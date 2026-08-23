@@ -1,5 +1,6 @@
-mod compare;
 mod casegen;
+mod compare;
+mod flowgen;
 mod native;
 mod proto;
 mod wasm;
@@ -7,6 +8,7 @@ mod wasm;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use iced_x86::{Code, FastFormatter, Mnemonic};
+use rand::RngExt;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -42,6 +44,12 @@ enum Cmd {
         /// Print the list of codes under test and exit.
         #[arg(long)]
         list: bool,
+        /// Case shape: "instr" (random sequences), "flow" (branches/calls/loops/strings) or "mixed".
+        #[arg(long, default_value = "mixed")]
+        mode: String,
+        /// Run and show only this case index (after generation).
+        #[arg(long)]
+        only: Option<usize>,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -61,14 +69,14 @@ fn main() -> Result<()> {
             code.push(0xF4);
             let case = proto::CaseIn::new(code);
             let runner = wasm::Runner::new()?;
-            let out = runner.translate(&case, 0x2000_2000)?;
+            let out = runner.translate(&case, 0x2000_2000, &[])?;
             for (ip, text) in &out.unimplemented {
                 println!(";; unimplemented at {ip:#x}: {text}");
             }
             println!("{}", wasmprinter::print_bytes(&out.wasm).map_err(|e| anyhow::anyhow!("{e}"))?);
             Ok(())
         }
-        Cmd::CpuDiff { count, seed, max_instrs, mnemonics, code_filter, work, show, list } => {
+        Cmd::CpuDiff { count, seed, max_instrs, mnemonics, code_filter, work, show, list, mode, only } => {
             let mn: Vec<Mnemonic> = match mnemonics {
                 Some(s) => {
                     let all = casegen::integer_mnemonics();
@@ -99,7 +107,9 @@ fn main() -> Result<()> {
             let mut g = casegen::Gen::new(seed);
             let mut cases = Vec::new();
             while cases.len() < count {
-                if let Some(c) = g.case(&codes, max_instrs) {
+                let flow = match mode.as_str() { "flow" => true, "instr" => false, _ => g.rng.random_bool(0.4) };
+                let c = if flow { flowgen::flow_case(&mut g, &codes) } else { g.case(&codes, max_instrs) };
+                if let Some(c) = c {
                     cases.push(c);
                 }
             }
@@ -112,11 +122,15 @@ fn main() -> Result<()> {
             let mut per_code: BTreeMap<Code, (u32, u32)> = BTreeMap::new();
             let mut shown = 0;
             let mut failures = 0;
+            let mut indeterminate = 0;
             let mut unimpl: BTreeMap<String, u32> = BTreeMap::new();
             let t1 = std::time::Instant::now();
             let mut fmt = FastFormatter::new();
             for (k, case) in cases.iter().enumerate() {
-                let res = match runner.run(&case.input, stack_base) {
+                if only.is_some_and(|o| o != k) {
+                    continue;
+                }
+                let res = match runner.run(&case.input, stack_base, &case.entries) {
                     Ok(r) => r,
                     Err(e) => {
                         failures += 1;
@@ -135,7 +149,11 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let diffs = compare::compare(&native_out[k], &res.out, &case.instrs, false);
+                let mut diffs = compare::compare(&native_out[k], &res.out, &case.instrs, false);
+                if !diffs.is_empty() && compare::reads_undefined_flag(&case.instrs) {
+                    indeterminate += 1;
+                    diffs.clear();
+                }
                 for &c in &case.codes {
                     let e = per_code.entry(c).or_insert((0, 0));
                     if diffs.is_empty() { e.0 += 1 } else { e.1 += 1 }
@@ -161,6 +179,16 @@ fn main() -> Result<()> {
                         for d in &diffs {
                             println!("    {:<12} native {:<22} wasm {}", d.field, d.native, d.wasm);
                         }
+                        if only.is_some() {
+                            let (n, w) = (&native_out[k], &res.out);
+                            println!("    native out: regs={:08x?} eflags={:#x} status={:#x} off={}", n.regs, n.eflags, n.status, n.fault_off);
+                            println!("    wasm   out: regs={:08x?} eflags={:#x} status={:#x} off={}", w.regs, w.eflags, w.status, w.fault_off);
+                            let i = &case.input;
+                            println!("    data[0x2f8..0x310] in  {}", compare::hex(&i.data[0x2f8..0x310]));
+                            println!("    data[0x3f8..0x410] in  {}", compare::hex(&i.data[0x3f8..0x410]));
+                            println!("    data[0x3f8..0x410] nat {}", compare::hex(&n.data[0x3f8..0x410]));
+                            println!("    data[0x3f8..0x410] was {}", compare::hex(&w.data[0x3f8..0x410]));
+                        }
                         if let Some(e) = &res.wasm_error {
                             println!("    wasm error: {e}");
                         }
@@ -168,7 +196,7 @@ fn main() -> Result<()> {
                 }
             }
             let t_wasm = t1.elapsed();
-            println!("\n{} cases: {} passed, {} failed  (native {:.1}s, wasm {:.1}s)", count, count - failures, failures, t_native.as_secs_f64(), t_wasm.as_secs_f64());
+            println!("\n{} cases: {} passed, {} failed, {} indeterminate (read an undefined flag)  (native {:.1}s, wasm {:.1}s)", count, count - failures, failures, indeterminate, t_native.as_secs_f64(), t_wasm.as_secs_f64());
             let mut failing: Vec<(&Code, &(u32, u32))> = per_code.iter().filter(|(_, v)| v.1 > 0).collect();
             failing.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
             if !failing.is_empty() {

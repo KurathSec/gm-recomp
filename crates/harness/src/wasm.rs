@@ -34,6 +34,8 @@ pub struct Host {
     pub trap: Option<(i32, u32)>,
     pub fpu_calls: u32,
     pub unresolved: Option<u32>,
+    /// Guest entry address -> table index, for `resolve`.
+    pub funcs: HashMap<u32, u32>,
 }
 
 pub struct Runner {
@@ -58,20 +60,24 @@ impl Runner {
         Ok(Runner { engine: Engine::new(&cfg).map_err(wt)? })
     }
 
-    pub fn translate(&self, case: &CaseIn, stack_base: u32) -> Result<recomp::Output> {
+    pub fn translate(&self, case: &CaseIn, stack_base: u32, entries: &[u32]) -> Result<recomp::Output> {
         let mut code = case.code.clone();
         code.resize(CODE_MAX, 0xF4);
         let mem = SegMem { segs: vec![(DATA_BASE, case.data.clone()), (CODE_BASE, code), (stack_base, case.stack.clone())] };
         let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: false });
         let tables = HashMap::new();
-        let is_fn = |_: u32| false;
+        let entries_owned: Vec<u32> = entries.to_vec();
+        let is_fn = move |a: u32| entries_owned.contains(&a);
         let info = FuncInfo { jump_tables: &tables, is_function: &is_fn };
         tr.add_function(CODE_BASE, &info).map_err(|e| anyhow!("{e}"))?;
+        for &e in entries {
+            tr.add_function(e, &info).map_err(|e| anyhow!("{e}"))?;
+        }
         Ok(tr.finish())
     }
 
-    pub fn run(&self, case: &CaseIn, stack_base: u32) -> Result<RunResult> {
-        let output = self.translate(case, stack_base)?;
+    pub fn run(&self, case: &CaseIn, stack_base: u32, entries: &[u32]) -> Result<RunResult> {
+        let output = self.translate(case, stack_base, entries)?;
         let unimplemented = output.unimplemented.clone();
         let module = match Module::new(&self.engine, &output.wasm) {
             Ok(m) => m,
@@ -81,7 +87,7 @@ impl Runner {
             }
         };
 
-        let mut store = Store::new(&self.engine, Host { trap: None, fpu_calls: 0, unresolved: None });
+        let mut store = Store::new(&self.engine, Host { trap: None, fpu_calls: 0, unresolved: None, funcs: HashMap::new() });
         let top = (stack_base as u64 + STACK_SIZE as u64).max(CODE_BASE as u64 + CODE_MAX as u64);
         let pages = top.div_ceil(65536) + 1;
         let memory = Memory::new(&mut store, MemoryType::new(pages as u32, None)).map_err(wt)?;
@@ -103,6 +109,9 @@ impl Runner {
             linker.define(&store, abi::CPU_MODULE, name, Extern::Global(*g)).map_err(wt)?;
         }
         let resolve = Func::wrap(&mut store, |mut caller: Caller<'_, Host>, addr: i32| -> wasmtime::Result<i32> {
+            if let Some(&idx) = caller.data().funcs.get(&(addr as u32)) {
+                return Ok(idx as i32);
+            }
             caller.data_mut().unresolved = Some(addr as u32);
             Err(WtError::msg(format!("resolve({addr:#x}): no such function in the test module")))
         });
@@ -128,6 +137,12 @@ impl Runner {
             linker.define(&store, abi::RT_MODULE, name, Extern::Func(func)).map_err(wt)?;
         }
         let instance = linker.instantiate(&mut store, &module).map_err(wt).context("instantiating generated wasm")?;
+        // Every translated function gets a table slot so `call reg` can reach it.
+        for (entry, name) in &output.functions {
+            let f = instance.get_func(&mut store, name).context("missing export")?;
+            let idx = table.grow(&mut store, 1, Ref::Func(Some(f))).map_err(wt)?;
+            store.data_mut().funcs.insert(*entry, idx as u32);
+        }
 
         // Initial state.
         memory.write(&mut store, DATA_BASE as usize, &case.data).map_err(|e| anyhow!("{e:?}"))?;

@@ -65,6 +65,8 @@ pub struct Case {
     pub input: CaseIn,
     pub instrs: Vec<Instruction>,
     pub codes: Vec<Code>,
+    /// Additional function entry addresses inside the code block (call targets).
+    pub entries: Vec<u32>,
 }
 
 impl Gen {
@@ -167,6 +169,29 @@ impl Gen {
             };
             ops.push(op);
         }
+        // bt/bts/btr/btc [mem], reg: a random 32-bit bit offset addresses memory far away
+        // (a fault on both sides tells nothing), so give it a small-valued register.
+        if matches!(code.mnemonic(), Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc)
+            && matches!(ops.first(), Some(Op::M(_)))
+        {
+            if let Some(Op::R(r)) = ops.get(1).copied() {
+                if written.contains(&Register::ECX) {
+                    return Option::None;
+                }
+                let small = if r.size() == 2 { Register::CX } else { Register::ECX };
+                ops[1] = Op::R(small);
+                index_regs.push(Register::ECX);
+            }
+        }
+        // 16-bit shld/shrd with a count above 16 is undefined on Intel; keep counts in range.
+        if matches!(code.mnemonic(), Mnemonic::Shld | Mnemonic::Shrd) && oc.operand_size() == 16 {
+            match ops.get(2).copied() {
+                Some(Op::I(i)) => ops[2] = Op::I(i & 15),
+                Some(Op::R(_)) if written.contains(&Register::ECX) => return Option::None,
+                Some(Op::R(_)) => index_regs.push(Register::ECX),
+                _ => {}
+            }
+        }
         // Record destination writes (first operand, plus implicit ones).
         if let Some(Op::R(r)) = ops.first() {
             if oc.op_count() == 1 && matches!(code.mnemonic(), Mnemonic::Push | Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv) {
@@ -257,7 +282,43 @@ impl Gen {
         self.rng.fill(&mut input.data[..]);
         self.rng.fill(&mut input.stack[..]);
         let _ = STACK_SIZE;
-        Some(Case { input, instrs, codes: used })
+        Some(Case { input, instrs, codes: used, entries: Vec::new() })
+    }
+
+    /// One random instruction for use inside a larger program; `written` tracks registers
+    /// the program has already changed (so memory bases stay valid).
+    pub fn filler(&mut self, codes: &[Code], written: &mut Vec<Register>, allow_stack: bool) -> Option<(Instruction, Code)> {
+        let mut index_regs = Vec::new();
+        for _ in 0..8 {
+            let code = codes[self.rng.random_range(0..codes.len())];
+            if !allow_stack && matches!(code.mnemonic(), Mnemonic::Push | Mnemonic::Pop) {
+                continue;
+            }
+            if let Some(i) = self.instr(code, written, &mut index_regs) {
+                if index_regs.is_empty() {
+                    return Some((i, code));
+                }
+                index_regs.clear();
+            }
+        }
+        None
+    }
+
+    /// Initial state with the standard base registers and random data/stack contents.
+    pub fn fresh_input(&mut self, code: Vec<u8>) -> CaseIn {
+        let mut input = CaseIn::new(code);
+        for r in 0..8 {
+            input.regs[r] = self.rng.random();
+        }
+        input.regs[3] = DATA_BASE + 0x200;
+        input.regs[6] = DATA_BASE + 0x300;
+        input.regs[7] = DATA_BASE + 0x400;
+        input.regs[5] = DATA_BASE + 0x500;
+        input.regs[4] = 0x200 + self.rng.random_range(0..0x20) * 4;
+        input.eflags = self.rng.random::<u32>() & 0x8d5;
+        self.rng.fill(&mut input.data[..]);
+        self.rng.fill(&mut input.stack[..]);
+        input
     }
 }
 

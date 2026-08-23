@@ -935,15 +935,17 @@ impl<'a> FuncEmit<'a> {
     /// Emits a binary ALU op `dst = dst <op> src` with lazy flags.
     fn alu(&mut self, instr: &Instruction, op: FlagOp, wop: fn(&mut Self), writes: bool) {
         let w = Self::op_width(instr, 0);
+        if matches!(op, FlagOp::Adc | FlagOp::Sbb) {
+            // The carry must be read before the operand locals of the pending op are reused.
+            self.flag(flags::CF);
+            self.set(L_FC);
+            self.pending = None;
+        }
         let dst = self.prep_dst(instr, 0);
         self.read_dst(dst, w);
         self.set(L_FA);
         self.read_op(instr, 1, false);
         self.set(L_FB);
-        if matches!(op, FlagOp::Adc | FlagOp::Sbb) {
-            self.flag(flags::CF);
-            self.set(L_FC);
-        }
         self.get(L_FA);
         self.get(L_FB);
         wop(self);
@@ -1232,9 +1234,9 @@ impl<'a> FuncEmit<'a> {
                 self.c(mask(w));
                 self.i(W::I32And);
                 self.set(L_FR);
-                self.write_dst(dst, w, L_FR);
                 let r = instr.op1_register();
                 self.write_reg_from(r, L_FA);
+                self.write_dst(dst, w, L_FR);
                 self.set_pending(FlagOp::Add, w);
             }
             Cmpxchg => {
@@ -1450,11 +1452,13 @@ impl<'a> FuncEmit<'a> {
             OpKind::Register => None,
             _ => Some(1),
         };
-        self.read_dst(dst, w);
-        self.set(L_FA);
+        // The pending flag op still owns L_FA/L_FB/L_FR until it is replaced or materialized,
+        // so a count of zero must not touch them and a run-time count materializes first.
         match static_count {
             Some(0) => {}
             Some(n) => {
+                self.read_dst(dst, w);
+                self.set(L_FA);
                 self.c(n);
                 self.set(L_FB);
                 self.get(L_FA);
@@ -1470,6 +1474,8 @@ impl<'a> FuncEmit<'a> {
             None => {
                 // Count in CL: a zero count leaves flags untouched, so decide at run time.
                 self.materialize(flags::ALL);
+                self.read_dst(dst, w);
+                self.set(L_FA);
                 self.read_reg(Register::CL);
                 self.c(31);
                 self.i(W::I32And);
@@ -1570,7 +1576,9 @@ impl<'a> FuncEmit<'a> {
                 self.get(L_FB);
                 self.c(w as u32 + 1);
                 self.i(W::I32RemU);
-                self.set(L_T1);
+                self.tee(L_T1);
+                self.i(W::If(BlockType::Empty));
+                self.depth += 1;
                 self.get(L_FA);
                 self.set(L_FR);
                 self.i(W::Block(BlockType::Empty));
@@ -1598,6 +1606,8 @@ impl<'a> FuncEmit<'a> {
                 if left { self.get(L_FLAG); } else { self.get(L_FR); self.c(w as u32 - 2); self.i(W::I32ShrU); self.c(1); self.i(W::I32And); }
                 self.i(W::I32Xor);
                 self.set(L_FLAG + 5);
+                self.depth -= 1;
+                self.i(W::End);
             }
         }
         self.depth -= 1;
@@ -1895,9 +1905,9 @@ impl<'a> FuncEmit<'a> {
         let rep = instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix();
         let compare = matches!(m, Scasb | Scasw | Scasd | Cmpsb | Cmpsw | Cmpsd);
         if compare { self.materialize(flags::ALL); }
-        // delta = df ? -step : step  -> L_T3
-        self.c(step);
+        // delta = df ? -step : step  -> L_T3   (select keeps the first operand when the condition is set)
         self.c(step.wrapping_neg());
+        self.c(step);
         self.i(W::GlobalGet(Global::Df as u32));
         self.i(W::Select);
         self.set(L_T3);

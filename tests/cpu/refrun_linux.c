@@ -216,7 +216,7 @@ static void handler(int sig, void *info, void *ucp) {
     c->ebx = g_saved_ebx;
     c->esi = g_saved_esi;
     c->edi = g_saved_edi;
-    c->eflags = (c->eflags & ~0x8D5u) | 0x202u;
+    c->eflags = 0x202u; /* a test may have set TF/AC via popfd; never carry those into the harness */
 }
 
 __asm__(
