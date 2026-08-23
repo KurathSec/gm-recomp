@@ -1,0 +1,7 @@
+[package]
+name = "fpu"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+rustc_apfloat = "0.2.3"

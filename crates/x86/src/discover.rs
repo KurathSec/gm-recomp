@@ -85,6 +85,9 @@ pub struct Discovery {
     /// Human-readable notes on unresolved jumps and rejected roots (capped).
     #[serde(skip)]
     pub diagnostics: Vec<String>,
+    /// RVA of every discovered instruction, ascending.
+    #[serde(skip)]
+    pub instruction_starts: Vec<u32>,
 }
 
 const MAX_DIAGNOSTICS: usize = 400;
@@ -248,7 +251,13 @@ impl<'a> Walker<'a> {
                 // Privileged or nonsensical in user code: a strong sign we are decoding data.
                 Mnemonic::In | Mnemonic::Out | Mnemonic::Hlt | Mnemonic::Cli | Mnemonic::Sti | Mnemonic::Lgdt
                 | Mnemonic::Lidt | Mnemonic::Ud2 | Mnemonic::Insb | Mnemonic::Insd | Mnemonic::Outsb | Mnemonic::Outsd
-                | Mnemonic::Iretd | Mnemonic::Sysenter | Mnemonic::Rsm => {
+                | Mnemonic::Iretd | Mnemonic::Sysenter | Mnemonic::Sysexit | Mnemonic::Sysret | Mnemonic::Rsm
+                // Never emitted by compilers for user code; they only show up when data is decoded.
+                | Mnemonic::Arpl | Mnemonic::Sldt | Mnemonic::Lldt | Mnemonic::Ltr | Mnemonic::Str | Mnemonic::Invd
+                | Mnemonic::Wbinvd | Mnemonic::Verr | Mnemonic::Verw | Mnemonic::Les | Mnemonic::Lds | Mnemonic::Lss
+                | Mnemonic::Lfs | Mnemonic::Lgs | Mnemonic::Salc | Mnemonic::Into | Mnemonic::Int1 | Mnemonic::Bound
+                | Mnemonic::Aam | Mnemonic::Aad | Mnemonic::Aaa | Mnemonic::Aas | Mnemonic::Daa | Mnemonic::Das
+                | Mnemonic::Retf | Mnemonic::Lar | Mnemonic::Lsl | Mnemonic::Clts | Mnemonic::Lmsw | Mnemonic::Smsw => {
                     b.failure = Some((rva, "privileged instruction"));
                     break;
                 }
@@ -755,5 +764,6 @@ pub fn discover(pe: &Pe) -> Discovery {
         largest_gaps: gaps,
         function_list,
         diagnostics: w.diagnostics,
+        instruction_starts: w.state.iter().enumerate().filter(|&(_, &s)| s == INSTR_START).map(|(i, _)| i as u32).collect(),
     }
 }
