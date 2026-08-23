@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>wasm memory feasibility</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Probes what the guest address space can be built from in this browser:
+// how large a (shared) wasm32 memory can get, whether multi-memory and the
+// other features the runtime relies on exist, and raw access throughput.
+const out = document.getElementById('out');
+const r = { ua: navigator.userAgent, crossOriginIsolated: self.crossOriginIsolated };
+const log = (k, v) => { r[k] = v; out.textContent = JSON.stringify(r, null, 2); };
+
+function maxMemoryPages(shared) {
+  // Largest `maximum` the engine accepts, then how far `grow` actually gets.
+  let accepted = 0;
+  for (const max of [65536, 49152, 32768, 24576, 16384, 8192]) {
+    try { new WebAssembly.Memory({ initial: 1, maximum: max, shared }); accepted = max; break; } catch {}
+  }
+  if (!accepted) return { accepted: 0, grown: 0 };
+  const m = new WebAssembly.Memory({ initial: 1, maximum: accepted, shared });
+  let grown = 1;
+  // Grow in 256MB steps so a failure identifies the real ceiling.
+  for (let pages = 4096; grown + pages <= accepted; ) {
+    try { m.grow(pages); grown += pages; } catch { break; }
+  }
+  return { accepted, grown, grownMB: grown / 16 };
+}
+
+const multiMemory = new Uint8Array([
+  0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,          // type (i32)->i32
+  0x03,0x02,0x01,0x00,                               // one function
+  0x05,0x05,0x02,0x00,0x01,0x00,0x01,                // two memories, 1 page each
+  0x07,0x0a,0x02,0x01,0x66,0x00,0x00,0x02,0x6d,0x31,0x02,0x01, // export f, m1
+  0x0a,0x0a,0x01,0x08,0x00,0x20,0x00,0x28,0x42,0x01,0x00,0x0b  // f: i32.load from memory 1
+]);
+
+const exceptions = new Uint8Array([
+  0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  0x01,0x04,0x01,0x60,0x00,0x00,                     // type ()->()
+  0x03,0x02,0x01,0x00,
+  0x0d,0x03,0x01,0x00,0x00,                          // tag section: one tag of type 0
+  0x0a,0x06,0x01,0x04,0x00,0x08,0x00,0x0b            // body: throw 0
+]);
+
+try {
+  log('shared', maxMemoryPages(true));
+  log('unshared', maxMemoryPages(false));
+  try {
+    const mod = new WebAssembly.Module(multiMemory);
+    const inst = new WebAssembly.Instance(mod);
+    new Uint32Array(inst.exports.m1.buffer)[1] = 0xdeadbeef;
+    log('multiMemory', inst.exports.f(4) === (0xdeadbeef | 0) ? 'works' : 'wrong value');
+  } catch (e) { log('multiMemory', 'unsupported: ' + e.message); }
+  try { new WebAssembly.Module(exceptions); log('exceptionHandling', 'legacy throw ok'); } catch (e) { log('exceptionHandling', 'unsupported: ' + e.message); }
+  log('jspi', typeof WebAssembly.Suspending === 'function');
+  log('memory64', (() => { try { new WebAssembly.Memory({ initial: 1n, maximum: 2n, address: 'i64' }); return true; } catch { return false; } })());
+  log('sharedArrayBuffer', typeof SharedArrayBuffer === 'function');
+  log('offscreenCanvas', typeof OffscreenCanvas === 'function');
+  log('atomicsWaitAsync', typeof Atomics.waitAsync === 'function');
+  log('audioWorklet', typeof AudioWorkletNode === 'function');
+  log('opfsSyncAccess', typeof FileSystemFileHandle === 'function' && 'createSyncAccessHandle' in FileSystemFileHandle.prototype);
+  const c = new OffscreenCanvas(64, 64);
+  const gl = c.getContext('webgl2', { desynchronized: true, antialias: false, premultipliedAlpha: false });
+  log('webgl2', gl ? (gl.getContextAttributes().desynchronized ? 'desynchronized' : 'ok') : 'none');
+
+  // Throughput over a 1GB shared memory, in JS: a reference point for HLE-side access.
+  const pages = Math.min(r.shared.grown, 16384);
+  const m = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
+  const u32 = new Uint32Array(m.buffer);
+  const t0 = performance.now();
+  let s = 0;
+  for (let i = 0; i < u32.length; i += 16) s += u32[i];
+  const dt = performance.now() - t0;
+  log('jsStrideReadMBps', Math.round((u32.length * 4) / 1048576 / (dt / 1000)));
+  log('ok', true);
+} catch (e) {
+  log('error', String(e.stack || e));
+}
+await fetch('/report', { method: 'POST', body: JSON.stringify(r) }).catch(() => {});
+</script>

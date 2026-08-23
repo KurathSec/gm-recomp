@@ -1,0 +1,6 @@
+/target
+/web/node_modules
+/web/dist
+# Imported game data is never committed.
+/web/public/games
+/out

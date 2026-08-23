@@ -1,0 +1,9 @@
+[package]
+name = "x86"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "fast_fmt", "instr_info"] }
+pe = { version = "0.1.0", path = "../pe" }
+serde = { version = "1.0.229", features = ["derive"] }
