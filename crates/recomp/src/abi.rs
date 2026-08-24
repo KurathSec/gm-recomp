@@ -83,7 +83,8 @@ pub enum RtFunc {
     Resolve = 0,
     /// `trap(kind, eip)`: the guest did something the translated code cannot continue from.
     Trap,
-    /// `fpu(code, a, b) -> i32`: executes one x87/MMX instruction (`code` is the iced-x86 `Code`).
+    /// `fpu(code, a, b, ip, fop) -> i32`: executes one x87/MMX instruction (`code` is the
+    /// iced-x86 `Code`; `ip` and the 11-bit `fop` feed the FPU instruction/opcode pointers).
     Fpu,
     /// `cpuid()`: reads eax/ecx globals, writes eax..edx globals.
     Cpuid,
@@ -110,6 +111,8 @@ pub mod trap {
     pub const HLT: i32 = 6;
     /// A branch left the translated region without a resolvable target.
     pub const NO_TARGET: i32 = 7;
+    /// A waiting x87 instruction found an unmasked exception pending (#MF).
+    pub const FPU_EXCEPTION: i32 = 8;
 }
 
 /// Type indices inside every generated module.
@@ -120,7 +123,7 @@ pub mod types {
     pub const RESOLVE: u32 = 1;
     /// `(i32, i32) -> ()`: trap.
     pub const TRAP: u32 = 2;
-    /// `(i32, i32, i32) -> i32`: fpu.
+    /// `(i32, i32, i32, i32, i32) -> i32`: fpu.
     pub const FPU: u32 = 3;
 }
 

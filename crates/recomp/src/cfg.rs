@@ -57,12 +57,15 @@ impl Block {
 pub struct Cfg {
     pub entry: u32,
     pub blocks: BTreeMap<u32, Block>,
+    /// x87 instructions: ip -> 11-bit opcode (low 3 bits of the escape byte, then ModRM).
+    pub fop: HashMap<u32, u16>,
 }
 
 const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
 
 pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, String> {
     let mut blocks: BTreeMap<u32, Block> = BTreeMap::new();
+    let mut fop: HashMap<u32, u16> = HashMap::new();
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
@@ -103,6 +106,16 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
                 return Err(format!("invalid instruction at {ip:#x}"));
             }
             total += 1;
+            if format!("{:?}", instr.mnemonic()).starts_with('F') && instr.mnemonic() != Mnemonic::Femms {
+                // skip legacy prefixes to find the D8..DF escape byte
+                let mut k = 0;
+                while k + 1 < instr.len() && matches!(buf[k], 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3) {
+                    k += 1;
+                }
+                if (0xD8..=0xDF).contains(&buf[k]) && k + 1 < n {
+                    fop.insert(ip, (((buf[k] & 7) as u16) << 8) | buf[k + 1] as u16);
+                }
+            }
             if total > MAX_INSTRS_PER_FUNCTION {
                 return Err(format!("function at {entry:#x} exceeds {MAX_INSTRS_PER_FUNCTION} instructions"));
             }
@@ -145,7 +158,7 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
         queue.extend(block.successors());
         blocks.insert(start, block);
     }
-    Ok(Cfg { entry, blocks })
+    Ok(Cfg { entry, blocks, fop })
 }
 
 /// Whether an instruction's memory operand is just `[disp32]` with a jump-table shape.

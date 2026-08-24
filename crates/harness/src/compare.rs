@@ -94,7 +94,30 @@ pub struct Diff {
     pub wasm: String,
 }
 
-pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], compare_xmm: bool) -> Vec<Diff> {
+/// How much of the FXSAVE image to compare.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FxCompare {
+    None,
+    Xmm,
+    /// x87 registers bit-exact.
+    X87,
+    /// x87 registers within ~53 bits (transcendental results), status C1/PE ignored.
+    X87Approx,
+}
+
+fn ext_to_f64(b: &[u8]) -> f64 {
+    let mant = u64::from_le_bytes(b[..8].try_into().unwrap());
+    let se = u16::from_le_bytes([b[8], b[9]]);
+    let sign = if se & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = (se & 0x7fff) as i32;
+    if exp == 0x7fff {
+        return if mant << 1 == 0 { sign * f64::INFINITY } else { f64::NAN };
+    }
+    sign * (mant as f64) * 2f64.powi(exp - 16383 - 63)
+}
+
+pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], fx: FxCompare) -> Vec<Diff> {
+    let compare_xmm = fx == FxCompare::Xmm;
     let mut diffs = Vec::new();
     fn push_into(diffs: &mut Vec<Diff>, field: &str, a: String, b: String) {
         if a != b {
@@ -128,6 +151,32 @@ pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], compare
         if a != b {
             push!(&format!("stack[{i:#x}]"), format!("{a:#04x}"), format!("{b:#04x}"));
             if diffs.len() > 64 { break; }
+        }
+    }
+    if matches!(fx, FxCompare::X87 | FxCompare::X87Approx) {
+        let (n, w) = (&native.fx, &wasm.fx);
+        push!("fcw", format!("{:#06x}", u16::from_le_bytes([n[0], n[1]])), format!("{:#06x}", u16::from_le_bytes([w[0], w[1]])));
+        let sw_mask: u16 = if fx == FxCompare::X87Approx { !(0x0200 | 0x0020) } else { 0xffff };
+        push!("fsw", format!("{:#06x}", u16::from_le_bytes([n[2], n[3]]) & sw_mask), format!("{:#06x}", u16::from_le_bytes([w[2], w[3]]) & sw_mask));
+        push!("ftw", format!("{:#04x}", n[4]), format!("{:#04x}", w[4]));
+        let top = ((u16::from_le_bytes([n[2], n[3]]) >> 11) & 7) as usize;
+        for i in 0..8 {
+            // FXSAVE stores ST(i) raw, empty or not: popped values stay comparable.
+            let phys = (top + i) & 7;
+            if fx == FxCompare::X87Approx && n[4] & (1 << phys) == 0 && w[4] & (1 << phys) == 0 {
+                continue;
+            }
+            let a = &n[32 + 16 * i..42 + 16 * i];
+            let b = &w[32 + 16 * i..42 + 16 * i];
+            if fx == FxCompare::X87Approx {
+                let (fa, fb) = (ext_to_f64(a), ext_to_f64(b));
+                let ok = (fa.is_nan() && fb.is_nan()) || fa == fb || ((fa - fb).abs() <= fa.abs().max(fb.abs()) * 2f64.powi(-48));
+                if !ok {
+                    push!(&format!("st{i}~"), hex(a), hex(b));
+                }
+            } else {
+                push!(&format!("st{i}"), hex(a), hex(b));
+            }
         }
     }
     if compare_xmm {

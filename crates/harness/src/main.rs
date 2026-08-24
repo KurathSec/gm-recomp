@@ -1,6 +1,7 @@
 mod casegen;
 mod compare;
 mod flowgen;
+mod x87gen;
 mod native;
 mod proto;
 mod wasm;
@@ -50,6 +51,27 @@ enum Cmd {
         /// Run and show only this case index (after generation).
         #[arg(long)]
         only: Option<usize>,
+        /// With --only: also print this data-block range, as off:len (hex).
+        #[arg(long)]
+        dump_data: Option<String>,
+    },
+    /// Run one x87 program natively and in wasm with chosen ST registers, and print both states.
+    Probe {
+        /// Code bytes in hex (hlt is appended).
+        hex: String,
+        /// Initial ST(0), ST(1), ... as 20 hex digits (little-endian 80-bit images).
+        #[arg(long)]
+        st: Vec<String>,
+        #[arg(long, default_value = "037f")]
+        cw: String,
+        /// Data block contents as off=hexbytes (offset in hex, relative to the data block).
+        #[arg(long)]
+        data: Vec<String>,
+        /// Also print this data range after the run, as off:len (hex).
+        #[arg(long)]
+        dump: Option<String>,
+        #[arg(long, default_value = "target/refrun")]
+        work: PathBuf,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -59,6 +81,41 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Probe { hex, st, cw, data, dump, work } => {
+            let mut code: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16)).collect::<Result<_, _>>()?;
+            code.push(0xF4);
+            let mut case = proto::CaseIn::new(code);
+            case.regs[3] = proto::DATA_BASE + 0x200;
+            case.regs[4] = 0x200;
+            case.fx[0..2].copy_from_slice(&u16::from_str_radix(&cw, 16)?.to_le_bytes());
+            let mut tags = 0u8;
+            for (i, h) in st.iter().enumerate() {
+                let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|k| u8::from_str_radix(&h[k..k + 2], 16)).collect::<Result<_, _>>()?;
+                case.fx[32 + 16 * i..32 + 16 * i + bytes.len()].copy_from_slice(&bytes);
+                tags |= 1 << i;
+            }
+            case.fx[4] = tags;
+            for d in &data {
+                let (o, h) = d.split_once('=').expect("--data off=hex");
+                let o = usize::from_str_radix(o.trim_start_matches("0x"), 16)?;
+                let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|k| u8::from_str_radix(&h[k..k + 2], 16)).collect::<Result<_, _>>()?;
+                case.data[o..o + bytes.len()].copy_from_slice(&bytes);
+            }
+            let repo = std::env::current_dir()?;
+            let nat = native::Native::prepare(&repo, &work)?;
+            let runner = wasm::Runner::new()?;
+            let n = nat.run(std::slice::from_ref(&case))?.remove(0);
+            let w = runner.run(&case, n.stack_base, &[])?.out;
+            for (label, o) in [("native", &n), ("wasm  ", &w)] {
+                println!("{label}: status={:#x} fcw={:#06x} fsw={:#06x} ftw={:#04x} st: {}", o.status, u16::from_le_bytes([o.fx[0], o.fx[1]]), u16::from_le_bytes([o.fx[2], o.fx[3]]), o.fx[4], (0..8).map(|r| compare::hex(&o.fx[32 + 16 * r..42 + 16 * r])).collect::<Vec<_>>().join(" "));
+                if let Some(d) = &dump {
+                    let (o2, l) = d.split_once(':').unwrap_or((d, "16"));
+                    let (o2, l) = (usize::from_str_radix(o2.trim_start_matches("0x"), 16)?, usize::from_str_radix(l.trim_start_matches("0x"), 16)?);
+                    println!("        data[{o2:#x}..] {}", compare::hex(&o.data[o2..o2 + l]));
+                }
+            }
+            Ok(())
+        }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;
             println!("{}", wasmprinter::print_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?);
@@ -76,7 +133,7 @@ fn main() -> Result<()> {
             println!("{}", wasmprinter::print_bytes(&out.wasm).map_err(|e| anyhow::anyhow!("{e}"))?);
             Ok(())
         }
-        Cmd::CpuDiff { count, seed, max_instrs, mnemonics, code_filter, work, show, list, mode, only } => {
+        Cmd::CpuDiff { count, seed, max_instrs, mnemonics, code_filter, work, show, list, mode, only, dump_data } => {
             let mn: Vec<Mnemonic> = match mnemonics {
                 Some(s) => {
                     let all = casegen::integer_mnemonics();
@@ -89,7 +146,13 @@ fn main() -> Result<()> {
                 }
                 None => casegen::integer_mnemonics(),
             };
-            let mut codes = casegen::supported_codes(&mn);
+            let mut codes = if mode == "x87" {
+                x87gen::x87_codes(&x87gen::x87_mnemonics())
+            } else if mode == "x87trans" {
+                x87gen::x87_codes(&x87gen::transcendental_mnemonics())
+            } else {
+                casegen::supported_codes(&mn)
+            };
             if let Some(f) = &code_filter {
                 codes.retain(|c| format!("{c:?}").contains(f.as_str()));
             }
@@ -107,8 +170,12 @@ fn main() -> Result<()> {
             let mut g = casegen::Gen::new(seed);
             let mut cases = Vec::new();
             while cases.len() < count {
-                let flow = match mode.as_str() { "flow" => true, "instr" => false, _ => g.rng.random_bool(0.4) };
-                let c = if flow { flowgen::flow_case(&mut g, &codes) } else { g.case(&codes, max_instrs) };
+                let c = match mode.as_str() {
+                    "x87" | "x87trans" => x87gen::x87_case(&mut g, &codes, max_instrs),
+                    "flow" => flowgen::flow_case(&mut g, &codes),
+                    "instr" => g.case(&codes, max_instrs),
+                    _ => if g.rng.random_bool(0.4) { flowgen::flow_case(&mut g, &codes) } else { g.case(&codes, max_instrs) },
+                };
                 if let Some(c) = c {
                     cases.push(c);
                 }
@@ -149,7 +216,12 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let mut diffs = compare::compare(&native_out[k], &res.out, &case.instrs, false);
+                let fxmode = match mode.as_str() {
+                    "x87" => compare::FxCompare::X87,
+                    "x87trans" => compare::FxCompare::X87Approx,
+                    _ => compare::FxCompare::None,
+                };
+                let mut diffs = compare::compare(&native_out[k], &res.out, &case.instrs, fxmode);
                 if !diffs.is_empty() && compare::reads_undefined_flag(&case.instrs) {
                     indeterminate += 1;
                     diffs.clear();
@@ -188,6 +260,16 @@ fn main() -> Result<()> {
                             println!("    data[0x3f8..0x410] in  {}", compare::hex(&i.data[0x3f8..0x410]));
                             println!("    data[0x3f8..0x410] nat {}", compare::hex(&n.data[0x3f8..0x410]));
                             println!("    data[0x3f8..0x410] was {}", compare::hex(&w.data[0x3f8..0x410]));
+                            if let Some(d) = &dump_data {
+                                let (o, l) = d.split_once(':').unwrap_or((d, "16"));
+                                let (o, l) = (usize::from_str_radix(o.trim_start_matches("0x"), 16).unwrap(), usize::from_str_radix(l.trim_start_matches("0x"), 16).unwrap());
+                                println!("    data[{o:#x}..] in  {}", compare::hex(&i.data[o..o + l]));
+                                println!("    data[{o:#x}..] nat {}", compare::hex(&n.data[o..o + l]));
+                                println!("    data[{o:#x}..] was {}", compare::hex(&w.data[o..o + l]));
+                            }
+                            println!("    fx in : {} st: {}", compare::hex(&i.fx[..8]), (0..8).map(|r| compare::hex(&i.fx[32 + 16 * r..42 + 16 * r])).collect::<Vec<_>>().join(" "));
+                            println!("    fx nat: {} st: {}", compare::hex(&n.fx[..8]), (0..8).map(|r| compare::hex(&n.fx[32 + 16 * r..42 + 16 * r])).collect::<Vec<_>>().join(" "));
+                            println!("    fx was: {} st: {}", compare::hex(&w.fx[..8]), (0..8).map(|r| compare::hex(&w.fx[32 + 16 * r..42 + 16 * r])).collect::<Vec<_>>().join(" "));
                         }
                         if let Some(e) = &res.wasm_error {
                             println!("    wasm error: {e}");

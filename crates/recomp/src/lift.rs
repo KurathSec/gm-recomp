@@ -1405,7 +1405,8 @@ impl<'a> FuncEmit<'a> {
                 // Only reached when not a block terminator (cannot happen); treat as trap.
                 self.trap(trap::UNIMPLEMENTED, self.ip);
             }
-            m if format!("{m:?}").starts_with('F') && !matches!(m, Wait | Femms) => self.x87(instr),
+            Femms | Emms => self.x87(instr),
+            m if format!("{m:?}").starts_with('F') && m != Wait => self.x87(instr),
             _ => self.unimplemented(instr),
         }
     }
@@ -1991,31 +1992,64 @@ impl<'a> FuncEmit<'a> {
 
     fn x87(&mut self, instr: &Instruction) {
         use Mnemonic::*;
-        // a = memory address or ST index of op0; b = ST index of op1 (or 0).
+        // a = memory address or ST index of op0; b packs op1's ST index, the memory operand
+        // size and which operands are ST registers (see fpu::args).
         let has_mem = (0..instr.op_count()).any(|n| instr.op_kind(n) == OpKind::Memory);
+        let op0_st = instr.op_count() > 0 && instr.op0_kind() == OpKind::Register && instr.op0_register().is_st();
+        let op1_st = instr.op_count() > 1 && instr.op1_kind() == OpKind::Register && instr.op1_register().is_st();
         if has_mem {
             self.addr(instr);
-        } else if instr.op_count() > 0 && instr.op0_kind() == OpKind::Register && instr.op0_register().is_st() {
+        } else if op0_st {
             self.c(instr.op0_register().number() as u32);
         } else {
             self.c(0);
         }
         self.set(L_T1);
-        if instr.op_count() > 1 && instr.op1_kind() == OpKind::Register && instr.op1_register().is_st() {
-            self.c(instr.op1_register().number() as u32);
+        let mut b: u32 = 0;
+        if op1_st {
+            b |= instr.op1_register().number() as u32;
+        }
+        if has_mem {
+            b |= (instr.memory_size() as u32) << 8;
+        }
+        if op0_st {
+            b |= 1 << 16;
+        }
+        if op1_st {
+            b |= 1 << 17;
+        }
+        let is_fcmov = matches!(instr.mnemonic(), Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu);
+        if is_fcmov {
+            // The condition lives in the integer flags: evaluate it here and pass it in bit 24.
+            let cc = match instr.mnemonic() {
+                Fcmovb => ConditionCode::b,
+                Fcmove => ConditionCode::e,
+                Fcmovbe => ConditionCode::be,
+                Fcmovu => ConditionCode::p,
+                Fcmovnb => ConditionCode::ae,
+                Fcmovne => ConditionCode::ne,
+                Fcmovnbe => ConditionCode::a,
+                _ => ConditionCode::np,
+            };
+            self.c(b);
+            self.cond(cc);
+            self.c(24);
+            self.i(W::I32Shl);
+            self.i(W::I32Or);
         } else {
-            self.c(0);
+            self.c(b);
         }
         self.set(L_T2);
-        // fnstsw ax reads no memory; fcomi* read flags from the return value.
         let writes_flags = matches!(instr.mnemonic(), Fcomi | Fcomip | Fucomi | Fucomip);
-        let writes_ax = instr.mnemonic() == Fnstsw && instr.op0_kind() == OpKind::Register;
+        let writes_ax = instr.mnemonic() == Fnstsw && !has_mem;
         if writes_flags {
             self.materialize(flags::ALL);
         }
         self.i(W::I32Const(instr.code() as i32));
         self.get(L_T1);
         self.get(L_T2);
+        self.c(self.ip);
+        self.c(self.cfg.fop.get(&self.ip).copied().unwrap_or(0) as u32);
         self.call_rt(RtFunc::Fpu);
         if writes_ax {
             self.set(L_T1);

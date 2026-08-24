@@ -36,6 +36,23 @@ pub struct Host {
     pub unresolved: Option<u32>,
     /// Guest entry address -> table index, for `resolve`.
     pub funcs: HashMap<u32, u32>,
+    pub fpu: fpu::Fpu,
+}
+
+struct MemView<'a>(&'a mut [u8]);
+impl fpu::Mem for MemView<'_> {
+    fn read(&mut self, addr: u32, buf: &mut [u8]) {
+        let a = addr as usize;
+        if let Some(src) = self.0.get(a..a + buf.len()) {
+            buf.copy_from_slice(src);
+        }
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) {
+        let a = addr as usize;
+        if let Some(dst) = self.0.get_mut(a..a + data.len()) {
+            dst.copy_from_slice(data);
+        }
+    }
 }
 
 pub struct Runner {
@@ -87,7 +104,9 @@ impl Runner {
             }
         };
 
-        let mut store = Store::new(&self.engine, Host { trap: None, fpu_calls: 0, unresolved: None, funcs: HashMap::new() });
+        let mut host = Host { trap: None, fpu_calls: 0, unresolved: None, funcs: HashMap::new(), fpu: fpu::Fpu::new() };
+        host.fpu.read_fxsave(&case.fx);
+        let mut store = Store::new(&self.engine, host);
         let top = (stack_base as u64 + STACK_SIZE as u64).max(CODE_BASE as u64 + CODE_MAX as u64);
         let pages = top.div_ceil(65536) + 1;
         let memory = Memory::new(&mut store, MemoryType::new(pages as u32, None)).map_err(wt)?;
@@ -120,9 +139,18 @@ impl Runner {
             // Every trap kind ends a test case, like the native exception does.
             Err(WtError::msg(format!("guest trap {kind}")))
         });
-        let fpu = Func::wrap(&mut store, |mut caller: Caller<'_, Host>, _code: i32, _a: i32, _b: i32| -> i32 {
+        let fpu_mem = memory;
+        let fpu = Func::wrap(&mut store, move |mut caller: Caller<'_, Host>, code: i32, a: i32, b: i32, ip: i32, fop: i32| -> wasmtime::Result<i32> {
             caller.data_mut().fpu_calls += 1;
-            0
+            let mn = iced_x86::Code::try_from(code as usize).map(|c| c.mnemonic()).unwrap_or(iced_x86::Mnemonic::INVALID);
+            if caller.data().fpu.fault_pending(mn) {
+                caller.data_mut().trap = Some((trap::FPU_EXCEPTION, ip as u32));
+                return Err(WtError::msg("x87 exception pending"));
+            }
+            let mut f = std::mem::take(&mut caller.data_mut().fpu);
+            let r = f.exec(mn, a as u32, b as u32, ip as u32, fop as u16, &mut MemView(fpu_mem.data_mut(&mut caller)));
+            caller.data_mut().fpu = f;
+            Ok(r)
         });
         let cpuid = Func::wrap(&mut store, |_caller: Caller<'_, Host>| {});
         let rdtsc = Func::wrap(&mut store, |_caller: Caller<'_, Host>| {});
@@ -176,6 +204,7 @@ impl Runner {
             Some((trap::INT3, ip)) => (0x8000_0003, ip - CODE_BASE),
             Some((trap::UD2, ip)) => (0xC000_001D, ip - CODE_BASE),
             Some((trap::INT, _)) => (0xC000_0005, u32::MAX),
+            Some((trap::FPU_EXCEPTION, ip)) => (0xC000_0094, ip - CODE_BASE),
             Some((trap::UNIMPLEMENTED, ip)) => (0xFFFF_0001, ip - CODE_BASE),
             Some((_, ip)) => (0xFFFF_0002, ip.wrapping_sub(CODE_BASE)),
             None => match &res {
@@ -204,6 +233,7 @@ impl Runner {
             | bit(&mut store, abi::Global::Df, 10)
             | bit(&mut store, abi::Global::Of, 11);
         let mut fx = case.fx;
+        store.data().fpu.write_fxsave(&mut fx);
         fx[24..28].copy_from_slice(&(globals[abi::Global::Mxcsr as usize].get(&mut store).i32().unwrap() as u32).to_le_bytes());
         for x in 0..8 {
             let v = globals[abi::Global::Xmm0 as usize + x].get(&mut store).v128().unwrap().as_u128();

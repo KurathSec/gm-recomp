@@ -282,6 +282,7 @@ int entry(int argc, char **argv) {
         if (code_len > CODE_MAX || !read_full(in, g_code, code_len)) die("bad code length");
         if (!read_full(in, &g_ci, sizeof g_ci)) die("truncated case body");
         memcpy((void *)DATA_BASE, g_ci.data, DATA_SIZE);
+        memset((void *)(DATA_BASE + DATA_SIZE), 0, CODE_BASE - DATA_BASE - DATA_SIZE); /* no stale bytes between cases */
         memcpy((void *)STACK_BASE, g_ci.stack, STACK_SIZE);
         memcpy((void *)CODE_BASE, g_code, code_len);
         memset((void *)(CODE_BASE + code_len), 0xF4, CODE_MAX - code_len);

@@ -57,7 +57,7 @@ impl<'m> Translator<'m> {
         types.ty().function([], []); // FUNC
         types.ty().function([ValType::I32], [ValType::I32]); // RESOLVE
         types.ty().function([ValType::I32, ValType::I32], []); // TRAP
-        types.ty().function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]); // FPU
+        types.ty().function([ValType::I32; 5], [ValType::I32]); // FPU
         debug_assert_eq!(types::FPU, 3);
 
         let mut imports = ImportSection::new();
