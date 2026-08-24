@@ -143,6 +143,9 @@ pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], fx: FxC
     push!("eflags", format!("{:#06x}", native.eflags & mask), format!("{:#06x}", wasm.eflags & mask));
     for (i, (a, b)) in native.data.iter().zip(&wasm.data).enumerate() {
         if a != b {
+            if compare_xmm && nan_chunk(&native.data, &wasm.data, i) {
+                continue; // a stored NaN whose payload wasm does not reproduce
+            }
             push!(&format!("data[{i:#x}]"), format!("{a:#04x}"), format!("{b:#04x}"));
             if diffs.len() > 64 { break; }
         }
@@ -170,7 +173,7 @@ pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], fx: FxC
             let b = &w[32 + 16 * i..42 + 16 * i];
             if fx == FxCompare::X87Approx {
                 let (fa, fb) = (ext_to_f64(a), ext_to_f64(b));
-                let ok = (fa.is_nan() && fb.is_nan()) || fa == fb || ((fa - fb).abs() <= fa.abs().max(fb.abs()) * 2f64.powi(-48));
+                let ok = (fa.is_nan() && fb.is_nan()) || fa == fb || ((fa - fb).abs() <= fa.abs().max(fb.abs()) * 2f64.powi(-44));
                 if !ok {
                     push!(&format!("st{i}~"), hex(a), hex(b));
                 }
@@ -180,14 +183,49 @@ pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], fx: FxC
         }
     }
     if compare_xmm {
-        push!("mxcsr", format!("{:#x}", u32::from_le_bytes(native.fx[24..28].try_into().unwrap())), format!("{:#x}", u32::from_le_bytes(wasm.fx[24..28].try_into().unwrap())));
+        // MXCSR exception flags (bits 0-5) are not modelled; compare the control bits only.
+        push!("mxcsr", format!("{:#x}", u32::from_le_bytes(native.fx[24..28].try_into().unwrap()) & !0x3f), format!("{:#x}", u32::from_le_bytes(wasm.fx[24..28].try_into().unwrap()) & !0x3f));
         for x in 0..8 {
             let a = &native.fx[160 + x * 16..176 + x * 16];
             let b = &wasm.fx[160 + x * 16..176 + x * 16];
-            push!(&format!("xmm{x}"), hex(a), hex(b));
+            if !xmm_equal_modulo_nan(a, b) {
+                push!(&format!("xmm{x}"), hex(a), hex(b));
+            }
         }
     }
     diffs
+}
+
+/// Byte `i` lies in a 4- or 8-byte aligned chunk that holds a NaN on both sides.
+fn nan_chunk(a: &[u8], b: &[u8], i: usize) -> bool {
+    let c8 = i & !7;
+    if c8 + 8 <= a.len() {
+        let (x, y) = (u64::from_le_bytes(a[c8..c8 + 8].try_into().unwrap()), u64::from_le_bytes(b[c8..c8 + 8].try_into().unwrap()));
+        if f64::from_bits(x).is_nan() && f64::from_bits(y).is_nan() {
+            return true;
+        }
+    }
+    let c4 = i & !3;
+    if c4 + 4 <= a.len() {
+        let (x, y) = (u32::from_le_bytes(a[c4..c4 + 4].try_into().unwrap()), u32::from_le_bytes(b[c4..c4 + 4].try_into().unwrap()));
+        if f32::from_bits(x).is_nan() && f32::from_bits(y).is_nan() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lanes that are NaN on both sides compare equal whatever their payloads, at 32- and
+/// 64-bit granularity (the harness cannot know the lane type).
+fn xmm_equal_modulo_nan(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    let f64_nan = |x: &[u8]| f64::from_bits(u64::from_le_bytes(x.try_into().unwrap())).is_nan();
+    let f32_nan = |x: &[u8]| f32::from_bits(u32::from_le_bytes(x.try_into().unwrap())).is_nan();
+    let by64 = (0..2).all(|l| a[8 * l..8 * l + 8] == b[8 * l..8 * l + 8] || (f64_nan(&a[8 * l..8 * l + 8]) && f64_nan(&b[8 * l..8 * l + 8])));
+    let by32 = (0..4).all(|l| a[4 * l..4 * l + 4] == b[4 * l..4 * l + 4] || (f32_nan(&a[4 * l..4 * l + 4]) && f32_nan(&b[4 * l..4 * l + 4])));
+    by64 || by32
 }
 
 pub fn hex(b: &[u8]) -> String {

@@ -15,29 +15,29 @@ use std::collections::HashMap;
 use wasm_encoder::{BlockType, Function, Instruction as W, MemArg, ValType};
 
 // Local indices.
-const L_REG: u32 = 0; // eax..edi = 0..7
-const L_FLAG: u32 = 8; // cf,pf,af,zf,sf,of = 8..13
-const L_BLK: u32 = 14;
-const L_FA: u32 = 15;
-const L_FB: u32 = 16;
-const L_FR: u32 = 17;
-const L_FC: u32 = 18;
-const L_T0: u32 = 19;
-const L_T1: u32 = 20;
-const L_T2: u32 = 21;
-const L_T3: u32 = 22;
-const L_Q0: u32 = 23;
-const L_Q1: u32 = 24;
-const L_D0: u32 = 25;
-const L_V0: u32 = 26;
-const L_V1: u32 = 27;
+pub(crate) const L_REG: u32 = 0; // eax..edi = 0..7
+pub(crate) const L_FLAG: u32 = 8; // cf,pf,af,zf,sf,of = 8..13
+pub(crate) const L_BLK: u32 = 14;
+pub(crate) const L_FA: u32 = 15;
+pub(crate) const L_FB: u32 = 16;
+pub(crate) const L_FR: u32 = 17;
+pub(crate) const L_FC: u32 = 18;
+pub(crate) const L_T0: u32 = 19;
+pub(crate) const L_T1: u32 = 20;
+pub(crate) const L_T2: u32 = 21;
+pub(crate) const L_T3: u32 = 22;
+pub(crate) const L_Q0: u32 = 23;
+pub(crate) const L_Q1: u32 = 24;
+pub(crate) const L_D0: u32 = 25;
+pub(crate) const L_V0: u32 = 26;
+pub(crate) const L_V1: u32 = 27;
 pub const LOCALS: [(u32, ValType); 4] = [(23, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128)];
 
-fn mem0() -> MemArg {
+pub(crate) fn mem0() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
 }
 
-fn mask(w: u8) -> u32 {
+pub(crate) fn mask(w: u8) -> u32 {
     if w == 32 { 0xffff_ffff } else { (1u32 << w) - 1 }
 }
 
@@ -71,6 +71,10 @@ pub struct FuncEmit<'a> {
 }
 
 impl<'a> FuncEmit<'a> {
+    pub(crate) fn ip(&self) -> u32 {
+        self.ip
+    }
+
     pub fn new(cfg: &'a Cfg, func_index: &'a HashMap<u32, u32>) -> Self {
         let order: Vec<u32> = cfg.blocks.keys().copied().collect();
         let index = order.iter().enumerate().map(|(i, &a)| (a, i as u32)).collect();
@@ -92,23 +96,23 @@ impl<'a> FuncEmit<'a> {
         }
     }
 
-    fn i(&mut self, ins: W) {
+    pub(crate) fn i(&mut self, ins: W) {
         self.f.instruction(&ins);
     }
 
-    fn c(&mut self, v: u32) {
+    pub(crate) fn c(&mut self, v: u32) {
         self.i(W::I32Const(v as i32));
     }
 
-    fn get(&mut self, l: u32) {
+    pub(crate) fn get(&mut self, l: u32) {
         self.i(W::LocalGet(l));
     }
 
-    fn set(&mut self, l: u32) {
+    pub(crate) fn set(&mut self, l: u32) {
         self.i(W::LocalSet(l));
     }
 
-    fn tee(&mut self, l: u32) {
+    pub(crate) fn tee(&mut self, l: u32) {
         self.i(W::LocalTee(l));
     }
 
@@ -155,12 +159,12 @@ impl<'a> FuncEmit<'a> {
         self.pending = None;
     }
 
-    fn spill_all(&mut self) {
+    pub(crate) fn spill_all(&mut self) {
         self.spill_regs();
         self.spill_flags();
     }
 
-    fn reload_all(&mut self) {
+    pub(crate) fn reload_all(&mut self) {
         self.reload_regs();
         self.reload_flags();
     }
@@ -169,7 +173,7 @@ impl<'a> FuncEmit<'a> {
         self.i(W::Call(f as u32));
     }
 
-    fn trap(&mut self, kind: i32, arg: u32) {
+    pub(crate) fn trap(&mut self, kind: i32, arg: u32) {
         self.spill_all();
         self.i(W::I32Const(kind));
         self.c(arg);
@@ -177,7 +181,7 @@ impl<'a> FuncEmit<'a> {
         self.reload_all();
     }
 
-    fn unimplemented(&mut self, instr: &Instruction) {
+    pub(crate) fn unimplemented(&mut self, instr: &Instruction) {
         let mut text = String::new();
         iced_x86::FastFormatter::new().format(instr, &mut text);
         self.unimplemented.push((self.ip, text));
@@ -195,7 +199,7 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// Pushes the register's value zero-extended to i32.
-    fn read_reg(&mut self, r: Register) {
+    pub(crate) fn read_reg(&mut self, r: Register) {
         let l = Self::reg_local(r);
         self.get(l);
         match r.size() {
@@ -217,7 +221,7 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// Stores local `src` into the register, merging partial widths.
-    fn write_reg_from(&mut self, r: Register, src: u32) {
+    pub(crate) fn write_reg_from(&mut self, r: Register, src: u32) {
         let l = Self::reg_local(r);
         match r.size() {
             4 => {
@@ -256,7 +260,7 @@ impl<'a> FuncEmit<'a> {
     // ---- memory ----------------------------------------------------------
 
     /// Pushes the effective address of the memory operand.
-    fn addr(&mut self, instr: &Instruction) {
+    pub(crate) fn addr(&mut self, instr: &Instruction) {
         let mut terms = 0;
         if instr.memory_base() != Register::None {
             let b = instr.memory_base();
@@ -308,7 +312,7 @@ impl<'a> FuncEmit<'a> {
         let _ = terms;
     }
 
-    fn load(&mut self, w: u8) {
+    pub(crate) fn load(&mut self, w: u8) {
         self.i(match w {
             8 => W::I32Load8U(mem0()),
             16 => W::I32Load16U(mem0()),
@@ -317,7 +321,7 @@ impl<'a> FuncEmit<'a> {
         });
     }
 
-    fn store(&mut self, w: u8) {
+    pub(crate) fn store(&mut self, w: u8) {
         self.i(match w {
             8 => W::I32Store8(mem0()),
             16 => W::I32Store16(mem0()),
@@ -338,7 +342,7 @@ impl<'a> FuncEmit<'a> {
 
     /// Pushes operand `n` zero-extended. Memory operands use the address in L_T0 when
     /// `addr_in_t0`, otherwise compute it inline.
-    fn read_op(&mut self, instr: &Instruction, n: u32, addr_in_t0: bool) {
+    pub(crate) fn read_op(&mut self, instr: &Instruction, n: u32, addr_in_t0: bool) {
         match instr.op_kind(n) {
             OpKind::Register => self.read_reg(instr.op_register(n)),
             OpKind::Memory => {
@@ -583,7 +587,7 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// Writes the given pending flags into their locals.
-    fn materialize(&mut self, which: u8) {
+    pub(crate) fn materialize(&mut self, which: u8) {
         if self.pending.is_none() {
             return;
         }
@@ -1407,7 +1411,11 @@ impl<'a> FuncEmit<'a> {
             }
             Femms | Emms => self.x87(instr),
             m if format!("{m:?}").starts_with('F') && m != Wait => self.x87(instr),
-            _ => self.unimplemented(instr),
+            _ => {
+                if !self.sse(instr) {
+                    self.unimplemented(instr);
+                }
+            }
         }
     }
 

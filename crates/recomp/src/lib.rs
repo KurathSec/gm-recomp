@@ -4,6 +4,7 @@ pub mod abi;
 pub mod cfg;
 pub mod flags;
 pub mod lift;
+pub mod sse;
 
 use abi::{GLOBALS, RT_FUNCS, types};
 use cfg::{Cfg, FuncInfo, GuestMem};

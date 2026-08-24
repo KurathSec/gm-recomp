@@ -1,6 +1,7 @@
 mod casegen;
 mod compare;
 mod flowgen;
+mod ssegen;
 mod x87gen;
 mod native;
 mod proto;
@@ -118,7 +119,16 @@ fn main() -> Result<()> {
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;
-            println!("{}", wasmprinter::print_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?);
+            let mut cfg = wasmprinter::Config::new();
+            cfg.print_offsets(true);
+            let mut text = String::new();
+            cfg.print(&bytes, &mut wasmprinter::PrintFmtWrite(&mut text)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{text}");
+            let mut v = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+            match v.validate_all(&bytes) {
+                Ok(_) => println!(";; valid"),
+                Err(e) => println!(";; INVALID: {e} (offset {:#x})", e.offset()),
+            }
             Ok(())
         }
         Cmd::Translate { hex } => {
@@ -146,7 +156,9 @@ fn main() -> Result<()> {
                 }
                 None => casegen::integer_mnemonics(),
             };
-            let mut codes = if mode == "x87" {
+            let mut codes = if mode == "sse" {
+                ssegen::sse_codes(&ssegen::sse_mnemonics())
+            } else if mode == "x87" {
                 x87gen::x87_codes(&x87gen::x87_mnemonics())
             } else if mode == "x87trans" {
                 x87gen::x87_codes(&x87gen::transcendental_mnemonics())
@@ -171,7 +183,9 @@ fn main() -> Result<()> {
             let mut cases = Vec::new();
             while cases.len() < count {
                 let c = match mode.as_str() {
-                    "x87" | "x87trans" => x87gen::x87_case(&mut g, &codes, max_instrs),
+                    "sse" => ssegen::sse_case(&mut g, &codes, max_instrs),
+                    "x87" => x87gen::x87_case(&mut g, &codes, max_instrs),
+                    "x87trans" => x87gen::x87_case_mode(&mut g, &codes, max_instrs, true),
                     "flow" => flowgen::flow_case(&mut g, &codes),
                     "instr" => g.case(&codes, max_instrs),
                     _ => if g.rng.random_bool(0.4) { flowgen::flow_case(&mut g, &codes) } else { g.case(&codes, max_instrs) },
@@ -217,6 +231,7 @@ fn main() -> Result<()> {
                     }
                 };
                 let fxmode = match mode.as_str() {
+                    "sse" => compare::FxCompare::Xmm,
                     "x87" => compare::FxCompare::X87,
                     "x87trans" => compare::FxCompare::X87Approx,
                     _ => compare::FxCompare::None,

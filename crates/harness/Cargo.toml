@@ -11,5 +11,6 @@ iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "d
 rand = "0.10.3"
 recomp = { version = "0.1.0", path = "../recomp" }
 wasm-encoder = "0.262.0"
+wasmparser = "0.262.0"
 wasmprinter = "0.262.0"
 wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "runtime", "std"] }

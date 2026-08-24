@@ -117,6 +117,9 @@ pub struct Fpu {
     /// A register operand had a zero exponent with nonzero significand (denormal or
     /// pseudo-denormal), which raises DE even when apfloat sees a normal value.
     reg_denormal: bool,
+    /// An unmasked exception was raised by the current instruction: it is aborted
+    /// (register stack and memory are left as they were; the status word keeps the flags).
+    aborted: bool,
     /// Set by `operand_or_indef` when an operand was empty or unsupported: the
     /// instruction's result is then the indefinite QNaN regardless of other operands.
     fault_operand: bool,
@@ -174,7 +177,7 @@ enum Arith {
 
 impl Fpu {
     pub fn new() -> Self {
-        Fpu { regs: [0; 8], tags: [3; 8], top: 0, cw: 0x037f, sw: 0, fip: 0, fop: 0, fdp: 0, cur_fop: 0, cur_fdp: 0, mem_denormal: false, mem_source: false, reg_denormal: false, fault_operand: false, unmasked_pending: false }
+        Fpu { regs: [0; 8], tags: [3; 8], top: 0, cw: 0x037f, sw: 0, fip: 0, fop: 0, fdp: 0, cur_fop: 0, cur_fdp: 0, mem_denormal: false, mem_source: false, reg_denormal: false, aborted: false, fault_operand: false, unmasked_pending: false }
     }
 
     // ---- state access --------------------------------------------------------
@@ -314,6 +317,7 @@ impl Fpu {
         if bits & !(self.cw & 0x3f) & 0x3f != 0 {
             self.fop = self.cur_fop;
             self.fdp = self.cur_fdp;
+            self.aborted = true;
         }
         self.refresh_es();
     }
@@ -603,18 +607,18 @@ impl Fpu {
                 let s = if v.is_signaling() { self.raise(SW_IE); quiet_single(s) } else { s };
                 self.raise(f);
                 self.c1_from_store(widen(s), v, f);
-                m.write(addr, &(s.to_bits() as u32).to_le_bytes());
+                if !self.aborted { m.write(addr, &(s.to_bits() as u32).to_le_bytes()); }
             }
             MemorySize::Float64 => {
                 let (d, f) = narrow::<rustc_apfloat::ieee::DoubleS>(v, rm);
                 let d = if v.is_signaling() { self.raise(SW_IE); quiet_double(d) } else { d };
                 self.raise(f);
                 self.c1_from_store(widen(d), v, f);
-                m.write(addr, &(d.to_bits() as u64).to_le_bytes());
+                if !self.aborted { m.write(addr, &(d.to_bits() as u64).to_le_bytes()); }
             }
             MemorySize::Float80 => {
                 self.clear_c1();
-                m.write(addr, &v.to_bits().to_le_bytes()[..10]);
+                if !self.aborted { m.write(addr, &v.to_bits().to_le_bytes()[..10]); }
             }
             _ => return false,
         }
@@ -649,10 +653,12 @@ impl Fpu {
             let back = Ext::from_i128(val).value;
             if back.abs() > v.abs() { self.sw |= SW_C1; }
         }
-        match bits {
-            16 => m.write(addr, &(val as i16).to_le_bytes()),
-            32 => m.write(addr, &(val as i32).to_le_bytes()),
-            _ => m.write(addr, &(val as i64).to_le_bytes()),
+        if !self.aborted {
+            match bits {
+                16 => m.write(addr, &(val as i16).to_le_bytes()),
+                32 => m.write(addr, &(val as i32).to_le_bytes()),
+                _ => m.write(addr, &(val as i64).to_le_bytes()),
+            }
         }
         true
     }
@@ -678,7 +684,7 @@ impl Fpu {
             }
             if v.is_negative() { out[9] = 0x80; }
         }
-        m.write(addr, &out);
+        if !self.aborted { m.write(addr, &out); }
     }
 
     // ---- compare ----------------------------------------------------------------
@@ -791,6 +797,16 @@ impl Fpu {
     /// `b` is packed per `args`. Returns the value some instructions hand back to the
     /// integer side (fnstsw ax: the status word; fcomi family: EFLAGS bits).
     pub fn exec(&mut self, mn: Mnemonic, a: u32, b: u32, ip: u32, fop: u16, m: &mut dyn Mem) -> i32 {
+        let snapshot = (self.regs, self.tags, self.top);
+        self.aborted = false;
+        let r = self.exec_inner(mn, a, b, ip, fop, m);
+        if self.aborted {
+            (self.regs, self.tags, self.top) = snapshot;
+        }
+        r
+    }
+
+    fn exec_inner(&mut self, mn: Mnemonic, a: u32, b: u32, ip: u32, fop: u16, m: &mut dyn Mem) -> i32 {
         use Mnemonic::*;
         let memsize: MemorySize = unsafe { std::mem::transmute(args::memsize(b) as u8) };
         let has_mem = args::memsize(b) != 0;
@@ -965,7 +981,7 @@ impl Fpu {
                         // 80-bit stores copy the raw image, unsupported encodings included
                         let bits = self.st_bits(0);
                         self.clear_c1();
-                        m.write(a, &bits.to_le_bytes()[..10]);
+                        if !self.aborted { m.write(a, &bits.to_le_bytes()[..10]); }
                         if mn == Fstp { self.pop(); }
                         return 0;
                     } else {
@@ -1330,10 +1346,30 @@ impl Fpu {
 
     fn transcendental(&mut self, mn: Mnemonic) {
         use Mnemonic::*;
-        let x = match self.operand(0) { Some(v) => v, None => return };
-        let xf = to_f64(x);
         let two_arg = matches!(mn, Fyl2x | Fyl2xp1 | Fpatan);
-        let y = if two_arg { match self.operand(1) { Some(v) => v, None => return } } else { Ext::ZERO };
+        if matches!(mn, Fsincos | Fptan) && self.push_would_overflow() {
+            // stack overflow: both results are indefinite
+            self.raise(SW_IE | SW_SF);
+            self.set_st_raw(0, Self::INDEFINITE_BITS, false);
+            self.push_raw(Self::INDEFINITE_BITS);
+            return;
+        }
+        let x = self.operand_or_indef(0);
+        let y = if two_arg { self.operand_or_indef(1) } else { Ext::ZERO };
+        if self.fault_operand {
+            // stack underflow: the destination becomes indefinite; stack motion still happens
+            if two_arg {
+                self.set_st_raw(1, Self::INDEFINITE_BITS, false);
+                self.pop();
+            } else {
+                self.set_st_raw(0, Self::INDEFINITE_BITS, false);
+                if matches!(mn, Fsincos | Fptan) {
+                    self.push_raw(Self::INDEFINITE_BITS);
+                }
+            }
+            return;
+        }
+        let xf = to_f64(x);
         let yf = to_f64(y);
         if x.is_signaling() || (two_arg && y.is_signaling()) { self.raise(SW_IE); }
         self.sw &= !(SW_C2 | SW_C1);
@@ -1412,8 +1448,9 @@ impl Fpu {
         }
     }
 
+    /// Transcendental results are produced at full 64-bit precision regardless of PC.
     fn round_constant_rm(&mut self, v: Ext) -> Ext {
-        self.round_constant(v)
+        v
     }
 }
 

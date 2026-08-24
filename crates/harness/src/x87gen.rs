@@ -116,6 +116,11 @@ fn random_f80(g: &mut Gen) -> [u8; 10] {
 }
 
 pub fn x87_case(g: &mut Gen, codes: &[Code], max_instrs: usize) -> Option<Case> {
+    x87_case_mode(g, codes, max_instrs, false)
+}
+
+/// `trans`: operands stay inside the domains of the transcendental instructions.
+pub fn x87_case_mode(g: &mut Gen, codes: &[Code], max_instrs: usize, trans: bool) -> Option<Case> {
     let n = g.rng.random_range(1..=max_instrs);
     let mut instrs = Vec::new();
     let mut used = Vec::new();
@@ -190,7 +195,18 @@ pub fn x87_case(g: &mut Gen, codes: &[Code], max_instrs: usize) -> Option<Case> 
     let k = g.rng.random_range(0..=8usize);
     let mut abridged = 0u8;
     for i in 0..k {
-        let v = random_f80(g);
+        let v = if trans {
+            // |x| < 0.25 keeps fyl2xp1/f2xm1 in range; positive values keep fyl2x defined
+            let f: f64 = g.rng.random_range(0.001..0.25) * if g.rng.random_bool(0.3) { -1.0 } else { 1.0 };
+            let mut b = [0u8; 10];
+            let bits = f.to_bits();
+            let (m, e) = ((bits & ((1 << 52) - 1)) | (1 << 52), ((bits >> 52) & 0x7ff) as i32 - 1023);
+            b[..8].copy_from_slice(&(m << 11).to_le_bytes());
+            b[8..10].copy_from_slice(&(((e + 16383) as u16) | if f < 0.0 { 0x8000 } else { 0 }).to_le_bytes());
+            b
+        } else {
+            random_f80(g)
+        };
         input.fx[32 + 16 * i..42 + 16 * i].copy_from_slice(&v);
         abridged |= 1 << i;
     }
