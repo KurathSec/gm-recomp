@@ -216,7 +216,7 @@ impl<'a> FuncEmit<'a> {
                 self.c(0xff);
                 self.i(W::I32And);
             }
-            _ => unreachable!(),
+            n => self.bad_width(n as u8 * 8),
         }
     }
 
@@ -253,7 +253,7 @@ impl<'a> FuncEmit<'a> {
                 self.i(W::I32Or);
                 self.set(l);
             }
-            _ => unreachable!(),
+            n => self.bad_width(n as u8 * 8),
         }
     }
 
@@ -317,8 +317,16 @@ impl<'a> FuncEmit<'a> {
             8 => W::I32Load8U(mem0()),
             16 => W::I32Load16U(mem0()),
             32 => W::I32Load(mem0()),
-            _ => unreachable!(),
+            _ => return self.bad_width(w),
         });
+    }
+
+    /// An operand width the integer paths do not handle (far pointers, or data that
+    /// speculative discovery decoded as code): trap if it is ever executed.
+    fn bad_width(&mut self, w: u8) {
+        self.unimplemented.push((self.ip, format!("operand width {w}")));
+        self.trap(trap::UNIMPLEMENTED, self.ip);
+        self.i(W::Unreachable);
     }
 
     pub(crate) fn store(&mut self, w: u8) {
@@ -326,7 +334,7 @@ impl<'a> FuncEmit<'a> {
             8 => W::I32Store8(mem0()),
             16 => W::I32Store16(mem0()),
             32 => W::I32Store(mem0()),
-            _ => unreachable!(),
+            _ => return self.bad_width(w),
         });
     }
 

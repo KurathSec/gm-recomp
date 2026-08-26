@@ -1802,13 +1802,20 @@ pub fn dispatch_exception(c: &mut Ctx, code: u32, flags: u32, addr: u32, params:
 /// back to AnsiString).
 fn delphi_exception_text(c: &Ctx, obj: u32) -> String {
     let vmt = c.host.read_u32(obj).unwrap_or(0);
-    let name_p = c.host.read_u32(vmt.wrapping_sub(56)).unwrap_or(0);
+    // vmtClassName is at -56 since Delphi 2009 and at -44 before (Delphi 7 builds GM8.0).
     let mut name = String::new();
-    if name_p != 0 {
+    for off in [56u32, 44] {
+        let name_p = c.host.read_u32(vmt.wrapping_sub(off)).unwrap_or(0);
+        if name_p == 0 {
+            continue;
+        }
         let n = c.host.read_u8(name_p).unwrap_or(0) as u32;
         let mut b = vec![0u8; n as usize];
         let _ = c.host.read(name_p + 1, &mut b);
-        name = String::from_utf8_lossy(&b).into_owned();
+        if n > 0 && b.iter().all(|ch| ch.is_ascii_alphanumeric() || *ch == b'_') {
+            name = String::from_utf8_lossy(&b).into_owned();
+            break;
+        }
     }
     let msg_p = c.host.read_u32(obj + 4).unwrap_or(0);
     let mut msg = String::new();

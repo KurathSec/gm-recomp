@@ -860,6 +860,29 @@ pub fn run(opts: RunOpts) -> Result<()> {
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let final_regs = read_regs(&mut store, &cpu);
+    {
+        // State fingerprint: registers plus every non-zero 64 KiB chunk of guest memory.
+        let data = memory.data(&store);
+        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+        let mut mix = |h: &mut u64, bytes: &[u8]| {
+            for &b in bytes {
+                *h ^= b as u64;
+                *h = h.wrapping_mul(0x0100_0000_01B3);
+            }
+        };
+        for r in [final_regs.eax, final_regs.ecx, final_regs.edx, final_regs.ebx, final_regs.esp, final_regs.ebp, final_regs.esi, final_regs.edi, final_regs.eip] {
+            mix(&mut h, &r.to_le_bytes());
+        }
+        let mut chunks = 0;
+        for (i, chunk) in data.chunks(65536).enumerate() {
+            if chunk.iter().any(|&b| b != 0) {
+                mix(&mut h, &(i as u32).to_le_bytes());
+                mix(&mut h, chunk);
+                chunks += 1;
+            }
+        }
+        eprintln!("state hash: {h:016x} ({chunks} non-zero 64K chunks)");
+    }
     for &(addr, len) in &opts.dump {
         let data = memory.data(&store);
         for row in (0..len).step_by(16) {
