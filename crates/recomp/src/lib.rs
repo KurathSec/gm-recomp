@@ -106,12 +106,20 @@ impl<'m> Translator<'m> {
             out_funcs.push((entry, name));
         }
 
+        let mut names = wasm_encoder::NameMap::new();
+        for (entry, name) in &out_funcs {
+            names.append(func_index[entry], name);
+        }
+        let mut name_section = wasm_encoder::NameSection::new();
+        name_section.functions(&names);
+
         let mut module = Module::new();
         module.section(&types);
         module.section(&imports);
         module.section(&functions);
         module.section(&exports);
         module.section(&code);
+        module.section(&name_section);
         Output { wasm: module.finish(), functions: out_funcs, unimplemented: std::mem::take(&mut self.unimplemented) }
     }
 }

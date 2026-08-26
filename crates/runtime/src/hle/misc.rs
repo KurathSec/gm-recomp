@@ -187,6 +187,308 @@ fn csidl_path(csidl: u32) -> Option<&'static str> {
     })
 }
 
+/// RT_VERSION resource bytes of a PE file on the guest file system.
+fn version_resource(c: &mut Ctx, path: &str) -> Option<Vec<u8>> {
+    let base = path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase();
+    let bytes = match c.p.module_by_name(&base) {
+        Some(m) => m.file.clone(),
+        None => match std::fs::read(c.p.host_path(path)) {
+            Ok(b) => b,
+            Err(_) => return system_dll_version(&base),
+        },
+    };
+    let pe = pe::Pe::parse(&bytes).ok()?;
+    let res = pe.resources().ok()?;
+    let r = res.iter().find(|r| matches!(r.kind, pe::ResId::Id(16)))?;
+    pe.resource_data(r).ok().map(|d| d.to_vec())
+}
+
+/// Version resources for the system DLLs the HLE layer stands in for (Windows 7 SP1).
+fn system_dll_version(name: &str) -> Option<Vec<u8>> {
+    let stem = name.trim_end_matches(".dll");
+    let known = ["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "d3d8", "d3d9", "ddraw", "dsound", "dinput8", "msvcrt", "shlwapi", "uxtheme", "wininet", "ws2_32", "wsock32", "imm32", "msimg32", "gdiplus", "dbghelp", "imagehlp"];
+    if !known.contains(&stem) {
+        return None;
+    }
+    // No manifest means the classic common controls (5.82).
+    let ver: [u16; 4] = if stem == "comctl32" { [5, 82, 7601, 17514] } else { [6, 1, 7601, 17514] };
+    Some(build_version_info(ver, &format!("{stem}.dll")))
+}
+
+fn ver_block(key: &str, ty: u16, value: &[u8], value_len: u16, children: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![0u8; 6];
+    for u in key.encode_utf16().chain([0]) {
+        b.extend_from_slice(&u.to_le_bytes());
+    }
+    while b.len() % 4 != 0 {
+        b.push(0);
+    }
+    b.extend_from_slice(value);
+    for ch in children {
+        while b.len() % 4 != 0 {
+            b.push(0);
+        }
+        b.extend_from_slice(ch);
+    }
+    let len = b.len() as u16;
+    b[0..2].copy_from_slice(&len.to_le_bytes());
+    b[2..4].copy_from_slice(&value_len.to_le_bytes());
+    b[4..6].copy_from_slice(&ty.to_le_bytes());
+    b
+}
+
+fn ver_string(key: &str, val: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    let units: Vec<u16> = val.encode_utf16().chain([0]).collect();
+    for u in &units {
+        v.extend_from_slice(&u.to_le_bytes());
+    }
+    ver_block(key, 1, &v, units.len() as u16, &[])
+}
+
+pub fn build_version_info(ver: [u16; 4], name: &str) -> Vec<u8> {
+    let ms = ((ver[0] as u32) << 16) | ver[1] as u32;
+    let ls = ((ver[2] as u32) << 16) | ver[3] as u32;
+    let mut fixed = Vec::new();
+    for x in [0xFEEF_04BDu32, 0x0001_0000, ms, ls, ms, ls, 0x3F, 0, 0x0004_0004, 2, 0, 0, 0] {
+        fixed.extend_from_slice(&x.to_le_bytes());
+    }
+    let vs = format!("{}.{}.{}.{}", ver[0], ver[1], ver[2], ver[3]);
+    let table = ver_block(
+        "040904B0",
+        1,
+        &[],
+        0,
+        &[
+            ver_string("CompanyName", "Microsoft Corporation"),
+            ver_string("FileDescription", name),
+            ver_string("FileVersion", &vs),
+            ver_string("InternalName", name),
+            ver_string("OriginalFilename", name),
+            ver_string("ProductName", "Microsoft\u{ae} Windows\u{ae} Operating System"),
+            ver_string("ProductVersion", &vs),
+        ],
+    );
+    let sfi = ver_block("StringFileInfo", 1, &[], 0, &[table]);
+    let mut tr = Vec::new();
+    tr.extend_from_slice(&0x0409u16.to_le_bytes());
+    tr.extend_from_slice(&0x04B0u16.to_le_bytes());
+    let var = ver_block("Translation", 0, &tr, 4, &[]);
+    let vfi = ver_block("VarFileInfo", 1, &[], 0, &[var]);
+    ver_block("VS_VERSION_INFO", 0, &fixed, 52, &[sfi, vfi])
+}
+
+fn version_size_result(c: &mut Ctx, path: &str, n: u32, nargs: u32) -> ApiResult {
+    let handle_arg = if nargs == 3 { 2 } else { 1 };
+    let h = c.arg(handle_arg);
+    if h != 0 {
+        let _ = c.host.write_u32(h, 0);
+    }
+    c.trace(format!("({path:?}) = {n}"));
+    if n == 0 {
+        c.set_last_error(1813);
+    }
+    ok(nargs, n)
+}
+
+fn get_version_info(c: &mut Ctx, path: &str, len: u32, out: u32) -> ApiResult {
+    match version_resource(c, path) {
+        Some(d) => {
+            let n = (d.len() as u32).min(len);
+            let _ = c.host.write(out, &d[..n as usize]);
+            ok(4, 1)
+        }
+        None => {
+            c.set_last_error(1813);
+            ok(4, 0)
+        }
+    }
+}
+
+/// One node of a VS_VERSIONINFO tree in guest memory.
+struct VerNode {
+    len: u32,
+    value_len: u32,
+    ty: u16,
+    key: String,
+    value: u32,
+    children: u32,
+}
+
+fn ver_node(c: &Ctx, p: u32) -> VerNode {
+    let len = c.host.read_u16(p).unwrap_or(0) as u32;
+    let value_len = c.host.read_u16(p + 2).unwrap_or(0) as u32;
+    let ty = c.host.read_u16(p + 4).unwrap_or(0);
+    let mut key = String::new();
+    let mut q = p + 6;
+    loop {
+        let u = c.host.read_u16(q).unwrap_or(0);
+        q += 2;
+        if u == 0 || key.len() > 64 {
+            break;
+        }
+        key.push(char::from_u32(u as u32).unwrap_or('?'));
+    }
+    let value = (q + 3) & !3;
+    let vbytes = if ty == 1 { value_len * 2 } else { value_len };
+    let children = (value + vbytes + 3) & !3;
+    VerNode { len, value_len, ty, key, value, children }
+}
+
+fn ver_query(c: &mut Ctx, wide: bool) -> ApiResult {
+    let block = c.arg(0);
+    let sub = if wide { c.wstr_arg(1) } else { c.str_arg(1) };
+    let (pptr, plen) = (c.arg(2), c.arg(3));
+    let mut start = block;
+    let mut node = ver_node(c, block);
+    for comp in sub.split('\\').filter(|s| !s.is_empty()) {
+        let end = start + node.len;
+        let mut p = node.children;
+        let mut found = None;
+        while p + 6 < end {
+            let ch = ver_node(c, p);
+            if ch.len == 0 {
+                break;
+            }
+            if ch.key.eq_ignore_ascii_case(comp) {
+                found = Some((p, ch));
+                break;
+            }
+            p = (p + ch.len + 3) & !3;
+        }
+        match found {
+            Some((p, ch)) => {
+                start = p;
+                node = ch;
+            }
+            None => {
+                c.trace(format!("({sub:?}): not found"));
+                return ok(4, 0);
+            }
+        }
+    }
+    let (ptr, len) = if node.ty == 1 && !wide {
+        let units: Vec<u16> = (0..node.value_len).map(|i| c.host.read_u16(node.value + 2 * i).unwrap_or(0)).collect();
+        let s = String::from_utf16_lossy(&units);
+        let s = s.trim_end_matches('\0').to_string();
+        let heap = c.p.process_heap;
+        let g: &mut dyn Guest = &mut *c.host;
+        let a = c.p.heap_alloc(g, heap, s.len() as u32 + 1, true);
+        let _ = c.host.write_cstr(a, s.as_bytes());
+        (a, s.len() as u32 + 1)
+    } else {
+        (node.value, node.value_len)
+    };
+    c.trace(format!("({sub:?}) = {ptr:#x} len {len}"));
+    if pptr != 0 {
+        let _ = c.host.write_u32(pptr, ptr);
+    }
+    if plen != 0 {
+        let _ = c.host.write_u32(plen, len);
+    }
+    ok(4, 1)
+}
+
+fn imagelist_append(c: &mut Ctx, h: u32) -> u32 {
+    match c.p.handles.get_mut(&h) {
+        Some(Handle::ImageList { count, .. }) => {
+            *count += 1;
+            (*count - 1) as u32
+        }
+        _ => 0xFFFF_FFFF,
+    }
+}
+
+/// Reads `n` bytes from a guest IStream (vtable slot 3: Read(this, pv, cb, pcbRead)).
+fn stream_read(c: &mut Ctx, stream: u32, n: u32) -> Result<Option<Vec<u8>>, super::ApiError> {
+    let heap = c.p.process_heap;
+    let g: &mut dyn Guest = &mut *c.host;
+    let buf = c.p.heap_alloc(g, heap, n + 4, true);
+    let vt = c.host.read_u32(stream).unwrap_or(0);
+    let read_fn = c.host.read_u32(vt + 12).unwrap_or(0);
+    let hr = c.call_guest(read_fn, &[stream, buf, n, buf + n])?;
+    let got = c.host.read_u32(buf + n).unwrap_or(0);
+    let mut out = vec![0u8; got.min(n) as usize];
+    let _ = c.host.read(buf, &mut out);
+    c.p.heap_free(buf);
+    if hr != 0 || got != n {
+        c.trace(format!(": IStream::Read({n}) at {read_fn:#x} = {hr:#x}, {got} bytes"));
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+/// Consumes one BMP (BITMAPFILEHEADER + DIB) from a stream. ImageList_Write puts only
+/// the header size in bfSize, so the length comes from the BITMAPINFOHEADER.
+fn stream_skip_bmp(c: &mut Ctx, stream: u32) -> Result<bool, super::ApiError> {
+    let Some(fh) = stream_read(c, stream, 14)? else { return Ok(false) };
+    if &fh[..2] != b"BM" {
+        c.trace(format!(": bitmap header {:02x?}", &fh[..]));
+        return Ok(false);
+    }
+    let Some(sz) = stream_read(c, stream, 4)? else { return Ok(false) };
+    let bisize = u32::from_le_bytes(sz[..4].try_into().unwrap());
+    if !(12..=124).contains(&bisize) {
+        return Ok(false);
+    }
+    let Some(rest) = stream_read(c, stream, bisize - 4)? else { return Ok(false) };
+    let mut ih = sz.clone();
+    ih.extend_from_slice(&rest);
+    let u32at = |o: usize| u32::from_le_bytes(ih[o..o + 4].try_into().unwrap());
+    let u16at = |o: usize| u16::from_le_bytes(ih[o..o + 2].try_into().unwrap()) as u32;
+    let (w, h, bpp) = if bisize == 12 { (u16at(4), u16at(6), u16at(10)) } else { (u32at(4), u32at(8), u16at(14)) };
+    let compression = if bisize >= 20 { u32at(16) } else { 0 };
+    let size_image = if bisize >= 24 { u32at(20) } else { 0 };
+    let clr_used = if bisize >= 36 { u32at(32) } else { 0 };
+    let colors = if clr_used != 0 { clr_used } else if bpp <= 8 { 1 << bpp } else { 0 };
+    let masks = if compression == 3 && bisize == 40 { 12 } else { 0 };
+    let table = colors * if bisize == 12 { 3 } else { 4 } + masks;
+    let stride = (w * bpp).div_ceil(32) * 4;
+    let bits = if size_image != 0 && compression != 0 { size_image } else { stride * (h as i32).unsigned_abs() };
+    Ok(stream_read(c, stream, table + bits)?.is_some())
+}
+
+/// ImageList_Read: ILHEAD, then the image bitmap and (with ILC_MASK) the mask bitmap.
+fn imagelist_read(c: &mut Ctx, stream: u32) -> Result<u32, super::ApiError> {
+    let Some(hd) = stream_read(c, stream, 28)? else { return Ok(0) };
+    let w = |i: usize| u16::from_le_bytes([hd[i], hd[i + 1]]);
+    if w(0) != 0x4C49 {
+        c.trace(format!(": bad magic {:#x}", w(0)));
+        return Ok(0);
+    }
+    let (count, cx, cy) = (w(4) as i32, w(10) as i32, w(12) as i32);
+    let bk = u32::from_le_bytes(hd[14..18].try_into().unwrap());
+    let flags = w(18) as u32;
+    if !stream_skip_bmp(c, stream)? {
+        return Ok(0);
+    }
+    if flags & 1 != 0 && !stream_skip_bmp(c, stream)? {
+        return Ok(0);
+    }
+    let h = c.p.new_handle(Handle::ImageList { cx, cy, count, flags, bk });
+    c.trace(format!(": {count} images {cx}x{cy} flags {flags:#x} = {h:#x}"));
+    Ok(h)
+}
+
+/// Data directory `dir` of the mapped image at `base` (address, writes size).
+fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
+    let e = c.host.read_u32(base + 0x3C).unwrap_or(0);
+    if c.host.read_u16(base).unwrap_or(0) != 0x5A4D || c.host.read_u32(base + e).unwrap_or(0) != 0x4550 || dir >= 16 {
+        return 0;
+    }
+    let nt = base + e;
+    let count = c.host.read_u32(nt + 0x74).unwrap_or(0);
+    if dir >= count {
+        return 0;
+    }
+    let rva = c.host.read_u32(nt + 0x78 + 8 * dir).unwrap_or(0);
+    let size = c.host.read_u32(nt + 0x7C + 8 * dir).unwrap_or(0);
+    if psize != 0 {
+        let _ = c.host.write_u32(psize, size);
+    }
+    if rva == 0 { 0 } else { base + rva }
+}
+
 pub fn register(r: &mut Registry) {
     // ---- advapi32 ------------------------------------------------------------
     let a = "advapi32.dll";
@@ -385,7 +687,6 @@ pub fn register(r: &mut Registry) {
         "CoUninitialize" => (0, 0),
         "OleInitialize" => (1, S_OK),
         "OleUninitialize" => (0, 0),
-        "CoCreateInstance" => (5, REGDB_E_CLASSNOTREG),
         "CoGetClassObject" => (5, REGDB_E_CLASSNOTREG),
         "CoCreateInstanceEx" => (6, REGDB_E_CLASSNOTREG),
         "CoRegisterClassObject" => (5, S_OK),
@@ -431,6 +732,25 @@ pub fn register(r: &mut Registry) {
         "CoInitializeSecurity" => (9, S_OK),
         "CoMarshalInterThreadInterfaceInStream" => (3, E_FAIL),
         "CoGetInterfaceAndReleaseStream" => (3, E_FAIL),
+    });
+    r.add(o, "CoCreateInstance", |c| {
+        let (clsid_p, iid_p, ppv) = (c.arg(0), c.arg(3), c.arg(4));
+        let mut g = [0u8; 16];
+        let _ = c.host.read(clsid_p, &mut g);
+        let clsid = super::com::format_iid(&g);
+        match super::com::create_instance(c, &clsid, iid_p, ppv) {
+            Some(hr) => {
+                c.trace(format!("({clsid}) = {hr:#x}"));
+                ok(5, hr)
+            }
+            None => {
+                c.p.log(format!("CoCreateInstance({clsid}): class not registered"));
+                if ppv != 0 {
+                    let _ = c.host.write_u32(ppv, 0);
+                }
+                ok(5, REGDB_E_CLASSNOTREG)
+            }
+        }
     });
     r.add(o, "CoTaskMemAlloc", |c| {
         let n = c.arg(0);
@@ -774,21 +1094,43 @@ pub fn register(r: &mut Registry) {
 
     // ---- version -------------------------------------------------------------------
     let v = "version.dll";
-    r.add(v, "GetFileVersionInfoSizeA", |c| {
-        let h = c.arg(1);
-        if h != 0 {
-            let _ = c.host.write_u32(h, 0);
-        }
-        c.set_last_error(1813);
-        ok(2, 0)
+    r.add(v, "GetFileVersionInfoSizeW", |c| {
+        let path = c.wstr_arg(0);
+        let n = version_resource(c, &path).map(|d| d.len() as u32 * 2).unwrap_or(0);
+        version_size_result(c, &path, n, 2)
     });
-    r.alias(v, "GetFileVersionInfoSizeW", v, "GetFileVersionInfoSizeA");
+    r.add(v, "GetFileVersionInfoSizeA", |c| {
+        let path = c.str_arg(0);
+        let n = version_resource(c, &path).map(|d| d.len() as u32 * 2).unwrap_or(0);
+        version_size_result(c, &path, n, 2)
+    });
+    r.add(v, "GetFileVersionInfoW", |c| {
+        let path = c.wstr_arg(0);
+        let (len, out) = (c.arg(2), c.arg(3));
+        get_version_info(c, &path, len, out)
+    });
+    r.add(v, "GetFileVersionInfoA", |c| {
+        let path = c.str_arg(0);
+        let (len, out) = (c.arg(2), c.arg(3));
+        get_version_info(c, &path, len, out)
+    });
+    r.add(v, "GetFileVersionInfoSizeExW", |c| {
+        let path = c.wstr_arg(1);
+        let n = version_resource(c, &path).map(|d| d.len() as u32 * 2).unwrap_or(0);
+        version_size_result(c, &path, n, 3)
+    });
+    r.add(v, "GetFileVersionInfoExW", |c| {
+        let path = c.wstr_arg(1);
+        let (len, out) = (c.arg(3), c.arg(4));
+        let r = get_version_info(c, &path, len, out)?;
+        Ok(Ret::stdcall(5, r.eax))
+    });
+    r.add(v, "VerQueryValueW", |c| ver_query(c, true));
+    r.add(v, "VerQueryValueA", |c| ver_query(c, false));
     const_apis!(r, v, {
-        "GetFileVersionInfoA" => (4, 0),
-        "GetFileVersionInfoW" => (4, 0),
-        "VerQueryValueA" => (4, 0),
-        "VerQueryValueW" => (4, 0),
         "VerLanguageNameA" => (3, 0),
+        "VerFindFileA" => (8, 0),
+        "VerInstallFileA" => (8, 0),
     });
 
     // ---- winmm -----------------------------------------------------------------------
@@ -920,25 +1262,128 @@ pub fn register(r: &mut Registry) {
     r.add(cc, "InitCommonControlsEx", |_c| ok(1, 1));
     r.alias(cc, "#17", cc, "InitCommonControls");
     r.add(cc, "ImageList_Create", |c| {
-        let h = c.p.new_handle(Handle::Dummy("imagelist"));
+        let (cx, cy, flags) = (c.arg_i32(0), c.arg_i32(1), c.arg(2));
+        let h = c.p.new_handle(Handle::ImageList { cx, cy, count: 0, flags, bk: 0xFFFF_FFFF });
         ok(5, h)
     });
     r.add(cc, "ImageList_Destroy", |c| {
         let h = c.arg(0);
-        c.p.handles.remove(&h);
-        ok(1, 1)
+        let r = matches!(c.p.handles.remove(&h), Some(Handle::ImageList { .. }));
+        ok(1, r as u32)
     });
     r.add(cc, "ImageList_GetIconSize", |c| {
-        let cx = c.arg(1);
-        let cy = c.arg(2);
-        let _ = c.host.write_u32(cx, 16);
-        let _ = c.host.write_u32(cy, 16);
+        let (h, pcx, pcy) = (c.arg(0), c.arg(1), c.arg(2));
+        let Some(Handle::ImageList { cx, cy, .. }) = c.p.handles.get(&h).cloned() else { return ok(3, 0) };
+        let _ = c.host.write_u32(pcx, cx as u32);
+        let _ = c.host.write_u32(pcy, cy as u32);
         ok(3, 1)
     });
+    r.add(cc, "ImageList_SetIconSize", |c| {
+        let (h, ncx, ncy) = (c.arg(0), c.arg_i32(1), c.arg_i32(2));
+        match c.p.handles.get_mut(&h) {
+            Some(Handle::ImageList { cx, cy, count, .. }) => {
+                *cx = ncx;
+                *cy = ncy;
+                *count = 0;
+                ok(3, 1)
+            }
+            _ => ok(3, 0),
+        }
+    });
+    r.add(cc, "ImageList_GetImageCount", |c| {
+        let h = c.arg(0);
+        let n = match c.p.handles.get(&h) {
+            Some(Handle::ImageList { count, .. }) => *count as u32,
+            _ => 0,
+        };
+        ok(1, n)
+    });
+    r.add(cc, "ImageList_SetImageCount", |c| {
+        let (h, n) = (c.arg(0), c.arg_i32(1));
+        match c.p.handles.get_mut(&h) {
+            Some(Handle::ImageList { count, .. }) => {
+                *count = n;
+                ok(2, 1)
+            }
+            _ => ok(2, 0),
+        }
+    });
+    for (name, nargs) in [("ImageList_Add", 3u32), ("ImageList_AddMasked", 3), ("ImageList_AddIcon", 2)] {
+        let f: super::ApiFn = match nargs {
+            3 => |c| {
+                let h = c.arg(0);
+                let idx = imagelist_append(c, h);
+                ok(3, idx)
+            },
+            _ => |c| {
+                let h = c.arg(0);
+                let idx = imagelist_append(c, h);
+                ok(2, idx)
+            },
+        };
+        r.add(cc, name, f);
+    }
+    r.add(cc, "ImageList_ReplaceIcon", |c| {
+        let (h, i) = (c.arg(0), c.arg_i32(1));
+        let idx = if i < 0 { imagelist_append(c, h) } else { i as u32 };
+        ok(3, idx)
+    });
+    r.add(cc, "ImageList_Remove", |c| {
+        let (h, i) = (c.arg(0), c.arg_i32(1));
+        match c.p.handles.get_mut(&h) {
+            Some(Handle::ImageList { count, .. }) => {
+                if i < 0 {
+                    *count = 0;
+                } else if i < *count {
+                    *count -= 1;
+                }
+                ok(2, 1)
+            }
+            _ => ok(2, 0),
+        }
+    });
+    r.add(cc, "ImageList_GetBkColor", |c| {
+        let h = c.arg(0);
+        let v = match c.p.handles.get(&h) {
+            Some(Handle::ImageList { bk, .. }) => *bk,
+            _ => 0xFFFF_FFFF,
+        };
+        ok(1, v)
+    });
+    r.add(cc, "ImageList_SetBkColor", |c| {
+        let (h, v) = (c.arg(0), c.arg(1));
+        let prev = match c.p.handles.get_mut(&h) {
+            Some(Handle::ImageList { bk, .. }) => std::mem::replace(bk, v),
+            _ => 0xFFFF_FFFF,
+        };
+        ok(2, prev)
+    });
+    r.add(cc, "ImageList_Read", |c| {
+        let stream = c.arg(0);
+        let h = imagelist_read(c, stream)?;
+        ok(1, h)
+    });
+    r.add(cc, "ImageList_ReadEx", |c| {
+        let (stream, ppv) = (c.arg(1), c.arg(3));
+        let h = imagelist_read(c, stream)?;
+        if ppv != 0 {
+            let _ = c.host.write_u32(ppv, h);
+        }
+        ok(4, if h != 0 { S_OK } else { E_FAIL })
+    });
+    r.add(cc, "ImageList_Write", |c| {
+        c.p.log("ImageList_Write: not supported".into());
+        ok(2, 0)
+    });
+    r.add(cc, "ImageList_Duplicate", |c| {
+        let h = c.arg(0);
+        let v = match c.p.handles.get(&h).cloned() {
+            Some(il @ Handle::ImageList { .. }) => c.p.new_handle(il),
+            _ => 0,
+        };
+        ok(1, v)
+    });
     const_apis!(r, cc, {
-        "ImageList_Add" => (3, 0),
-        "ImageList_AddMasked" => (3, 0),
-        "ImageList_AddIcon" => (2, 0),
         "ImageList_Copy" => (5, 1),
         "ImageList_BeginDrag" => (4, 0),
         "ImageList_EndDrag" => (0, 0),
@@ -949,24 +1394,14 @@ pub fn register(r: &mut Registry) {
         "ImageList_Draw" => (6, 1),
         "ImageList_DrawEx" => (10, 1),
         "ImageList_DrawIndirect" => (1, 1),
-        "ImageList_GetBkColor" => (1, 0xFFFF_FFFF),
-        "ImageList_SetBkColor" => (2, 0xFFFF_FFFF),
         "ImageList_GetDragImage" => (2, 0),
         "ImageList_GetIcon" => (3, 0),
-        "ImageList_GetImageCount" => (1, 0),
         "ImageList_GetImageInfo" => (3, 0),
         "ImageList_LoadImageA" => (7, 0),
         "ImageList_LoadImageW" => (7, 0),
-        "ImageList_Read" => (1, 0),
-        "ImageList_Write" => (2, 0),
-        "ImageList_Remove" => (2, 1),
         "ImageList_Replace" => (4, 1),
-        "ImageList_ReplaceIcon" => (3, 0),
-        "ImageList_SetIconSize" => (3, 1),
-        "ImageList_SetImageCount" => (2, 1),
         "ImageList_SetOverlayImage" => (3, 1),
         "ImageList_Merge" => (6, 0),
-        "ImageList_Duplicate" => (1, 0),
         "ImageList_SetDragCursorImage" => (4, 0),
         "FlatSB_GetScrollInfo" => (3, 0),
         "FlatSB_GetScrollPos" => (2, 0),
@@ -1352,10 +1787,57 @@ pub fn register(r: &mut Registry) {
         "SymGetModuleBase" => (2, 0),
         "SymGetModuleBase64" => (2, 0),
         "MiniDumpWriteDump" => (7, 0),
-        "ImageNtHeader" => (1, 0),
         "UnDecorateSymbolName" => (4, 0),
     });
-    for name in ["SymInitialize", "SymCleanup", "SymGetLineFromAddr", "StackWalk", "SymFunctionTableAccess", "SymGetModuleBase", "SymGetSymFromAddr", "ImageNtHeader", "UnDecorateSymbolName", "SymSetOptions", "SymGetOptions", "SymLoadModule", "SymGetModuleInfo"] {
+    const_apis!(r, "dbghelp.dll", {
+        "SymInitializeW" => (3, 0),
+        "SymFromAddrW" => (4, 0),
+        "SymGetLineFromAddrW64" => (4, 0),
+        "SymLoadModuleExW" => (8, 0),
+        "SymGetModuleInfoW" => (3, 0),
+        "SymGetModuleInfoW64" => (3, 0),
+        "SymGetSearchPathW" => (3, 0),
+        "SymSetSearchPathW" => (2, 0),
+        "SymGetSymFromAddr64" => (4, 0),
+        "SymLoadModule64" => (6, 0),
+        "SymGetModuleInfo64" => (3, 0),
+        "SymUnloadModule" => (2, 0),
+        "SymUnloadModule64" => (3, 0),
+        "SymEnumerateModules" => (3, 0),
+    });
+    r.add("dbghelp.dll", "ImageDirectoryEntryToData", |c| {
+        let (base, mapped, dir, psize) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        let _ = mapped;
+        let v = image_directory(c, base, dir, psize);
+        ok(4, v)
+    });
+    r.add("dbghelp.dll", "ImageDirectoryEntryToDataEx", |c| {
+        let (base, dir, psize, phdr) = (c.arg(0), c.arg(2), c.arg(3), c.arg(4));
+        if phdr != 0 {
+            let _ = c.host.write_u32(phdr, 0);
+        }
+        let v = image_directory(c, base, dir, psize);
+        ok(5, v)
+    });
+    r.alias("imagehlp.dll", "ImageDirectoryEntryToData", "dbghelp.dll", "ImageDirectoryEntryToData");
+    r.alias("imagehlp.dll", "ImageDirectoryEntryToDataEx", "dbghelp.dll", "ImageDirectoryEntryToDataEx");
+    r.add("dbghelp.dll", "ImageNtHeader", |c| {
+        let base = c.arg(0);
+        let e = c.host.read_u32(base + 0x3C).unwrap_or(0);
+        let ok_ = c.host.read_u16(base).unwrap_or(0) == 0x5A4D && c.host.read_u32(base + e).unwrap_or(0) == 0x4550;
+        ok(1, if ok_ { base + e } else { 0 })
+    });
+    r.alias("imagehlp.dll", "ImageNtHeader", "dbghelp.dll", "ImageNtHeader");
+    r.alias("ntdll.dll", "RtlImageNtHeader", "dbghelp.dll", "ImageNtHeader");
+    r.add("ntdll.dll", "RtlImageDirectoryEntryToData", |c| {
+        let (base, dir, psize) = (c.arg(0), c.arg(2), c.arg(3));
+        let v = image_directory(c, base, dir, psize);
+        ok(4, v)
+    });
+    for name in ["SymInitializeW", "SymFromAddrW", "SymGetLineFromAddrW64", "SymLoadModuleExW", "SymGetModuleInfoW", "SymGetModuleInfoW64", "SymGetSearchPathW", "SymSetSearchPathW", "SymGetSymFromAddr64", "SymLoadModule64", "SymGetModuleInfo64", "SymUnloadModule", "SymUnloadModule64", "SymEnumerateModules", "SymGetLineFromAddr64", "StackWalk64", "SymFunctionTableAccess64", "SymGetModuleBase64"] {
+        r.alias("imagehlp.dll", name, "dbghelp.dll", name);
+    }
+    for name in ["SymInitialize", "SymCleanup", "SymGetLineFromAddr", "StackWalk", "SymFunctionTableAccess", "SymGetModuleBase", "SymGetSymFromAddr", "UnDecorateSymbolName", "SymSetOptions", "SymGetOptions", "SymLoadModule", "SymGetModuleInfo"] {
         r.alias("imagehlp.dll", name, "dbghelp.dll", name);
     }
     const_apis!(r, "usp10.dll", {

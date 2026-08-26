@@ -1541,6 +1541,11 @@ fn draw_text(c: &mut Ctx, wide: bool, ex: bool) -> ApiResult {
     ok(if ex { 6 } else { 5 }, h as u32)
 }
 
+/// A child window created on behalf of an HLE component (no window procedure).
+pub fn create_simple_child(c: &mut Ctx, class: &str, parent: u32, x: i32, y: i32, w: i32, h: i32) -> u32 {
+    create_window(c, 0, class, "", WS_CHILD | 0x1000_0000, x, y, w, h, parent, 0, 0, 0).unwrap_or(0)
+}
+
 pub fn register_more(r: &mut Registry) {
     let u = "user32.dll";
     // ---- characters ----------------------------------------------------------------
@@ -1878,6 +1883,9 @@ pub fn register_more(r: &mut Registry) {
     r.alias(u, "ChangeDisplaySettingsExA", u, "ChangeDisplaySettingsExW");
     r.add(u, "EnumDisplayDevicesW", |_c| ok(4, 0));
     r.add(u, "EnumDisplayDevicesA", |_c| ok(4, 0));
+    r.add(u, "WINNLSEnableIME", |_c| ok(2, 1));
+    r.add(u, "WINNLSGetEnableStatus", |_c| ok(1, 1));
+    r.add(u, "WINNLSGetIMEHotkey", |_c| ok(1, 0));
     r.add(u, "PhysicalToLogicalPoint", |_c| ok(2, 1));
     r.add(u, "LogicalToPhysicalPoint", |_c| ok(2, 1));
     r.add(u, "GetGestureInfo", |_c| ok(2, 0));

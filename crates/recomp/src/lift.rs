@@ -784,6 +784,12 @@ impl<'a> FuncEmit<'a> {
 
     pub fn emit(&mut self) {
         self.load_state();
+        // Blocks are laid out by address; the entry need not be the first one.
+        let entry_index = self.index[&self.cfg.entry];
+        if entry_index != 0 {
+            self.c(entry_index);
+            self.set(L_BLK);
+        }
         let n = self.order.len() as u32;
         // block $fail; loop $top; block b_{n-1} ... block b_0; br_table; end b_0; code 0; end b_1; code 1; ...
         self.i(W::Block(BlockType::Empty));
@@ -823,7 +829,7 @@ impl<'a> FuncEmit<'a> {
             self.ip = instr.ip() as u32;
             self.next_ip = instr.next_ip() as u32;
             self.needed = needs[k];
-            let is_term = k == last && !matches!(block.term, Term::Fall(_));
+            let is_term = k == last && !matches!(block.term, Term::Fall(_) | Term::Bad(_));
             if is_term {
                 self.emit_terminator(instr, &block.term, live_out);
             } else {
@@ -836,11 +842,20 @@ impl<'a> FuncEmit<'a> {
                 self.goto(next);
             }
         }
+        if let Term::Bad(ip) = block.term {
+            self.materialize(live_out);
+            self.ip = ip;
+            self.trap(trap::UD2, ip);
+            self.c(ip);
+            self.i(W::GlobalSet(Global::Eip as u32));
+            self.spill_all();
+            self.i(W::Return);
+        }
     }
 
     fn emit_terminator(&mut self, instr: &Instruction, term: &Term, live_out: u8) {
         match term {
-            Term::Fall(_) => unreachable!(),
+            Term::Fall(_) | Term::Bad(_) => unreachable!(),
             Term::Jump(target) => {
                 self.materialize(live_out);
                 if self.index[target] != self.cur_block as u32 + 1 {
@@ -891,18 +906,25 @@ impl<'a> FuncEmit<'a> {
                 // Each case: set blk and branch to the loop. Use a nested block ladder;
                 // the index is pushed inside the innermost block (operands do not cross blocks).
                 let n = cases.len() as u32;
+                // Outermost block: indices outside the discovered table (Delphi's Move
+                // indexes its table with negative values) jump through memory.
+                self.i(W::Block(BlockType::Empty));
                 for _ in 0..n {
                     self.i(W::Block(BlockType::Empty));
                 }
                 self.read_reg(ix);
-                self.i(W::BrTable(Cow::Owned((0..n).collect()), n - 1));
+                self.i(W::BrTable(Cow::Owned((0..n).collect()), n));
                 for (k, &case) in cases.iter().enumerate() {
                     self.i(W::End);
                     self.c(case);
                     self.set(L_BLK);
                     let remaining = n - 1 - k as u32;
-                    self.i(W::Br(depth + remaining));
+                    self.i(W::Br(depth + remaining + 1));
                 }
+                self.i(W::End);
+                self.read_op(instr, 0, false);
+                self.set(L_T1);
+                self.tail_dynamic();
             }
             Term::TailCall(target) => self.tail_static(*target),
             Term::IndirectTail => {
@@ -2096,7 +2118,7 @@ fn liveness(cfg: &Cfg) -> HashMap<u32, u8> {
         let mut changed = false;
         for (&start, b) in cfg.blocks.iter().rev() {
             let out = match b.term {
-                Term::Ret | Term::TailCall(_) | Term::IndirectTail | Term::Trap => flags::ALL,
+                Term::Ret | Term::TailCall(_) | Term::IndirectTail | Term::Trap | Term::Bad(_) => flags::ALL,
                 _ => b.successors().iter().map(|s| live_in[s]).fold(0, |a, x| a | x),
             };
             let (used, def) = usedef[&start];

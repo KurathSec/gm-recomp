@@ -30,6 +30,8 @@ pub enum Term {
     IndirectTail,
     Ret,
     Trap,
+    /// Undecodable or unmapped bytes at this address: executing them faults (#UD).
+    Bad(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -77,19 +79,19 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
         if let Some((&bstart, _)) = blocks.range(..start).next_back() {
             let b = &blocks[&bstart];
             if start < b.end() {
-                let b = blocks.remove(&bstart).unwrap();
-                let split = b.instrs.iter().position(|i| i.ip() as u32 == start);
-                let Some(split) = split else {
-                    return Err(format!("branch into the middle of an instruction at {start:#x}"));
-                };
-                let (head, tail) = b.instrs.split_at(split);
-                blocks.insert(bstart, Block { start: bstart, instrs: head.to_vec(), term: Term::Fall(start) });
-                blocks.insert(start, Block { start, instrs: tail.to_vec(), term: b.term.clone() });
-                continue;
+                // A branch into the middle of an instruction decodes an overlapping block.
+                if let Some(split) = b.instrs.iter().position(|i| i.ip() as u32 == start) {
+                    let b = blocks.remove(&bstart).unwrap();
+                    let (head, tail) = b.instrs.split_at(split);
+                    blocks.insert(bstart, Block { start: bstart, instrs: head.to_vec(), term: Term::Fall(start) });
+                    blocks.insert(start, Block { start, instrs: tail.to_vec(), term: b.term.clone() });
+                    continue;
+                }
             }
         }
         let mut instrs = Vec::new();
         let mut ip = start;
+        let mut zero_run = 0;
         let term;
         loop {
             if blocks.contains_key(&ip) && ip != start {
@@ -98,12 +100,14 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
             }
             let n = (0..16).rev().find(|&n| mem.read(ip, &mut buf[..n])).unwrap_or(0);
             if n == 0 {
-                return Err(format!("unmapped code at {ip:#x}"));
+                term = Term::Bad(ip);
+                break;
             }
             let mut decoder = Decoder::with_ip(32, &buf[..n], ip as u64, DecoderOptions::NONE);
             let instr = decoder.decode();
             if instr.is_invalid() {
-                return Err(format!("invalid instruction at {ip:#x}"));
+                term = Term::Bad(ip);
+                break;
             }
             total += 1;
             if format!("{:?}", instr.mnemonic()).starts_with('F') && instr.mnemonic() != Mnemonic::Femms {
@@ -127,7 +131,22 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
                 term = Term::Trap;
                 break;
             }
+            // Runs of `add [eax],al` (00 00) are zero-filled memory, not code.
+            if instr.code() == iced_x86::Code::Add_rm8_r8 && buf[0] == 0 && buf[1] == 0 {
+                zero_run += 1;
+                if zero_run >= 8 {
+                    term = Term::Bad(ip);
+                    break;
+                }
+            } else {
+                zero_run = 0;
+            }
             match instr.flow_control() {
+                FlowControl::Call if instr.op0_kind() == OpKind::NearBranch32 && pops_return_address(mem, instr.near_branch_target() as u32, next) => {
+                    // `call x` where x starts with `pop r32` (Delphi MakeObjectInstance and
+                    // similar thunks): the bytes after the call are data the callee consumes.
+                    term = Term::Bad(next);
+                }
                 FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
                     ip = next;
                     continue;
@@ -159,6 +178,13 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
         blocks.insert(start, block);
     }
     Ok(Cfg { entry, blocks, fop })
+}
+
+/// The call target pops its return address right away (and is not the `call $+5`
+/// get-PC idiom, whose continuation is real code).
+fn pops_return_address(mem: &dyn GuestMem, target: u32, next: u32) -> bool {
+    let mut b = [0u8; 1];
+    target != next && mem.read(target, &mut b) && (0x58..=0x5F).contains(&b[0])
 }
 
 /// Whether an instruction's memory operand is just `[disp32]` with a jump-table shape.

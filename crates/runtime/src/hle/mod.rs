@@ -2,6 +2,7 @@
 //! stdcall arguments from the guest stack and returns the value for EAX plus how
 //! many argument bytes the callee pops.
 
+pub mod com;
 pub mod d3d8;
 pub mod gdi32;
 pub mod kernel32;
@@ -142,7 +143,9 @@ impl Registry {
         gdi32::register(&mut r);
         misc::register(&mut r);
         d3d8::register(&mut r);
+        com::register(&mut r);
         kernel32::register_more(&mut r);
+        kernel32::register_paths(&mut r);
         user32::register_more(&mut r);
         r
     }

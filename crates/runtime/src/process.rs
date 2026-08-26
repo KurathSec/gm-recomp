@@ -32,6 +32,7 @@ pub enum Handle {
     Resource { addr: u32, size: u32 },
     Window(u32),
     Gdi(GdiObject),
+    ImageList { cx: i32, cy: i32, count: i32, flags: u32, bk: u32 },
     Timer,
     Dummy(&'static str),
 }
@@ -178,6 +179,10 @@ pub struct Process {
     pub exe_path: String,
     pub cwd: String,
     pub host_root: std::path::PathBuf,
+    /// Writable layer over `host_root` (copy-on-write); None writes in place.
+    pub write_root: Option<std::path::PathBuf>,
+    /// Guest paths (relative, lowercase) deleted from the read-only layer.
+    pub deleted: std::collections::HashSet<String>,
     pub env: Vec<(String, String)>,
     /// Virtual clock in microseconds since process start.
     pub clock_us: u64,
@@ -200,6 +205,9 @@ pub struct Process {
     pub d3d_objects: HashMap<u32, D3dObject>,
     /// COM interface name -> vtable address in guest memory.
     pub com_vtables: HashMap<&'static str, u32>,
+    /// Interface pointer -> (object base, interface index) for HLE COM objects.
+    pub com_ifaces: HashMap<u32, (u32, u32)>,
+    pub com_classes: HashMap<u32, &'static [&'static crate::hle::com::Interface]>,
     pub draw_calls: u64,
     pub textures_created: u64,
     pub next_d3d_handle: u32,
@@ -243,6 +251,8 @@ impl Process {
             exe_path: exe_path.to_string(),
             cwd,
             host_root,
+            write_root: None,
+            deleted: Default::default(),
             env: vec![
                 ("PATH".into(), "C:\\Windows\\system32;C:\\Windows".into()),
                 ("SystemRoot".into(), "C:\\Windows".into()),
@@ -273,6 +283,8 @@ impl Process {
             frame_limit: u64::MAX,
             d3d_objects: HashMap::new(),
             com_vtables: HashMap::new(),
+            com_ifaces: HashMap::new(),
+            com_classes: HashMap::new(),
             draw_calls: 0,
             textures_created: 0,
             next_d3d_handle: 0x1000,
@@ -344,24 +356,102 @@ impl Process {
         self.fake_modules.iter().find(|(_, b)| **b == base).map(|(n, _)| n.as_str())
     }
 
-    /// Maps a guest path to the host file system (game directory = C:\game).
-    pub fn host_path(&self, guest: &str) -> std::path::PathBuf {
+    /// Path components of a guest path relative to the game directory (C:\game);
+    /// other drives and directories map below it too.
+    pub fn guest_rel(&self, guest: &str) -> Vec<String> {
         let mut p = guest.replace('/', "\\");
         if !p.contains(':') && !p.starts_with("\\\\") {
             p = format!("{}\\{}", self.cwd.trim_end_matches('\\'), p.trim_start_matches('\\'));
         }
         let lower = p.to_lowercase();
-        let root = self.cwd.to_lowercase();
-        let rel = if lower.starts_with(&root) { &p[root.len()..] } else { &p[..] };
-        let mut out = self.host_root.clone();
+        let root = "c:\\game";
+        let rel = if lower.starts_with(root) { &p[root.len()..] } else { &p[..] };
+        let mut out: Vec<String> = Vec::new();
         for comp in rel.split('\\').filter(|c| !c.is_empty() && *c != ".") {
             if comp == ".." {
                 out.pop();
             } else if comp.ends_with(':') {
-                // other drives map under the root too
-                out.push(comp.trim_end_matches(':'));
+                out.push(comp.trim_end_matches(':').to_string());
             } else {
-                out.push(comp);
+                out.push(comp.to_string());
+            }
+        }
+        out
+    }
+
+    fn join(root: &std::path::Path, rel: &[String]) -> std::path::PathBuf {
+        let mut out = root.to_path_buf();
+        for c in rel {
+            out.push(c);
+        }
+        out
+    }
+
+    /// Resolves a guest path for reading: the writable layer first, then the game files.
+    pub fn host_path(&self, guest: &str) -> std::path::PathBuf {
+        let rel = self.guest_rel(guest);
+        let key = rel.join("\\").to_lowercase();
+        if let Some(w) = &self.write_root {
+            let wp = Self::join(w, &rel);
+            if self.deleted.contains(&key) || wp.exists() {
+                return wp;
+            }
+        }
+        Self::join(&self.host_root, &rel)
+    }
+
+    /// Resolves a guest path for writing. With a writable layer, the file (or
+    /// directory) is copied up from the game files first so writes never touch them.
+    pub fn host_path_w(&mut self, guest: &str) -> std::path::PathBuf {
+        let rel = self.guest_rel(guest);
+        let key = rel.join("\\").to_lowercase();
+        let Some(w) = self.write_root.clone() else { return Self::join(&self.host_root, &rel) };
+        let wp = Self::join(&w, &rel);
+        if !wp.exists() && !self.deleted.contains(&key) {
+            let base = Self::join(&self.host_root, &rel);
+            if let Some(parent) = wp.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if base.is_file() {
+                let _ = std::fs::copy(&base, &wp);
+            } else if base.is_dir() {
+                let _ = std::fs::create_dir_all(&wp);
+            }
+        } else if let Some(parent) = wp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        self.deleted.remove(&key);
+        wp
+    }
+
+    /// Hides a guest path from the read-only layer (after DeleteFile/RemoveDirectory).
+    pub fn mark_deleted(&mut self, guest: &str) {
+        if self.write_root.is_some() {
+            let key = self.guest_rel(guest).join("\\").to_lowercase();
+            self.deleted.insert(key);
+        }
+    }
+
+    /// Directory listing merged over both layers: (name, host path).
+    pub fn list_dir(&self, guest_dir: &str) -> Vec<(String, std::path::PathBuf)> {
+        let rel = self.guest_rel(guest_dir);
+        let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut roots = vec![self.host_root.clone()];
+        if let Some(w) = &self.write_root {
+            roots.insert(0, w.clone());
+        }
+        for root in roots {
+            let Ok(rd) = std::fs::read_dir(Self::join(&root, &rel)) else { continue };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let mut key_rel = rel.clone();
+                key_rel.push(name.clone());
+                if self.deleted.contains(&key_rel.join("\\").to_lowercase()) {
+                    continue;
+                }
+                if !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    out.push((name, e.path()));
+                }
             }
         }
         out
@@ -426,6 +516,31 @@ impl Process {
         self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE });
         self.main_thread = 0x1238;
         Ok((TEB_BASE, stack_top))
+    }
+
+    /// Implicit TLS of statically loaded images: each module with a TLS directory
+    /// gets an index and a copy of its template in the TEB's ThreadLocalStoragePointer array.
+    pub fn setup_static_tls(&mut self, mem: &mut dyn Guest) -> Result<(), String> {
+        let templates: Vec<(u32, (u32, u32, u32))> = self.modules.iter().filter_map(|m| m.tls_template.map(|t| (m.tls_index_va, t))).collect();
+        if templates.is_empty() {
+            return Ok(());
+        }
+        let heap = self.process_heap;
+        let array = self.heap_alloc(mem, heap, 4 * 64, true);
+        for (i, (index_va, (start, end, zero))) in templates.into_iter().enumerate() {
+            let len = end.saturating_sub(start);
+            let block = self.heap_alloc(mem, heap, len + zero + 16, true);
+            let mut buf = vec![0u8; len as usize];
+            mem.read(start, &mut buf).map_err(|e| e.to_string())?;
+            mem.write(block, &buf).map_err(|e| e.to_string())?;
+            mem.write_u32(array + 4 * i as u32, block).map_err(|e| e.to_string())?;
+            if index_va != 0 {
+                mem.write_u32(index_va, i as u32).map_err(|e| e.to_string())?;
+            }
+            self.tls_used[i] = true;
+        }
+        mem.write_u32(TEB_BASE + 0x2C, array).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn create_heap(&mut self, mem: &mut dyn Guest, size: u32) -> Result<u32, String> {

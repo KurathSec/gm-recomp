@@ -66,6 +66,8 @@ pub fn stock(c: &mut Ctx, i: u32) -> u32 {
         15 => GdiObject::Palette,
         18 => GdiObject::Brush { color: 0xFF_FFFF },
         19 => GdiObject::Pen { color: 0 },
+        // DEFAULT_BITMAP: what a fresh memory DC has selected.
+        21 => GdiObject::Bitmap { w: 1, h: 1, bpp: 1, bits: 0, pitch: 4 },
         _ => return 0,
     };
     let h = c.p.new_gdi(o);
@@ -78,7 +80,8 @@ pub fn create_dc(c: &mut Ctx, hwnd: u32) -> u32 {
     let font = stock(c, 13);
     let brush = stock(c, 0);
     let pen = stock(c, 7);
-    c.p.new_gdi(GdiObject::Dc { hwnd, font, brush, pen, bitmap: 0, text_color: 0, bk_color: 0xFF_FFFF, bk_mode: 2 })
+    let bitmap = stock(c, 21);
+    c.p.new_gdi(GdiObject::Dc { hwnd, font, brush, pen, bitmap, text_color: 0, bk_color: 0xFF_FFFF, bk_mode: 2 })
 }
 
 fn valloc(c: &mut Ctx, size: u32) -> u32 {

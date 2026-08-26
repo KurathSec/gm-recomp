@@ -96,6 +96,18 @@ enum Cmd {
         /// Do not print the log tail at the end.
         #[arg(long)]
         quiet: bool,
+        /// Wall-clock limit in seconds.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        /// Show the last N dispatcher targets at the end.
+        #[arg(long, default_value_t = 0)]
+        recent: usize,
+        /// Hex-dump guest memory at the end, as addr:len (hex), repeatable.
+        #[arg(long)]
+        dump: Vec<String>,
+        /// Keep files the game wrote in earlier runs.
+        #[arg(long)]
+        keep_writes: bool,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -140,8 +152,15 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet } => {
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet })
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes } => {
+            let dump = dump
+                .iter()
+                .map(|d| {
+                    let (a, l) = d.split_once(':').ok_or_else(|| anyhow::anyhow!("--dump wants addr:len"))?;
+                    Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

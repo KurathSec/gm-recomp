@@ -1071,31 +1071,6 @@ pub fn register(r: &mut Registry) {
         ok(4, 1)
     });
     r.add(k, "SetFileTime", |_c| ok(4, 1));
-    r.add(k, "DeleteFileA", |c| {
-        let path = c.str_arg(0);
-        let hp = c.p.host_path(&path);
-        ok(1, std::fs::remove_file(hp).is_ok() as u32)
-    });
-    r.add(k, "MoveFileA", |c| {
-        let (a, b) = (c.str_arg(0), c.str_arg(1));
-        let (ha, hb) = (c.p.host_path(&a), c.p.host_path(&b));
-        ok(2, std::fs::rename(ha, hb).is_ok() as u32)
-    });
-    r.add(k, "CopyFileA", |c| {
-        let (a, b) = (c.str_arg(0), c.str_arg(1));
-        let (ha, hb) = (c.p.host_path(&a), c.p.host_path(&b));
-        ok(3, std::fs::copy(ha, hb).is_ok() as u32)
-    });
-    r.add(k, "CreateDirectoryA", |c| {
-        let path = c.str_arg(0);
-        let hp = c.p.host_path(&path);
-        ok(2, std::fs::create_dir_all(hp).is_ok() as u32)
-    });
-    r.add(k, "RemoveDirectoryA", |c| {
-        let path = c.str_arg(0);
-        let hp = c.p.host_path(&path);
-        ok(1, std::fs::remove_dir(hp).is_ok() as u32)
-    });
     r.add(k, "GetFullPathNameA", |c| {
         let path = c.str_arg(0);
         let full = if path.contains(':') { path.clone() } else { format!("{}\\{}", c.p.cwd, path) };
@@ -1291,19 +1266,27 @@ pub fn register(r: &mut Registry) {
     let _ = ERROR_SUCCESS;
 }
 
+/// DLLs the HLE layer always provides, even if a file of that name exists.
+const CORE_DLLS: &[&str] = &["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid"];
+/// Further HLE DLLs, used when the game does not ship its own copy.
+const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
+
+fn dll_stem(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let base = lower.rsplit(['\\', '/']).next().unwrap_or(&lower).to_string();
+    base.trim_end_matches(".dll").to_string()
+}
+
 fn module_handle(c: &mut Ctx, name: &str) -> u32 {
     if name.is_empty() {
         return c.p.modules.first().map(|m| m.base).unwrap_or(0x40_0000);
     }
-    if let Some(m) = c.p.module_by_name(name.rsplit('\\').next().unwrap_or(name)) {
+    if let Some(m) = c.p.module_by_name(name.rsplit(['\\', '/']).next().unwrap_or(name)) {
         return m.base;
     }
-    let lower = name.to_lowercase();
-    let stem = lower.rsplit('\\').next().unwrap_or(&lower).to_string();
-    let known = ["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "d3d8", "d3d9", "ddraw", "dsound", "dinput8", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "msvcrt", "wininet", "dbghelp", "gdiplus", "olepro32", "dplayx", "d3dx8", "windowscodecs", "imagehlp", "xinput1_3", "xinput1_4", "dinput"];
-    let stem_nodll = stem.trim_end_matches(".dll");
-    if known.contains(&stem_nodll) || known.contains(&stem.as_str()) {
-        return c.p.fake_module(stem_nodll);
+    let stem = dll_stem(name);
+    if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.fake_modules.contains_key(&format!("{stem}.dll")) {
+        return c.p.fake_module(&stem);
     }
     0
 }
@@ -1322,22 +1305,29 @@ fn module_path(c: &mut Ctx, base: u32) -> String {
 }
 
 fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
-    let h = module_handle(c, name);
-    if h != 0 {
-        return Ok(h);
+    if let Some(m) = c.p.module_by_name(name.rsplit(['\\', '/']).next().unwrap_or(name)) {
+        return Ok(m.base);
     }
-    let hp = c.p.host_path(name);
-    let bytes = match std::fs::read(&hp) {
-        Ok(b) if hp.is_file() => b,
-        _ => {
-            c.p.log(format!("LoadLibrary({name:?}): not found"));
-            c.set_last_error(ERROR_MOD_NOT_FOUND);
-            return Ok(0);
+    let stem = dll_stem(name);
+    if CORE_DLLS.contains(&stem.as_str()) {
+        return Ok(c.p.fake_module(&stem));
+    }
+    // A DLL the game ships (or extracted at run time) is loaded and recompiled.
+    let with_ext = if name.to_lowercase().ends_with(".dll") || name.contains('.') { name.to_string() } else { format!("{name}.dll") };
+    let hp = c.p.host_path(&with_ext);
+    if hp.is_file() {
+        if let Ok(bytes) = std::fs::read(&hp) {
+            let base_name = with_ext.rsplit(['\\', '/']).next().unwrap_or(&with_ext).to_string();
+            let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
+            return load_image(c, &base_name, &guest_path, bytes, true);
         }
-    };
-    let base_name = name.rsplit(['\\', '/']).next().unwrap_or(name).to_string();
-    let guest_path = if name.contains(':') { name.to_string() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), name.trim_start_matches('\\')) };
-    load_image(c, &base_name, &guest_path, bytes, true)
+    }
+    if HLE_DLLS.contains(&stem.as_str()) {
+        return Ok(c.p.fake_module(&stem));
+    }
+    c.p.log(format!("LoadLibrary({name:?}): not found"));
+    c.set_last_error(ERROR_MOD_NOT_FOUND);
+    Ok(0)
 }
 
 /// Maps a PE image, binds its imports, runs TLS callbacks and DllMain. Shared by
@@ -1554,20 +1544,27 @@ fn write_systemtime(c: &mut Ctx, p: u32) {
 }
 
 fn create_file(c: &mut Ctx, path: &str, access: u32, disposition: u32) -> u32 {
-    let hp = c.p.host_path(path);
     let writable = access & 0x4000_0000 != 0;
     // CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5
-    let exists = hp.exists();
+    let exists = c.p.host_path(path).exists();
+    let hp = if writable || matches!(disposition, 1 | 2 | 5) || (disposition == 4 && !exists) { c.p.host_path_w(path) } else { c.p.host_path(path) };
     let result = match disposition {
         3 if !exists => Err(()),
         1 if exists => Err(()),
+        5 if !exists => Err(()),
         2 | 5 => std::fs::File::create(&hp).map(|_| ()).map_err(|_| ()),
         4 if !exists => std::fs::File::create(&hp).map(|_| ()).map_err(|_| ()),
         _ => Ok(()),
     };
     if result.is_err() || !hp.exists() {
-        c.set_last_error(ERROR_FILE_NOT_FOUND);
+        c.set_last_error(if disposition == 1 && exists { super::ERROR_ALREADY_EXISTS } else { ERROR_FILE_NOT_FOUND });
         return INVALID_HANDLE_VALUE;
+    }
+    if disposition == 4 && exists || disposition == 2 && exists {
+        // ERROR_ALREADY_EXISTS is reported alongside success.
+        c.set_last_error(super::ERROR_ALREADY_EXISTS);
+    } else {
+        c.set_last_error(0);
     }
     if hp.is_dir() {
         return c.p.new_handle(Handle::Dummy("directory"));
@@ -1629,17 +1626,14 @@ fn file_size(c: &mut Ctx, h: u32) -> Option<u64> {
 }
 
 fn find_first(c: &mut Ctx, pattern: &str) -> u32 {
-    let (dir, pat) = match pattern.rsplit_once('\\') {
+    let (dir, pat) = match pattern.rsplit_once(['\\', '/']) {
         Some((d, p)) => (d.to_string(), p.to_string()),
         None => (c.p.cwd.clone(), pattern.to_string()),
     };
-    let hd = c.p.host_path(&dir);
-    let Ok(rd) = std::fs::read_dir(&hd) else { return INVALID_HANDLE_VALUE };
     let mut entries = Vec::new();
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
+    for (name, hp) in c.p.list_dir(&dir) {
         if glob_match(&pat.to_lowercase(), &name.to_lowercase()) {
-            let md = e.metadata().ok();
+            let md = std::fs::metadata(&hp).ok();
             entries.push(FindEntry { name, size: md.as_ref().map(|m| m.len()).unwrap_or(0), is_dir: md.map(|m| m.is_dir()).unwrap_or(false) });
         }
     }
@@ -1762,7 +1756,8 @@ pub fn dispatch_exception(c: &mut Ctx, code: u32, flags: u32, addr: u32, params:
     write_exception_record(c, rec, code, flags & !EXCEPTION_UNWINDING, addr, params);
     write_context(c, ctx, ctx_regs);
     let _ = c.host.write_u32(disp, 0);
-    c.p.log(format!("exception {code:#x} at {addr:#x}: dispatching"));
+    let detail = if code == 0x0EED_FADE && params.len() >= 2 { format!(" ({})", delphi_exception_text(c, params[1])) } else { String::new() };
+    c.p.log(format!("exception {code:#x} at {addr:#x}{detail}: dispatching"));
     // Nested callbacks must not overwrite the records.
     c.regs.esp = scratch;
     let mut frame = c.host.read_u32(teb).unwrap_or(0xFFFF_FFFF);
@@ -1794,6 +1789,36 @@ pub fn dispatch_exception(c: &mut Ctx, code: u32, flags: u32, addr: u32, params:
     }
     c.regs.esp = saved_esp;
     Err(ApiError(format!("unhandled exception {code:#x} at {addr:#x}")))
+}
+
+/// Class name and message of a Delphi exception object (TObject VMT layout of
+/// Delphi 2009+: class name at vmt-44, FMessage at +4 as UnicodeString; falls
+/// back to AnsiString).
+fn delphi_exception_text(c: &Ctx, obj: u32) -> String {
+    let vmt = c.host.read_u32(obj).unwrap_or(0);
+    let name_p = c.host.read_u32(vmt.wrapping_sub(56)).unwrap_or(0);
+    let mut name = String::new();
+    if name_p != 0 {
+        let n = c.host.read_u8(name_p).unwrap_or(0) as u32;
+        let mut b = vec![0u8; n as usize];
+        let _ = c.host.read(name_p + 1, &mut b);
+        name = String::from_utf8_lossy(&b).into_owned();
+    }
+    let msg_p = c.host.read_u32(obj + 4).unwrap_or(0);
+    let mut msg = String::new();
+    if msg_p != 0 {
+        let len = c.host.read_u32(msg_p - 4).unwrap_or(0).min(4096);
+        let elem = c.host.read_u16(msg_p - 10).unwrap_or(1);
+        if elem == 2 {
+            let units: Vec<u16> = (0..len).map(|i| c.host.read_u16(msg_p + 2 * i).unwrap_or(0)).collect();
+            msg = String::from_utf16_lossy(&units);
+        } else {
+            let mut b = vec![0u8; len as usize];
+            let _ = c.host.read(msg_p, &mut b);
+            msg = String::from_utf8_lossy(&b).into_owned();
+        }
+    }
+    format!("{name}: {}", msg.trim_end())
 }
 
 /// RtlUnwind: calls every handler between the top of the chain and `target` with
@@ -2320,6 +2345,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "CopyFileW", |c| {
         let (src, dst, fail) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)), c.arg(2));
         let (hs, hd) = (c.p.host_path(&src), c.p.host_path(&dst));
+        let hd = if fail != 0 && hd.exists() { hd } else { c.p.host_path_w(&dst) };
         if fail != 0 && hd.exists() {
             c.set_last_error(super::ERROR_ALREADY_EXISTS);
             return ok(3, 0);
@@ -2334,6 +2360,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "CopyFileA", |c| {
         let (src, dst, fail) = (c.str_arg(0), c.str_arg(1), c.arg(2));
         let (hs, hd) = (c.p.host_path(&src), c.p.host_path(&dst));
+        let hd = if fail != 0 && hd.exists() { hd } else { c.p.host_path_w(&dst) };
         if fail != 0 && hd.exists() {
             c.set_last_error(super::ERROR_ALREADY_EXISTS);
             return ok(3, 0);
@@ -2346,7 +2373,12 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(k, "MoveFileW", |c| {
         let (src, dst) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)));
-        let r = std::fs::rename(c.p.host_path(&src), c.p.host_path(&dst)).is_ok();
+        let hs = c.p.host_path_w(&src);
+        let hd = c.p.host_path_w(&dst);
+        let r = std::fs::rename(hs, hd).is_ok();
+        if r {
+            c.p.mark_deleted(&src);
+        }
         if !r {
             c.set_last_error(ERROR_FILE_NOT_FOUND);
         }
@@ -2354,7 +2386,12 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(k, "MoveFileA", |c| {
         let (src, dst) = (c.str_arg(0), c.str_arg(1));
-        let r = std::fs::rename(c.p.host_path(&src), c.p.host_path(&dst)).is_ok();
+        let hs = c.p.host_path_w(&src);
+        let hd = c.p.host_path_w(&dst);
+        let r = std::fs::rename(hs, hd).is_ok();
+        if r {
+            c.p.mark_deleted(&src);
+        }
         if !r {
             c.set_last_error(ERROR_FILE_NOT_FOUND);
         }
@@ -2362,12 +2399,22 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(k, "MoveFileExW", |c| {
         let (src, dst) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)));
-        let r = std::fs::rename(c.p.host_path(&src), c.p.host_path(&dst)).is_ok();
+        let hs = c.p.host_path_w(&src);
+        let hd = c.p.host_path_w(&dst);
+        let r = std::fs::rename(hs, hd).is_ok();
+        if r {
+            c.p.mark_deleted(&src);
+        }
         ok(3, r as u32)
     });
     r.add(k, "DeleteFileW", |c| {
         let p = wstr(c, c.arg(0));
-        let r = std::fs::remove_file(c.p.host_path(&p)).is_ok();
+        let r = c.p.host_path(&p).is_file();
+        if r {
+            let w = c.p.host_path_w(&p);
+            let _ = std::fs::remove_file(w);
+            c.p.mark_deleted(&p);
+        }
         c.trace(format!("({p:?}) = {r}"));
         if !r {
             c.set_last_error(ERROR_FILE_NOT_FOUND);
@@ -2376,7 +2423,12 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(k, "DeleteFileA", |c| {
         let p = c.str_arg(0);
-        let r = std::fs::remove_file(c.p.host_path(&p)).is_ok();
+        let r = c.p.host_path(&p).is_file();
+        if r {
+            let w = c.p.host_path_w(&p);
+            let _ = std::fs::remove_file(w);
+            c.p.mark_deleted(&p);
+        }
         if !r {
             c.set_last_error(ERROR_FILE_NOT_FOUND);
         }
@@ -2384,33 +2436,43 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(k, "CreateDirectoryW", |c| {
         let p = wstr(c, c.arg(0));
-        let hp = c.p.host_path(&p);
-        if hp.exists() {
+        if c.p.host_path(&p).exists() {
             c.set_last_error(super::ERROR_ALREADY_EXISTS);
             return ok(2, 0);
         }
-        let r = std::fs::create_dir(&hp).is_ok();
+        let hp = c.p.host_path_w(&p);
+        let r = std::fs::create_dir(&hp).is_ok() || hp.is_dir();
         c.trace(format!("({p:?}) = {r}"));
         ok(2, r as u32)
     });
     r.add(k, "CreateDirectoryA", |c| {
         let p = c.str_arg(0);
-        let hp = c.p.host_path(&p);
-        if hp.exists() {
+        if c.p.host_path(&p).exists() {
             c.set_last_error(super::ERROR_ALREADY_EXISTS);
             return ok(2, 0);
         }
-        let r = std::fs::create_dir(&hp).is_ok();
+        let hp = c.p.host_path_w(&p);
+        let r = std::fs::create_dir(&hp).is_ok() || hp.is_dir();
         ok(2, r as u32)
     });
     r.add(k, "RemoveDirectoryW", |c| {
         let p = wstr(c, c.arg(0));
-        let r = std::fs::remove_dir(c.p.host_path(&p)).is_ok();
+        let r = c.p.list_dir(&p).is_empty() && c.p.host_path(&p).is_dir();
+        if r {
+            let w = c.p.host_path_w(&p);
+            let _ = std::fs::remove_dir(w);
+            c.p.mark_deleted(&p);
+        }
         ok(1, r as u32)
     });
     r.add(k, "RemoveDirectoryA", |c| {
         let p = c.str_arg(0);
-        let r = std::fs::remove_dir(c.p.host_path(&p)).is_ok();
+        let r = c.p.list_dir(&p).is_empty() && c.p.host_path(&p).is_dir();
+        if r {
+            let w = c.p.host_path_w(&p);
+            let _ = std::fs::remove_dir(w);
+            c.p.mark_deleted(&p);
+        }
         ok(1, r as u32)
     });
     r.add(k, "SetFileAttributesW", |_c| ok(2, 1));
@@ -2749,4 +2811,30 @@ fn global_atom(c: &mut Ctx, name: &str) -> u16 {
     c.p.next_atom = c.p.next_atom.wrapping_add(1).max(0xC000);
     c.p.atoms.insert(key, a);
     a
+}
+
+pub fn register_paths(r: &mut Registry) {
+    let k = "kernel32.dll";
+    // Paths are already long; the 8.3 form is the same string.
+    r.add(k, "GetLongPathNameW", |c| {
+        let s = wstr(c, c.arg(0));
+        let (buf, cch) = (c.arg(1), c.arg(2));
+        let units = s.encode_utf16().count() as u32;
+        if cch <= units {
+            return ok(3, units + 1);
+        }
+        copy_wstr_out(c, buf, cch, &s);
+        ok(3, units)
+    });
+    r.alias(k, "GetShortPathNameW", k, "GetLongPathNameW");
+    r.add(k, "GetLongPathNameA", |c| {
+        let s = c.str_arg(0);
+        let (buf, cch) = (c.arg(1), c.arg(2));
+        if cch as usize <= s.len() {
+            return ok(3, s.len() as u32 + 1);
+        }
+        copy_str_out(c, buf, cch, s.as_bytes());
+        ok(3, s.len() as u32)
+    });
+    r.alias(k, "GetShortPathNameA", k, "GetLongPathNameA");
 }

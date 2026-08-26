@@ -21,6 +21,8 @@ pub struct LoadedModule {
     pub file: Vec<u8>,
     pub tls_callbacks: Vec<u32>,
     pub tls_index_va: u32,
+    /// Static TLS template (start VA, end VA, zero fill), relocated.
+    pub tls_template: Option<(u32, u32, u32)>,
     /// (DLL, function, IAT slot VA) for every import.
     pub imports: Vec<(String, String, u32)>,
 }
@@ -98,9 +100,13 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
         exports.insert(format!("#{}", e.ordinal), va);
     }
     let tls = pe.tls().map_err(|e| e.to_string())?;
-    let (tls_callbacks, tls_index_va) = match tls {
-        Some(t) => (t.callbacks.iter().map(|c| c.wrapping_add(delta)).collect(), t.index_va.wrapping_add(delta)),
-        None => (Vec::new(), 0),
+    let (tls_callbacks, tls_index_va, tls_template) = match tls {
+        Some(t) => (
+            t.callbacks.iter().map(|c| c.wrapping_add(delta)).collect(),
+            t.index_va.wrapping_add(delta),
+            Some((t.start_va.wrapping_add(delta), t.end_va.wrapping_add(delta), t.zero_fill)),
+        ),
+        None => (Vec::new(), 0, None),
     };
     Ok(LoadedModule {
         name: req.name.to_lowercase(),
@@ -114,6 +120,7 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
         file: bytes,
         tls_callbacks,
         tls_index_va,
+        tls_template,
         imports,
     })
 }

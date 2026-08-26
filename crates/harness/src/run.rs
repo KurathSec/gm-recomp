@@ -33,6 +33,14 @@ pub struct RunOpts {
     pub aot: bool,
     pub max_api_calls: u64,
     pub quiet: bool,
+    /// Wall-clock limit in seconds (guest loops without API calls are interrupted).
+    pub seconds: u64,
+    /// Print this many of the last dispatcher targets when the run stops.
+    pub recent: usize,
+    /// Memory ranges (addr, len) to hex-dump when the run stops.
+    pub dump: Vec<(u32, u32)>,
+    /// Keep files written by earlier runs (saves) instead of starting clean.
+    pub keep_writes: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +77,10 @@ struct State {
     max_api_calls: u64,
     tsc: u64,
     bad_functions: HashSet<u32>,
+    /// Ring buffer of the most recent dispatcher targets (eip, esp, eax, ebx).
+    recent: std::collections::VecDeque<[u32; 4]>,
+    recent_cap: usize,
+    dispatches: u64,
 }
 
 // ---- guest memory as seen by the HLE layer ------------------------------------------
@@ -375,9 +387,7 @@ fn translate_batch<S: AsContextMut<Data = State>>(cx: &mut S, cpu: &Cpu, entries
             let is_fn = |a: u32| st.funcs.contains_key(&a) || m.map(|m| m.functions.contains(&a)).unwrap_or(false);
             let info = FuncInfo { jump_tables: jt, is_function: &is_fn };
             if let Err(e) = tr.add_function(entry, &info) {
-                if st.trace {
-                    eprintln!("translate {entry:#x}: {e}");
-                }
+                eprintln!("translate {entry:#x}: {e}");
                 failed.push(entry);
             }
         }
@@ -451,6 +461,26 @@ fn resolve_addr<S: AsContextMut<Data = State>>(cx: &mut S, cpu: &Cpu, addr: u32)
 fn run_until<S: AsContextMut<Data = State>>(cx: &mut S, cpu: &Cpu, addr: u32, marker: u32) -> Result<()> {
     let mut eip = addr;
     loop {
+        {
+            let cap = cx.as_context().data().recent_cap;
+            let rec = if cap > 0 {
+                let esp = get_u32(cx, cpu.globals[G::Esp as usize]);
+                let eax = get_u32(cx, cpu.globals[G::Eax as usize]);
+                let ebx = get_u32(cx, cpu.globals[G::Ebx as usize]);
+                Some([eip, esp, eax, ebx])
+            } else {
+                None
+            };
+            let mut b = cx.as_context_mut();
+            let st = b.data_mut();
+            st.dispatches += 1;
+            if let Some(r) = rec {
+                if st.recent.len() == cap {
+                    st.recent.pop_front();
+                }
+                st.recent.push_back(r);
+            }
+        }
         let idx = resolve_addr(cx, cpu, eip)?;
         let f = match cpu.table.get(&mut *cx, idx as u64) {
             Some(Ref::Func(Some(f))) => f,
@@ -551,9 +581,26 @@ pub fn run(opts: RunOpts) -> Result<()> {
     if let Ok(cache) = wasmtime::Cache::from_file(None) {
         cfg.cache(Some(cache));
     }
+    cfg.epoch_interruption(true);
     let engine = Engine::new(&cfg).map_err(|e| anyhow!("{e:?}"))?;
+    {
+        let engine = engine.clone();
+        let secs = opts.seconds;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            engine.increment_epoch();
+        });
+    }
 
     let mut process = Process::new(host_root.clone(), &exe_path, &cmdline);
+    // Files the game writes go to a scratch layer, never into the imported game files.
+    let slug = opts.game_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let write_root = PathBuf::from("target/gamedata").join(&slug);
+    if !opts.keep_writes {
+        let _ = std::fs::remove_dir_all(&write_root);
+    }
+    std::fs::create_dir_all(&write_root)?;
+    process.write_root = Some(write_root);
     process.trace = opts.trace;
     process.frame_limit = opts.frames;
     let state = State {
@@ -573,8 +620,13 @@ pub fn run(opts: RunOpts) -> Result<()> {
         max_api_calls: opts.max_api_calls,
         tsc: 0,
         bad_functions: HashSet::new(),
+        recent: std::collections::VecDeque::new(),
+        recent_cap: opts.recent,
+        dispatches: 0,
     };
     let mut store = Store::new(&engine, state);
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;
     let table = Table::new(&mut store, TableType::new(RefType::FUNCREF, 0, None), Ref::Func(None)).map_err(|e| anyhow!("{e:?}"))?;
     let mut globals = Vec::new();
@@ -724,6 +776,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         let mut view = View { cx: &mut store, cpu };
         let mut p = view.cx.data_mut().p.take().unwrap();
         let r = p.setup_main_thread(&mut view, image_base).map_err(|e| anyhow!("{e}"))?;
+        p.setup_static_tls(&mut view).map_err(|e| anyhow!("{e}"))?;
         view.cx.data_mut().p = Some(p);
         r
     };
@@ -775,6 +828,14 @@ pub fn run(opts: RunOpts) -> Result<()> {
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let final_regs = read_regs(&mut store, &cpu);
+    for &(addr, len) in &opts.dump {
+        let data = memory.data(&store);
+        for row in (0..len).step_by(16) {
+            let a = (addr + row) as usize;
+            let bytes: Vec<String> = data.get(a..a + 16.min((len - row) as usize)).unwrap_or(&[]).iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("{:08x}: {}", addr + row, bytes.join(" "));
+        }
+    }
 
     let st = store.data();
     let p = st.p.as_ref();
@@ -793,8 +854,15 @@ pub fn run(opts: RunOpts) -> Result<()> {
             );
         }
     }
+    eprintln!("fpu: cw={:#06x} sw={:#06x} tw={:#06x}", st.fpu.control_word(), st.fpu.status_word(), st.fpu.tag_word());
     if let Some(p) = p {
-        eprintln!("frames presented: {}  api calls: {}  translated functions: {} ({:.1}s)  virtual time: {}ms", p.frames_presented, p.api_calls, st.translated, st.translate_time, p.now_ms());
+        eprintln!("frames presented: {}  api calls: {}  dispatches: {}  translated functions: {} ({:.1}s)  virtual time: {}ms", p.frames_presented, p.api_calls, st.dispatches, st.translated, st.translate_time, p.now_ms());
+        if !st.recent.is_empty() {
+            eprintln!("---- last {} dispatches (eip esp eax ebx) ----", st.recent.len());
+            for r in &st.recent {
+                eprintln!("  {:08x} {:08x} {:08x} {:08x}", r[0], r[1], r[2], r[3]);
+            }
+        }
         if !p.unimplemented.is_empty() {
             let mut u = p.unimplemented.clone();
             u.sort();
