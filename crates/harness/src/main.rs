@@ -5,6 +5,7 @@ mod ssegen;
 mod x87gen;
 mod native;
 mod proto;
+mod run;
 mod wasm;
 
 use anyhow::Result;
@@ -74,6 +75,28 @@ enum Cmd {
         #[arg(long, default_value = "target/refrun")]
         work: PathBuf,
     },
+    /// Run an imported game (web/public/games/<slug>) natively with the HLE runtime.
+    Run {
+        game_dir: PathBuf,
+        /// Entry executable (defaults to the manifest's entry).
+        #[arg(long)]
+        exe: Option<String>,
+        /// Print every API call.
+        #[arg(long)]
+        trace: bool,
+        /// Stop after this many Present calls.
+        #[arg(long, default_value_t = 1)]
+        frames: u64,
+        /// Translate every discovered function up front instead of on demand.
+        #[arg(long)]
+        aot: bool,
+        /// Stop after this many API calls (runaway protection).
+        #[arg(long, default_value_t = 50_000_000)]
+        max_api_calls: u64,
+        /// Do not print the log tail at the end.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
     /// Translate raw x86 bytes (hex) as a test program and print the wasm text.
@@ -116,6 +139,9 @@ fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet } => {
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

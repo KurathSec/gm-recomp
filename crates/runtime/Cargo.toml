@@ -1,0 +1,9 @@
+[package]
+name = "runtime"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+encoding_rs = "0.8.42"
+pe = { version = "0.1.0", path = "../pe" }
+x86 = { version = "0.1.0", path = "../x86" }
