@@ -4,9 +4,11 @@
 
 pub mod com;
 pub mod d3d8;
+pub mod dsound;
 pub mod gdi32;
 pub mod kernel32;
 pub mod misc;
+pub mod msvcrt;
 pub mod user32;
 
 use crate::mem::Guest;
@@ -39,17 +41,19 @@ pub struct Ret {
     /// continues there instead of returning to the caller: exception dispatch,
     /// `NtContinue`, thread switches.
     pub resume: bool,
+    /// High half of a 64-bit result.
+    pub edx: Option<u32>,
 }
 
 impl Ret {
     pub fn stdcall(nargs: u32, eax: u32) -> Self {
-        Ret { eax, pop: nargs * 4, resume: false }
+        Ret { eax, pop: nargs * 4, resume: false, edx: None }
     }
     pub fn cdecl(eax: u32) -> Self {
-        Ret { eax, pop: 0, resume: false }
+        Ret { eax, pop: 0, resume: false, edx: None }
     }
     pub fn resume() -> Self {
-        Ret { eax: 0, pop: 0, resume: true }
+        Ret { eax: 0, pop: 0, resume: true, edx: None }
     }
 }
 
@@ -65,6 +69,10 @@ pub trait Host: Guest {
     fn call_guest(&mut self, p: &mut Process, regs: &mut Regs, addr: u32, args: &[u32]) -> Result<u32, String>;
     /// Ends execution of the guest (ExitProcess).
     fn request_exit(&mut self, code: u32);
+    /// Pushes a value onto the x87 stack (FLD m64 semantics).
+    fn fpu_push(&mut self, v: f64);
+    /// Pops ST(0) (FSTP m64 semantics).
+    fn fpu_pop(&mut self) -> f64;
 }
 
 pub struct Ctx<'a> {
@@ -107,6 +115,19 @@ impl Ctx<'_> {
     pub fn call_guest(&mut self, addr: u32, args: &[u32]) -> Result<u32, ApiError> {
         self.host.call_guest(self.p, self.regs, addr, args).map_err(ApiError)
     }
+    /// Advances the virtual clock (sleeps, idle waits) and everything driven by it.
+    pub fn advance_clock(&mut self, us: u64) {
+        self.p.clock_us += us;
+        dsound::tick(self);
+    }
+    /// A clock read. Back-to-back reads with no other work in between (a spin-wait on
+    /// the time) advance the clock in doubling steps of 1..128 µs, so polling loops
+    /// end deterministically without skipping far past their deadline.
+    pub fn poll_clock(&mut self) {
+        let step = 1u64 << self.p.idle_streak.min(7);
+        self.p.idle_streak += 1;
+        self.advance_clock(step);
+    }
     /// Declared argument count of the current API (for tables of uniform methods).
     pub fn nargs(&self) -> u32 {
         self.p.registry.entries.get(self.id.0 as usize).map(|e| e.nargs).unwrap_or(0)
@@ -133,6 +154,10 @@ pub fn kernel32_copy_str(c: &mut Ctx, buf: u32, cap: u32, s: &[u8]) -> u32 {
 pub struct Registry {
     pub entries: Vec<ApiEntry>,
     pub by_name: HashMap<(String, String), ApiId>,
+    /// Math functions behind table-driven msvcrt entries, by API id.
+    pub math_fns: HashMap<u32, fn(f64) -> f64>,
+    /// APIs that do not end a clock spin-wait (clock reads, empty message polls).
+    pub idle_ok: std::collections::HashSet<u32>,
 }
 
 impl Registry {
@@ -144,8 +169,27 @@ impl Registry {
         misc::register(&mut r);
         d3d8::register(&mut r);
         com::register(&mut r);
+        msvcrt::register(&mut r);
+        dsound::register(&mut r);
         kernel32::register_more(&mut r);
         kernel32::register_paths(&mut r);
+        for (dll, name) in [
+            ("kernel32.dll", "QueryPerformanceCounter"),
+            ("kernel32.dll", "QueryPerformanceFrequency"),
+            ("kernel32.dll", "GetTickCount"),
+            ("kernel32.dll", "GetTickCount64"),
+            ("kernel32.dll", "GetSystemTimeAsFileTime"),
+            ("winmm.dll", "timeGetTime"),
+            ("user32.dll", "PeekMessageA"),
+            ("user32.dll", "PeekMessageW"),
+            ("user32.dll", "GetQueueStatus"),
+            ("user32.dll", "GetInputState"),
+            ("kernel32.dll", "GetCurrentThreadId"),
+        ] {
+            if let Some(id) = r.lookup(dll, name) {
+                r.idle_ok.insert(id.0);
+            }
+        }
         user32::register_more(&mut r);
         r
     }
@@ -215,6 +259,9 @@ macro_rules! const_apis {
         )*
     };
 }
+
+/// ApiError text that ends a run normally once `Process::frame_limit` frames were shown.
+pub const FRAME_LIMIT: &str = "frame limit reached";
 
 pub const ERROR_SUCCESS: u32 = 0;
 pub const ERROR_FILE_NOT_FOUND: u32 = 2;

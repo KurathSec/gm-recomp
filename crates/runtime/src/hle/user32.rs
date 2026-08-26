@@ -213,10 +213,10 @@ pub fn register(r: &mut Registry) {
     r.add(u, "GetInputState", |_c| ok(0, 0));
     r.add(u, "MsgWaitForMultipleObjects", |c| {
         pump_timers(c);
-        ok(5, if c.p.messages.is_empty() { c.p.clock_us += 1000; 0x102 } else { c.arg(0) })
+        ok(5, if c.p.messages.is_empty() { c.advance_clock(1000); 0x102 } else { c.arg(0) })
     });
     r.add(u, "WaitMessage", |c| {
-        c.p.clock_us += 1000;
+        c.advance_clock(1000);
         pump_timers(c);
         ok(0, 1)
     });
@@ -1063,6 +1063,7 @@ fn default_window() -> Window {
         children: Vec::new(),
         invalid: false,
         enabled: true,
+        sel: (0, 0),
     }
 }
 
@@ -1157,6 +1158,7 @@ fn create_window(c: &mut Ctx, exstyle: u32, class: &str, title: &str, style: u32
         children: Vec::new(),
         invalid: false,
         enabled: true,
+        sel: (0, 0),
     };
     c.p.windows.insert(hwnd, win);
     if let Some(p) = c.p.windows.get_mut(&parent) {
@@ -1289,7 +1291,7 @@ fn get_message(c: &mut Ctx, hwnd_filter: u32, _remove: bool) -> Result<Msg, supe
         let next = c.p.windows.values().flat_map(|w| w.timers.values().map(|(_, when)| *when)).min();
         match next {
             Some(when) if when > c.p.clock_us => c.p.clock_us = when,
-            _ => c.p.clock_us += 1000,
+            _ => c.advance_clock(1000),
         }
         if c.p.frames_presented >= c.p.frame_limit {
             return Ok(Msg { hwnd: 0, msg: WM_QUIT, wparam: 0, lparam: 0, time: c.p.now_ms(), pt: (0, 0) });
@@ -1340,7 +1342,134 @@ fn get_window_long(c: &Ctx, hwnd: u32, idx: i32) -> u32 {
     }
 }
 
-fn def_window_proc(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, _lp: u32) -> u32 {
+/// Start offsets of the lines of an edit control's text (CR LF, CR or LF break lines).
+fn edit_lines(t: &[char]) -> Vec<u32> {
+    let mut starts = vec![0u32];
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] == '\r' || t[i] == '\n' {
+            if t[i] == '\r' && t.get(i + 1) == Some(&'\n') {
+                i += 1;
+            }
+            starts.push(i as u32 + 1);
+        }
+        i += 1;
+    }
+    starts
+}
+
+/// The edit-control messages VCL's TMemo/TRichEdit use (text model only).
+fn edit_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> u32 {
+    let wide = c.name().ends_with('W');
+    let Some(w) = c.p.windows.get(&hwnd) else { return 0 };
+    let text: Vec<char> = w.title.chars().collect();
+    let (s0, s1) = w.sel;
+    let len = text.len() as u32;
+    let lines = edit_lines(&text);
+    let line_of = |ch: u32| lines.iter().rposition(|&st| st <= ch).unwrap_or(0) as u32;
+    let line_len = |line: usize| -> u32 {
+        let st = lines[line];
+        let mut e = if line + 1 < lines.len() { lines[line + 1] } else { len };
+        while e > st && matches!(text.get(e as usize - 1), Some('\r' | '\n')) {
+            e -= 1;
+        }
+        e - st
+    };
+    match msg {
+        0x00B0 => {
+            // EM_GETSEL
+            if wp != 0 {
+                let _ = c.host.write_u32(wp, s0);
+            }
+            if lp != 0 {
+                let _ = c.host.write_u32(lp, s1);
+            }
+            (s0.min(0xFFFF)) | (s1.min(0xFFFF) << 16)
+        }
+        0x00B1 => {
+            // EM_SETSEL
+            let (a, b) = (wp as i32, lp as i32);
+            let sel = if a == -1 { (s1, s1) } else { let b = if b < 0 { len } else { (b as u32).min(len) }; ((a as u32).min(len), b) };
+            if let Some(w) = c.p.windows.get_mut(&hwnd) {
+                w.sel = (sel.0.min(sel.1), sel.0.max(sel.1));
+            }
+            0
+        }
+        0x0434 => {
+            // EM_EXGETSEL
+            let _ = c.host.write_u32(lp, s0);
+            let _ = c.host.write_u32(lp + 4, s1);
+            0
+        }
+        0x0437 => {
+            // EM_EXSETSEL
+            let a = c.host.read_u32(lp).unwrap_or(0) as i32;
+            let b = c.host.read_u32(lp + 4).unwrap_or(0) as i32;
+            let sel = if a == 0 && b == -1 { (0, len) } else if a < 0 { (s1, s1) } else { ((a as u32).min(len), if b < 0 { len } else { (b as u32).min(len) }) };
+            if let Some(w) = c.p.windows.get_mut(&hwnd) {
+                w.sel = (sel.0.min(sel.1), sel.0.max(sel.1));
+            }
+            sel.1
+        }
+        0x00C2 => {
+            // EM_REPLACESEL: the inserted text also goes to the log.
+            let t = if lp == 0 { String::new() } else if wide { c.host.read_wstr(lp).unwrap_or_default() } else { c.host.read_cstr_lossy(lp) };
+            let class = c.p.windows.get(&hwnd).map(|w| w.class.clone()).unwrap_or_default();
+            if !t.trim().is_empty() {
+                c.p.log(format!("[{class} {hwnd:#x}] {}", t.trim_end()));
+            }
+            let ins: Vec<char> = t.chars().collect();
+            let (a, b) = (s0.min(len) as usize, s1.min(len) as usize);
+            let mut nt: Vec<char> = text[..a].to_vec();
+            nt.extend(&ins);
+            nt.extend(&text[b..]);
+            if let Some(w) = c.p.windows.get_mut(&hwnd) {
+                w.title = nt.into_iter().collect();
+                let caret = (a + ins.len()) as u32;
+                w.sel = (caret, caret);
+            }
+            0
+        }
+        0x00BA => lines.len() as u32, // EM_GETLINECOUNT
+        0x00BB => {
+            // EM_LINEINDEX
+            let line = if wp as i32 == -1 { line_of(s0) } else { wp };
+            lines.get(line as usize).copied().unwrap_or(0xFFFF_FFFF)
+        }
+        0x00C1 => {
+            // EM_LINELENGTH
+            if wp as i32 == -1 { 0 } else { line_len(line_of(wp) as usize) }
+        }
+        0x00C9 => {
+            // EM_LINEFROMCHAR
+            line_of(if wp as i32 == -1 { s0 } else { wp })
+        }
+        0x00C4 => {
+            // EM_GETLINE: buffer starts with its capacity
+            let line = wp as usize;
+            if line >= lines.len() {
+                return 0;
+            }
+            let st = lines[line] as usize;
+            let n = line_len(line) as usize;
+            let cap = c.host.read_u16(lp).unwrap_or(0) as usize;
+            let s: String = text[st..st + n.min(cap)].iter().collect();
+            if wide {
+                for (k, u) in s.encode_utf16().enumerate() {
+                    let _ = c.host.write_u16(lp + 2 * k as u32, u);
+                }
+            } else {
+                let _ = c.host.write(lp, s.as_bytes());
+            }
+            n.min(cap) as u32
+        }
+        0x00B8 => 0, // EM_GETMODIFY
+        0x00CE => 0, // EM_GETFIRSTVISIBLELINE
+        _ => 0,
+    }
+}
+
+fn def_window_proc(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp_: u32) -> u32 {
     match msg {
         WM_NCCREATE => 1,
         WM_CLOSE => {
@@ -1358,6 +1487,27 @@ fn def_window_proc(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, _lp: u32) -> u32 {
             }
             0
         }
+        0x000C => {
+            // WM_SETTEXT
+            let wide = c.name().ends_with('W');
+            let t = if lp_ == 0 { String::new() } else if wide { c.host.read_wstr(lp_).unwrap_or_default() } else { c.host.read_cstr_lossy(lp_) };
+            if let Some(w) = c.p.windows.get_mut(&hwnd) {
+                w.title = t;
+            }
+            1
+        }
+        0x000D => {
+            // WM_GETTEXT
+            let wide = c.name().ends_with('W');
+            let t = c.p.windows.get(&hwnd).map(|w| w.title.clone()).unwrap_or_default();
+            if wide { super::kernel32::copy_wstr_out(c, lp_, wp, &t) } else { super::kernel32_copy_str(c, lp_, wp, t.as_bytes()) }
+        }
+        0x000E => {
+            // WM_GETTEXTLENGTH
+            let wide = c.name().ends_with('W');
+            c.p.windows.get(&hwnd).map(|w| if wide { w.title.encode_utf16().count() } else { w.title.len() } as u32).unwrap_or(0)
+        }
+        0x00B0..=0x00D9 | 0x0434 | 0x0437 => edit_message(c, hwnd, msg, wp, lp_),
         0x0084 => 1, // WM_NCHITTEST -> HTCLIENT
         0x0021 => 3, // WM_MOUSEACTIVATE -> MA_ACTIVATE
         0x0087 => 0, // WM_GETDLGCODE
@@ -1898,11 +2048,11 @@ pub fn register_more(r: &mut Registry) {
             return ok(5, count);
         }
         if ms != 0xFFFF_FFFF {
-            c.p.clock_us += ms as u64 * 1000;
+            c.advance_clock(ms as u64 * 1000);
             pump_timers(c);
             return ok(5, if c.p.messages.is_empty() { 258 } else { count });
         }
-        c.p.clock_us += 10_000;
+        c.advance_clock(10_000);
         pump_timers(c);
         ok(5, count)
     });
@@ -1912,11 +2062,11 @@ pub fn register_more(r: &mut Registry) {
             return ok(5, count);
         }
         if ms != 0xFFFF_FFFF {
-            c.p.clock_us += ms as u64 * 1000;
+            c.advance_clock(ms as u64 * 1000);
             pump_timers(c);
             return ok(5, if c.p.messages.is_empty() { 258 } else { count });
         }
-        c.p.clock_us += 10_000;
+        c.advance_clock(10_000);
         pump_timers(c);
         ok(5, count)
     });

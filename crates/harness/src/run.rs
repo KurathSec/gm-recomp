@@ -174,6 +174,32 @@ impl<S: AsContextMut<Data = State>> Host for View<'_, S> {
     fn request_exit(&mut self, code: u32) {
         self.cx.as_context_mut().data_mut().exit = Some(code);
     }
+    fn fpu_push(&mut self, v: f64) {
+        let mut b = self.cx.as_context_mut();
+        let st = b.data_mut();
+        let mut m = Scratch(v.to_bits().to_le_bytes().to_vec());
+        st.fpu.exec(iced_x86::Mnemonic::Fld, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut m);
+    }
+    fn fpu_pop(&mut self) -> f64 {
+        let mut b = self.cx.as_context_mut();
+        let st = b.data_mut();
+        let mut m = Scratch(vec![0; 8]);
+        st.fpu.exec(iced_x86::Mnemonic::Fstp, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut m);
+        f64::from_bits(u64::from_le_bytes(m.0[..8].try_into().unwrap()))
+    }
+}
+
+/// An 8-byte memory operand at address 0 for host-initiated x87 loads and stores.
+struct Scratch(Vec<u8>);
+impl fpu::Mem for Scratch {
+    fn read(&mut self, addr: u32, buf: &mut [u8]) {
+        let a = addr as usize;
+        buf.copy_from_slice(&self.0[a..a + buf.len()]);
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) {
+        let a = addr as usize;
+        self.0[a..a + data.len()].copy_from_slice(data);
+    }
 }
 
 // ---- register access -------------------------------------------------------------------
@@ -258,6 +284,9 @@ fn call_api<S: AsContextMut<Data = State>>(cx: &mut S, cpu: &Cpu, id: ApiId) -> 
         let st = b.data_mut();
         let p = st.p.as_mut().ok_or_else(|| anyhow!("process not available"))?;
         p.api_calls += 1;
+        if !p.registry.idle_ok.contains(&id.0) {
+            p.idle_streak = 0;
+        }
         let e = &p.registry.entries[id.0 as usize];
         (format!("{}!{}", e.dll, e.name), e.func, e.nargs, p.api_calls)
     };
@@ -282,6 +311,9 @@ fn call_api<S: AsContextMut<Data = State>>(cx: &mut S, cpu: &Cpu, id: ApiId) -> 
                 }
             } else {
                 regs.eax = ret.eax;
+                if let Some(edx) = ret.edx {
+                    regs.edx = edx;
+                }
                 regs.esp += 4 + ret.pop;
                 regs.eip = ra;
                 if trace {
@@ -837,11 +869,17 @@ pub fn run(opts: RunOpts) -> Result<()> {
         }
     }
 
+    if let Err(e) = &outcome {
+        if format!("{e:#}").ends_with(runtime::hle::FRAME_LIMIT) {
+            outcome = Ok(());
+        }
+    }
     let st = store.data();
     let p = st.p.as_ref();
     eprintln!("---- run finished in {elapsed:.2}s ----");
     match &outcome {
         Ok(()) => match st.exit {
+            _ if p.is_some_and(|p| p.frames_presented >= p.frame_limit) => eprintln!("frame limit reached"),
             Some(code) => eprintln!("exit code {code}"),
             None => eprintln!("entry point returned (eip={:#x})", final_regs.eip),
         },
@@ -881,6 +919,18 @@ pub fn run(opts: RunOpts) -> Result<()> {
         if !missing.is_empty() {
             eprintln!("---- {} statically imported APIs without an implementation ----", missing.len());
             eprintln!("{}", missing.join(" "));
+        }
+        let presents: Vec<&String> = p.log.iter().filter(|l| l.starts_with("Present #")).collect();
+        for l in presents.iter().rev().take(3).rev() {
+            eprintln!("{l}");
+        }
+        let notable: Vec<&String> = p.log.iter().filter(|l| l.starts_with('[') || l.starts_with("exception") || l.starts_with("MessageBox") || l.contains("not implemented") || l.contains("not registered")).collect();
+        if !notable.is_empty() && !opts.trace {
+            eprintln!("---- notable log lines ({}) ----", notable.len());
+            let mut seen = std::collections::HashSet::new();
+            for l in notable.iter().filter(|l| seen.insert(l.as_str())).take(80) {
+                eprintln!("{l}");
+            }
         }
         if !opts.quiet && !opts.trace {
             let n = p.log.len();

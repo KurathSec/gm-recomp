@@ -342,6 +342,9 @@ fn dev_present(c: &mut Ctx) -> ApiResult {
     let draws = c.p.draw_calls;
     c.p.draw_calls = 0;
     c.p.log(format!("Present #{n} ({draws} draw calls, t={}ms)", c.p.now_ms()));
+    if n >= c.p.frame_limit {
+        return Err(super::ApiError(super::FRAME_LIMIT.into()));
+    }
     ret(c, D3D_OK)
 }
 

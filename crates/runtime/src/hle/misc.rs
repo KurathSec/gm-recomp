@@ -1135,7 +1135,10 @@ pub fn register(r: &mut Registry) {
 
     // ---- winmm -----------------------------------------------------------------------
     let w = "winmm.dll";
-    r.add(w, "timeGetTime", |c| ok(0, c.p.now_ms()));
+    r.add(w, "timeGetTime", |c| {
+        c.poll_clock();
+        ok(0, c.p.now_ms())
+    });
     r.add(w, "timeBeginPeriod", |_c| ok(1, 0));
     r.add(w, "timeEndPeriod", |_c| ok(1, 0));
     r.add(w, "timeGetDevCaps", |c| {

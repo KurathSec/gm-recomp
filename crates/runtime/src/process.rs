@@ -86,6 +86,8 @@ pub struct Window {
     pub children: Vec<u32>,
     pub invalid: bool,
     pub enabled: bool,
+    /// Edit-control selection (start, end) in characters of `title`.
+    pub sel: (u32, u32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -156,6 +158,35 @@ pub struct Thread {
     pub stack_limit: u32,
 }
 
+/// A DirectSound buffer: PCM data in guest memory plus playback state.
+#[derive(Debug, Clone)]
+pub struct SoundBuffer {
+    pub primary: bool,
+    pub flags: u32,
+    pub data: u32,
+    pub size: u32,
+    pub format_tag: u16,
+    pub channels: u16,
+    pub rate: u32,
+    /// Playback frequency (SetFrequency), in samples per second.
+    pub freq: u32,
+    pub block_align: u16,
+    pub bits: u16,
+    /// Hundredths of a decibel (0 = full, -10000 = silent).
+    pub volume: i32,
+    pub pan: i32,
+    pub play: u32,
+    pub write: u32,
+    pub playing: bool,
+    pub looping: bool,
+    /// Virtual time the cursor was last advanced to.
+    pub last_us: u64,
+    pub frac: u64,
+    /// (offset or DSBPN_OFFSETSTOP, event handle)
+    pub notify: Vec<(u32, u32)>,
+    pub fired: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct D3dObject {
     pub kind: &'static str,
@@ -186,6 +217,8 @@ pub struct Process {
     pub env: Vec<(String, String)>,
     /// Virtual clock in microseconds since process start.
     pub clock_us: u64,
+    /// Consecutive clock reads without other API work (see `Ctx::poll_clock`).
+    pub idle_streak: u32,
     pub exit_code: Option<u32>,
     pub tls_used: Vec<bool>,
     pub atoms: HashMap<String, u16>,
@@ -203,12 +236,17 @@ pub struct Process {
     pub frames_presented: u64,
     pub frame_limit: u64,
     pub d3d_objects: HashMap<u32, D3dObject>,
+    pub sound_buffers: BTreeMap<u32, SoundBuffer>,
     /// COM interface name -> vtable address in guest memory.
     pub com_vtables: HashMap<&'static str, u32>,
     /// Interface pointer -> (object base, interface index) for HLE COM objects.
     pub com_ifaces: HashMap<u32, (u32, u32)>,
     pub com_classes: HashMap<u32, &'static [&'static crate::hle::com::Interface]>,
     pub draw_calls: u64,
+    /// msvcrt state: errno cell, FILE* -> file handle, rand() seed.
+    pub crt_errno: u32,
+    pub crt_files: HashMap<u32, u32>,
+    pub crt_rand: u32,
     pub textures_created: u64,
     pub next_d3d_handle: u32,
     pub trace: bool,
@@ -265,6 +303,7 @@ impl Process {
                 ("COMPUTERNAME".into(), "GMRECOMP".into()),
             ],
             clock_us: 0,
+            idle_streak: 0,
             exit_code: None,
             tls_used: vec![false; 1088],
             atoms: HashMap::new(),
@@ -282,10 +321,14 @@ impl Process {
             frames_presented: 0,
             frame_limit: u64::MAX,
             d3d_objects: HashMap::new(),
+            sound_buffers: BTreeMap::new(),
             com_vtables: HashMap::new(),
             com_ifaces: HashMap::new(),
             com_classes: HashMap::new(),
             draw_calls: 0,
+            crt_errno: 0,
+            crt_files: HashMap::new(),
+            crt_rand: 1,
             textures_created: 0,
             next_d3d_handle: 0x1000,
             trace: false,

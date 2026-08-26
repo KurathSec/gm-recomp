@@ -789,13 +789,13 @@ pub fn register(r: &mut Registry) {
             ok(2, 0)
         } else {
             // advance the clock by the timeout and report it
-            c.p.clock_us += (timeout.min(1000) as u64) * 1000;
+            c.advance_clock((timeout.min(1000) as u64) * 1000);
             ok(2, if timeout == 0xFFFF_FFFF { 0 } else { 0x102 })
         }
     });
     r.add(k, "WaitForSingleObjectEx", |c| {
         let timeout = c.arg(1);
-        c.p.clock_us += (timeout.min(1000) as u64) * 1000;
+        c.advance_clock((timeout.min(1000) as u64) * 1000);
         ok(3, 0)
     });
     r.add(k, "WaitForMultipleObjects", |_c| ok(4, 0));
@@ -821,12 +821,12 @@ pub fn register(r: &mut Registry) {
     r.add(k, "SwitchToThread", |_c| ok(0, 0));
     r.add(k, "Sleep", |c| {
         let ms = c.arg(0);
-        c.p.clock_us += ms as u64 * 1000;
+        c.advance_clock(ms as u64 * 1000);
         ok(1, 0)
     });
     r.add(k, "SleepEx", |c| {
         let ms = c.arg(0);
-        c.p.clock_us += ms as u64 * 1000;
+        c.advance_clock(ms as u64 * 1000);
         ok(2, 0)
     });
     r.add(k, "CloseHandle", |c| {
@@ -849,8 +849,12 @@ pub fn register(r: &mut Registry) {
     r.add(k, "SetHandleInformation", |_c| ok(3, 1));
     r.add(k, "SetHandleCount", |c| ok(1, c.arg(0)));
     // ---- time -----------------------------------------------------------------------
-    r.add(k, "GetTickCount", |c| ok(0, c.p.now_ms()));
+    r.add(k, "GetTickCount", |c| {
+        c.poll_clock();
+        ok(0, c.p.now_ms())
+    });
     r.add(k, "GetTickCount64", |c| {
+        c.poll_clock();
         let ms = c.p.clock_us / 1000;
         c.regs.edx = (ms >> 32) as u32;
         ok(0, ms as u32)
@@ -861,6 +865,7 @@ pub fn register(r: &mut Registry) {
         ok(1, 1)
     });
     r.add(k, "QueryPerformanceCounter", |c| {
+        c.poll_clock();
         let p = c.arg(0);
         let _ = c.host.write_u64(p, c.p.clock_us * 10);
         ok(1, 1)
@@ -871,6 +876,7 @@ pub fn register(r: &mut Registry) {
     });
     r.alias(k, "GetLocalTime", k, "GetSystemTime");
     r.add(k, "GetSystemTimeAsFileTime", |c| {
+        c.poll_clock();
         let p = c.arg(0);
         // 2026-01-01 as FILETIME + virtual clock
         let base: u64 = 0x01DC_5A6B_0000_0000 + c.p.clock_us * 10;
@@ -1543,7 +1549,7 @@ fn write_systemtime(c: &mut Ctx, p: u32) {
     }
 }
 
-fn create_file(c: &mut Ctx, path: &str, access: u32, disposition: u32) -> u32 {
+pub(crate) fn create_file(c: &mut Ctx, path: &str, access: u32, disposition: u32) -> u32 {
     let writable = access & 0x4000_0000 != 0;
     // CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5
     let exists = c.p.host_path(path).exists();
@@ -1579,7 +1585,7 @@ fn with_file<T>(c: &mut Ctx, h: u32, f: impl FnOnce(&mut FileHandle) -> T) -> Op
     }
 }
 
-fn read_file(c: &mut Ctx, h: u32, buf: u32, n: u32) -> Option<u32> {
+pub(crate) fn read_file(c: &mut Ctx, h: u32, buf: u32, n: u32) -> Option<u32> {
     let (path, pos) = with_file(c, h, |fh| (fh.host_path.clone(), fh.pos))?;
     let mut file = std::fs::File::open(&path).ok()?;
     file.seek(SeekFrom::Start(pos)).ok()?;
@@ -1597,7 +1603,7 @@ fn read_file(c: &mut Ctx, h: u32, buf: u32, n: u32) -> Option<u32> {
     Some(got as u32)
 }
 
-fn write_file(c: &mut Ctx, h: u32, data: &[u8]) -> u32 {
+pub(crate) fn write_file(c: &mut Ctx, h: u32, data: &[u8]) -> u32 {
     let Some((path, pos)) = with_file(c, h, |fh| (fh.host_path.clone(), fh.pos)) else { return 0 };
     let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&path) else { return 0 };
     if file.seek(SeekFrom::Start(pos)).is_err() {
@@ -1610,7 +1616,7 @@ fn write_file(c: &mut Ctx, h: u32, data: &[u8]) -> u32 {
     data.len() as u32
 }
 
-fn seek_file(c: &mut Ctx, h: u32, dist: i64, method: u32) -> Option<u64> {
+pub(crate) fn seek_file(c: &mut Ctx, h: u32, dist: i64, method: u32) -> Option<u64> {
     let size = file_size(c, h)?;
     with_file(c, h, |fh| {
         let base = match method { 0 => 0i64, 1 => fh.pos as i64, _ => size as i64 };
@@ -1620,7 +1626,7 @@ fn seek_file(c: &mut Ctx, h: u32, dist: i64, method: u32) -> Option<u64> {
     })
 }
 
-fn file_size(c: &mut Ctx, h: u32) -> Option<u64> {
+pub(crate) fn file_size(c: &mut Ctx, h: u32) -> Option<u64> {
     let path = with_file(c, h, |fh| fh.host_path.clone())?;
     std::fs::metadata(path).ok().map(|m| m.len())
 }
@@ -2782,7 +2788,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "WaitForMultipleObjectsEx", |c| {
         let ms = c.arg(3);
         if ms != 0xFFFF_FFFF {
-            c.p.clock_us += ms as u64 * 1000;
+            c.advance_clock(ms as u64 * 1000);
         }
         ok(5, 0)
     });
