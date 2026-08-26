@@ -314,12 +314,34 @@ impl Fpu {
 
     fn raise(&mut self, bits: u16) {
         self.sw |= bits;
-        if bits & !(self.cw & 0x3f) & 0x3f != 0 {
+        let unmasked = bits & !(self.cw & 0x3f) & 0x3f;
+        if unmasked != 0 {
             self.fop = self.cur_fop;
             self.fdp = self.cur_fdp;
-            self.aborted = true;
+            // Pre-computation exceptions (invalid, denormal, zero divide) abort the
+            // instruction; overflow/underflow/precision deliver a (biased) result.
+            if unmasked & (SW_IE | SW_DE | SW_ZE) != 0 {
+                self.aborted = true;
+            }
         }
         self.refresh_es();
+    }
+
+    /// Unmasked overflow/underflow results are delivered with the exponent biased by
+    /// 2^±24576 so a trap handler can recover them.
+    fn bias_unmasked(&self, v: Ext, flags: u16) -> Ext {
+        let unmasked = flags & !(self.cw & 0x3f);
+        if unmasked & SW_OE != 0 && !v.is_nan() {
+            if v.is_infinite() {
+                // the unbiased value overflowed; scale the largest-magnitude value instead
+                return Ext::largest().copy_sign(v).scalbn(-24576);
+            }
+            return v.scalbn(-24576);
+        }
+        if unmasked & SW_UE != 0 && !v.is_nan() {
+            return v.scalbn(24576);
+        }
+        v
     }
 
     fn set_cc(&mut self, c0: bool, c1: bool, c2: bool, c3: bool) {
@@ -439,7 +461,7 @@ impl Fpu {
         let flags = flags | (pre & (SW_PE | SW_OE | SW_UE));
         self.raise(flags);
         self.set_c1_rounded(v, w, flags);
-        v
+        self.bias_unmasked(v, flags)
     }
 
     /// C1 reports whether an inexact result was rounded up (toward +infinity); 0 when exact.
@@ -470,7 +492,8 @@ impl Fpu {
             self.clear_c1();
             return self.nan_result(a, b);
         }
-        if a.is_denormal() || b.is_denormal() || self.mem_denormal || self.reg_denormal {
+        let zero_divide = op == Arith::Div && b.is_zero() && !a.is_zero();
+        if (a.is_denormal() || b.is_denormal() || self.mem_denormal || self.reg_denormal) && !zero_divide {
             flags |= SW_DE;
         }
         // Operand-class exceptions and NaN results are decided on the 64-bit format.
@@ -508,20 +531,20 @@ impl Fpu {
                 self.raise((f | pre) & !(SW_IE | SW_ZE));
                 let v = widen(r);
                 self.set_c1_rounded(v, w, f | pre);
-                v
+                self.bias_unmasked(v, f | pre)
             }
             2 => {
                 let (r, f) = narrow_wide::<X87DoubleS>(w, rm);
                 self.raise((f | pre) & !(SW_IE | SW_ZE));
                 let v = widen(r);
                 self.set_c1_rounded(v, w, f | pre);
-                v
+                self.bias_unmasked(v, f | pre)
             }
             _ => {
                 let (r, f) = narrow_wide::<rustc_apfloat::ieee::X87DoubleExtendedS>(w, rm);
                 self.raise((f | pre) & !(SW_IE | SW_ZE));
                 self.set_c1_rounded(r, w, f | pre);
-                r
+                self.bias_unmasked(r, f | pre)
             }
         };
         fix_zero(v)
@@ -645,7 +668,6 @@ impl Fpu {
         } else {
             (r.value, if exact { 0 } else { SW_PE })
         };
-        if v.is_denormal() { self.raise(SW_DE); }
         self.raise(flags);
         self.clear_c1();
         if flags & SW_PE != 0 {
@@ -664,6 +686,7 @@ impl Fpu {
     }
 
     fn store_bcd(&mut self, m: &mut dyn Mem, addr: u32, v: Ext) {
+        self.clear_c1();
         let rm = round_mode(self.cw);
         let mut exact = false;
         let r = v.to_i128_r(80, rm, &mut exact);
@@ -818,7 +841,7 @@ impl Fpu {
         // fnclex, fnop, fincstp, fdecstp, ffree, fwait) leave the pointers alone.
         // Current CPUs update FOP and FDP only when an unmasked exception is raised
         // (FCS/FDS are gone entirely); FIP tracks every non-control instruction.
-        if !matches!(mn, Fnop | Wait | Fninit | Fnclex | Fldcw | Fnstcw | Fnstsw | Fnstenv | Fldenv | Fnsave | Frstor | Fincstp | Fdecstp | Ffree | Ffreep) {
+        if !matches!(mn, Wait | Fninit | Fnclex | Fldcw | Fnstcw | Fnstsw | Fnstenv | Fldenv | Fnsave | Frstor | Fincstp | Fdecstp | Ffree | Ffreep) {
             self.fip = ip;
             self.cur_fop = fop & 0x7ff;
             self.cur_fdp = if has_mem { a } else { 0 };
