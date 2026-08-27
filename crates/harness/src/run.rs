@@ -181,9 +181,6 @@ pub fn run(opts: RunOpts) -> Result<()> {
         });
     }
 
-    let mut process = Process::new(host_root.clone(), &exe_path, &cmdline);
-    process.trace = opts.trace;
-    process.frame_limit = opts.frames;
     // Files the game writes go to a scratch layer, never into the imported game files.
     let slug = opts.game_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let write_root = PathBuf::from("target/gamedata").join(&slug);
@@ -191,7 +188,12 @@ pub fn run(opts: RunOpts) -> Result<()> {
         let _ = std::fs::remove_dir_all(&write_root);
     }
     std::fs::create_dir_all(&write_root)?;
-    process.write_root = Some(write_root);
+    let fs = runtime::vfs::DirFs::new(host_root.clone(), Some(write_root));
+    let mut process = Process::new(Box::new(fs), &exe_path, &cmdline);
+    process.trace = opts.trace;
+    process.frame_limit = opts.frames;
+    // A fixed date keeps runs reproducible.
+    process.epoch_unix = 1_767_225_600;
     let mut eng = Engine::new(process);
     eng.trace = opts.trace;
     eng.max_api_calls = opts.max_api_calls;
@@ -245,8 +247,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let mut m = Wt { cx: &mut store, cpu };
     let nop = m.instantiate(&engine::nop_module(), &["nop".to_string()]).map_err(|e| anyhow!("{e}"))?;
     m.engine().nop_index = nop[0];
-    let root = host_root.clone();
-    let started = engine::start(&mut m, &exe, &|name| std::fs::read(root.join(name)).ok()).map_err(|e| anyhow!("{e}"))?;
+    let started = engine::start(&mut m, &exe).map_err(|e| anyhow!("{e}"))?;
     if opts.aot {
         let t = Instant::now();
         let failed = engine::translate_all(&mut m, 512).map_err(|e| anyhow!("{e}"))?;

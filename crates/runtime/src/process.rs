@@ -47,7 +47,8 @@ pub struct FindEntry {
 #[derive(Debug, Clone)]
 pub struct FileHandle {
     pub path: String,
-    pub host_path: std::path::PathBuf,
+    /// Path in the VFS.
+    pub key: String,
     pub pos: u64,
     pub writable: bool,
 }
@@ -209,11 +210,11 @@ pub struct Process {
     pub cmdline: String,
     pub exe_path: String,
     pub cwd: String,
-    pub host_root: std::path::PathBuf,
-    /// Writable layer over `host_root` (copy-on-write); None writes in place.
-    pub write_root: Option<std::path::PathBuf>,
-    /// Guest paths (relative, lowercase) deleted from the read-only layer.
-    pub deleted: std::collections::HashSet<String>,
+    /// The guest's file system (`C:\\game` and everything below it).
+    pub fs: Box<dyn crate::vfs::Vfs>,
+    /// Host wall-clock time at process start (Unix seconds); dates follow it plus the
+    /// virtual clock.
+    pub epoch_unix: u64,
     pub env: Vec<(String, String)>,
     /// Virtual clock in microseconds since process start.
     pub clock_us: u64,
@@ -257,16 +258,16 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(host_root: std::path::PathBuf, exe_path: &str, cmdline: &str) -> Self {
-        Self::with_registry(Registry::new(), host_root, exe_path, cmdline)
+    pub fn new(fs: Box<dyn crate::vfs::Vfs>, exe_path: &str, cmdline: &str) -> Self {
+        Self::with_registry(Registry::new(), fs, exe_path, cmdline)
     }
 
     /// A placeholder with no APIs: stands in for the real process while it is lent out.
     pub fn empty() -> Self {
-        Self::with_registry(Registry::default(), std::path::PathBuf::new(), "", "")
+        Self::with_registry(Registry::default(), Box::new(crate::vfs::MemFs::new()), "", "")
     }
 
-    pub fn with_registry(registry: Registry, host_root: std::path::PathBuf, exe_path: &str, cmdline: &str) -> Self {
+    pub fn with_registry(registry: Registry, fs: Box<dyn crate::vfs::Vfs>, exe_path: &str, cmdline: &str) -> Self {
         let mut vm = Vm::new();
         vm.alloc(STUB_BASE, 0x0010_0000, true, PAGE_READWRITE, false, "hle stubs");
         vm.alloc(RET_TO_HOST, 0x1000, true, PAGE_READWRITE, false, "host return");
@@ -288,9 +289,8 @@ impl Process {
             cmdline: cmdline.to_string(),
             exe_path: exe_path.to_string(),
             cwd,
-            host_root,
-            write_root: None,
-            deleted: Default::default(),
+            fs,
+            epoch_unix: 1_767_225_600,
             env: vec![
                 ("PATH".into(), "C:\\Windows\\system32;C:\\Windows".into()),
                 ("SystemRoot".into(), "C:\\Windows".into()),
@@ -422,82 +422,9 @@ impl Process {
         out
     }
 
-    fn join(root: &std::path::Path, rel: &[String]) -> std::path::PathBuf {
-        let mut out = root.to_path_buf();
-        for c in rel {
-            out.push(c);
-        }
-        out
-    }
-
-    /// Resolves a guest path for reading: the writable layer first, then the game files.
-    pub fn host_path(&self, guest: &str) -> std::path::PathBuf {
-        let rel = self.guest_rel(guest);
-        let key = rel.join("\\").to_lowercase();
-        if let Some(w) = &self.write_root {
-            let wp = Self::join(w, &rel);
-            if self.deleted.contains(&key) || wp.exists() {
-                return wp;
-            }
-        }
-        Self::join(&self.host_root, &rel)
-    }
-
-    /// Resolves a guest path for writing. With a writable layer, the file (or
-    /// directory) is copied up from the game files first so writes never touch them.
-    pub fn host_path_w(&mut self, guest: &str) -> std::path::PathBuf {
-        let rel = self.guest_rel(guest);
-        let key = rel.join("\\").to_lowercase();
-        let Some(w) = self.write_root.clone() else { return Self::join(&self.host_root, &rel) };
-        let wp = Self::join(&w, &rel);
-        if !wp.exists() && !self.deleted.contains(&key) {
-            let base = Self::join(&self.host_root, &rel);
-            if let Some(parent) = wp.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if base.is_file() {
-                let _ = std::fs::copy(&base, &wp);
-            } else if base.is_dir() {
-                let _ = std::fs::create_dir_all(&wp);
-            }
-        } else if let Some(parent) = wp.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        self.deleted.remove(&key);
-        wp
-    }
-
-    /// Hides a guest path from the read-only layer (after DeleteFile/RemoveDirectory).
-    pub fn mark_deleted(&mut self, guest: &str) {
-        if self.write_root.is_some() {
-            let key = self.guest_rel(guest).join("\\").to_lowercase();
-            self.deleted.insert(key);
-        }
-    }
-
-    /// Directory listing merged over both layers: (name, host path).
-    pub fn list_dir(&self, guest_dir: &str) -> Vec<(String, std::path::PathBuf)> {
-        let rel = self.guest_rel(guest_dir);
-        let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
-        let mut roots = vec![self.host_root.clone()];
-        if let Some(w) = &self.write_root {
-            roots.insert(0, w.clone());
-        }
-        for root in roots {
-            let Ok(rd) = std::fs::read_dir(Self::join(&root, &rel)) else { continue };
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let mut key_rel = rel.clone();
-                key_rel.push(name.clone());
-                if self.deleted.contains(&key_rel.join("\\").to_lowercase()) {
-                    continue;
-                }
-                if !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
-                    out.push((name, e.path()));
-                }
-            }
-        }
-        out
+    /// The VFS path of a guest path.
+    pub fn vpath(&self, guest: &str) -> String {
+        self.guest_rel(guest).join("\\")
     }
 
     pub fn now_ms(&self) -> u32 {

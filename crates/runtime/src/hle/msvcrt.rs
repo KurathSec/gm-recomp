@@ -730,7 +730,7 @@ pub fn register(r: &mut Registry) {
         ok(0)
     });
     r.add(m, "time", |c| {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as u32 + (c.p.clock_us / 1_000_000) as u32;
+        let t = (c.p.epoch_unix + c.p.clock_us / 1_000_000) as u32;
         let p = c.arg(0);
         if p != 0 {
             let _ = c.host.write_u32(p, t);

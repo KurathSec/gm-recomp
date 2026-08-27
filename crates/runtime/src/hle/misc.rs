@@ -192,9 +192,9 @@ fn version_resource(c: &mut Ctx, path: &str) -> Option<Vec<u8>> {
     let base = path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase();
     let bytes = match c.p.module_by_name(&base) {
         Some(m) => m.file.clone(),
-        None => match std::fs::read(c.p.host_path(path)) {
-            Ok(b) => b,
-            Err(_) => return system_dll_version(&base),
+        None => match c.p.fs.read_all(&c.p.vpath(path)) {
+            Some(b) => b,
+            None => return system_dll_version(&base),
         },
     };
     let pe = pe::Pe::parse(&bytes).ok()?;

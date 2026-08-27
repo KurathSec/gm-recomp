@@ -2,7 +2,6 @@
 //! timers, keyboard state and the small set of queries a VCL application makes.
 
 use super::{ApiResult, Ctx, Registry, Ret};
-use crate::mem::Guest;
 use crate::process::{Handle, Msg, Window, WndClass};
 
 fn ok(nargs: u32, v: u32) -> ApiResult {
@@ -748,7 +747,7 @@ pub fn register(r: &mut Registry) {
     r.add(u, "GetSubMenu", |_c| ok(2, 0));
     r.add(u, "SetMenuDefaultItem", |_c| ok(3, 1));
     r.add(u, "ModifyMenuA", |_c| ok(5, 1));
-    r.add(u, "DrawTextA", |c| ok(5, 16));
+
     r.alias(u, "DrawTextW", u, "DrawTextA");
     r.add(u, "DrawTextExA", |_c| ok(6, 16));
     r.add(u, "DrawEdge", |_c| ok(4, 1));

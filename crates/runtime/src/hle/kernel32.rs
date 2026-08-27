@@ -4,7 +4,6 @@
 use super::{Regs, ApiError, ApiResult, Ctx, Registry, Ret, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_MOD_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PROC_NOT_FOUND, ERROR_SUCCESS, INVALID_HANDLE_VALUE, ERROR_ENVVAR_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER};
 use crate::mem::{Guest, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEM_TOP_DOWN, PAGE_READWRITE};
 use crate::process::{FileHandle, FindEntry, Handle, Process, RET_TO_HOST, TEB_BASE};
-use std::io::{Read, Seek, SeekFrom, Write};
 
 fn ok(nargs: u32, v: u32) -> ApiResult {
     Ok(Ret::stdcall(nargs, v))
@@ -1010,14 +1009,18 @@ pub fn register(r: &mut Registry) {
             None => ok(2, 0),
         }
     });
-    r.add(k, "SetEndOfFile", |_c| ok(1, 1));
+    r.add(k, "SetEndOfFile", |c| {
+        let h = c.arg(0);
+        let Some((key, pos)) = with_file(c, h, |fh| (fh.key.clone(), fh.pos)) else { return ok(1, 0) };
+        let r = c.p.fs.set_len(&key, pos);
+        ok(1, r as u32)
+    });
     r.add(k, "FlushFileBuffers", |_c| ok(1, 1));
     r.add(k, "GetFileAttributesA", |c| {
         let path = c.str_arg(0);
-        let hp = c.p.host_path(&path);
-        let r = match std::fs::metadata(&hp) {
-            Ok(m) => if m.is_dir() { 0x10 } else { 0x80 },
-            Err(_) => {
+        let r = match c.p.fs.stat(&c.p.vpath(&path)) {
+            Some(m) => if m.is_dir { 0x10 } else { 0x80 },
+            None => {
                 c.set_last_error(ERROR_FILE_NOT_FOUND);
                 0xFFFF_FFFF
             }
@@ -1027,10 +1030,9 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "GetFileAttributesW", |c| {
         let path = c.wstr_arg(0);
-        let hp = c.p.host_path(&path);
-        let r = match std::fs::metadata(&hp) {
-            Ok(m) => if m.is_dir() { 0x10 } else { 0x80 },
-            Err(_) => {
+        let r = match c.p.fs.stat(&c.p.vpath(&path)) {
+            Some(m) => if m.is_dir { 0x10 } else { 0x80 },
+            None => {
                 c.set_last_error(ERROR_FILE_NOT_FOUND);
                 0xFFFF_FFFF
             }
@@ -1038,24 +1040,6 @@ pub fn register(r: &mut Registry) {
         ok(1, r)
     });
     r.add(k, "SetFileAttributesA", |_c| ok(2, 1));
-    r.add(k, "GetFileAttributesExA", |c| {
-        let path = c.str_arg(0);
-        let hp = c.p.host_path(&path);
-        match std::fs::metadata(&hp) {
-            Ok(m) => {
-                let p = c.arg(2);
-                let _ = c.host.fill(p, 36, 0);
-                let _ = c.host.write_u32(p, if m.is_dir() { 0x10 } else { 0x80 });
-                let _ = c.host.write_u32(p + 28, (m.len() >> 32) as u32);
-                let _ = c.host.write_u32(p + 32, m.len() as u32);
-                ok(3, 1)
-            }
-            Err(_) => {
-                c.set_last_error(ERROR_FILE_NOT_FOUND);
-                ok(3, 0)
-            }
-        }
-    });
     r.add(k, "GetFileInformationByHandle", |c| {
         let h = c.arg(0);
         let size = file_size(c, h).unwrap_or(0);
@@ -1155,17 +1139,6 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "MapViewOfFile", |_c| ok(5, 0));
     r.add(k, "UnmapViewOfFile", |_c| ok(1, 1));
-    r.add(k, "SearchPathA", |c| {
-        let name = c.str_arg(1);
-        let hp = c.p.host_path(&name);
-        if hp.exists() {
-            let full = format!("{}\\{}", c.p.cwd, name);
-            let n = copy_str_out(c, c.arg(4), c.arg(3), full.as_bytes());
-            ok(6, n)
-        } else {
-            ok(6, 0)
-        }
-    });
     r.add(k, "GetConsoleMode", |_c| ok(2, 0));
     r.add(k, "GetConsoleCP", |_c| ok(0, 437));
     r.add(k, "GetConsoleOutputCP", |_c| ok(0, 437));
@@ -1320,9 +1293,9 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
     }
     // A DLL the game ships (or extracted at run time) is loaded and recompiled.
     let with_ext = if name.to_lowercase().ends_with(".dll") || name.contains('.') { name.to_string() } else { format!("{name}.dll") };
-    let hp = c.p.host_path(&with_ext);
-    if hp.is_file() {
-        if let Ok(bytes) = std::fs::read(&hp) {
+    let key = c.p.vpath(&with_ext);
+    if c.p.fs.is_file(&key) {
+        if let Some(bytes) = c.p.fs.read_all(&key) {
             let base_name = with_ext.rsplit(['\\', '/']).next().unwrap_or(&with_ext).to_string();
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
             return load_image(c, &base_name, &guest_path, bytes, true);
@@ -1551,31 +1524,30 @@ fn write_systemtime(c: &mut Ctx, p: u32) {
 
 pub(crate) fn create_file(c: &mut Ctx, path: &str, access: u32, disposition: u32) -> u32 {
     let writable = access & 0x4000_0000 != 0;
+    let key = c.p.vpath(path);
     // CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5
-    let exists = c.p.host_path(path).exists();
-    let hp = if writable || matches!(disposition, 1 | 2 | 5) || (disposition == 4 && !exists) { c.p.host_path_w(path) } else { c.p.host_path(path) };
-    let result = match disposition {
-        3 if !exists => Err(()),
-        1 if exists => Err(()),
-        5 if !exists => Err(()),
-        2 | 5 => std::fs::File::create(&hp).map(|_| ()).map_err(|_| ()),
-        4 if !exists => std::fs::File::create(&hp).map(|_| ()).map_err(|_| ()),
-        _ => Ok(()),
+    let exists = c.p.fs.exists(&key);
+    if !exists && !key.is_empty() && !c.p.fs.is_dir(crate::vfs::parent(&key)) {
+        c.set_last_error(super::ERROR_PATH_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    let ok_ = match disposition {
+        3 | 5 if !exists => false,
+        1 if exists => false,
+        2 | 5 => c.p.fs.create(&key),
+        1 | 4 if !exists => c.p.fs.create(&key),
+        _ => true,
     };
-    if result.is_err() || !hp.exists() {
+    if !ok_ {
         c.set_last_error(if disposition == 1 && exists { super::ERROR_ALREADY_EXISTS } else { ERROR_FILE_NOT_FOUND });
         return INVALID_HANDLE_VALUE;
     }
-    if disposition == 4 && exists || disposition == 2 && exists {
-        // ERROR_ALREADY_EXISTS is reported alongside success.
-        c.set_last_error(super::ERROR_ALREADY_EXISTS);
-    } else {
-        c.set_last_error(0);
-    }
-    if hp.is_dir() {
+    // ERROR_ALREADY_EXISTS is reported alongside success.
+    c.set_last_error(if exists && matches!(disposition, 2 | 4) { super::ERROR_ALREADY_EXISTS } else { 0 });
+    if c.p.fs.is_dir(&key) {
         return c.p.new_handle(Handle::Dummy("directory"));
     }
-    c.p.new_handle(Handle::File(FileHandle { path: path.to_string(), host_path: hp, pos: 0, writable }))
+    c.p.new_handle(Handle::File(FileHandle { path: path.to_string(), key, pos: 0, writable }))
 }
 
 fn with_file<T>(c: &mut Ctx, h: u32, f: impl FnOnce(&mut FileHandle) -> T) -> Option<T> {
@@ -1586,30 +1558,17 @@ fn with_file<T>(c: &mut Ctx, h: u32, f: impl FnOnce(&mut FileHandle) -> T) -> Op
 }
 
 pub(crate) fn read_file(c: &mut Ctx, h: u32, buf: u32, n: u32) -> Option<u32> {
-    let (path, pos) = with_file(c, h, |fh| (fh.host_path.clone(), fh.pos))?;
-    let mut file = std::fs::File::open(&path).ok()?;
-    file.seek(SeekFrom::Start(pos)).ok()?;
+    let (key, pos) = with_file(c, h, |fh| (fh.key.clone(), fh.pos))?;
     let mut data = vec![0u8; n as usize];
-    let mut got = 0usize;
-    while got < data.len() {
-        match file.read(&mut data[got..]) {
-            Ok(0) => break,
-            Ok(k) => got += k,
-            Err(_) => break,
-        }
-    }
+    let got = c.p.fs.read_at(&key, pos, &mut data)?;
     let _ = c.host.write(buf, &data[..got]);
     with_file(c, h, |fh| fh.pos += got as u64);
     Some(got as u32)
 }
 
 pub(crate) fn write_file(c: &mut Ctx, h: u32, data: &[u8]) -> u32 {
-    let Some((path, pos)) = with_file(c, h, |fh| (fh.host_path.clone(), fh.pos)) else { return 0 };
-    let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&path) else { return 0 };
-    if file.seek(SeekFrom::Start(pos)).is_err() {
-        return 0;
-    }
-    if file.write_all(data).is_err() {
+    let Some((key, pos, writable)) = with_file(c, h, |fh| (fh.key.clone(), fh.pos, fh.writable)) else { return 0 };
+    if !writable || !c.p.fs.write_at(&key, pos, data) {
         return 0;
     }
     with_file(c, h, |fh| fh.pos += data.len() as u64);
@@ -1627,8 +1586,8 @@ pub(crate) fn seek_file(c: &mut Ctx, h: u32, dist: i64, method: u32) -> Option<u
 }
 
 pub(crate) fn file_size(c: &mut Ctx, h: u32) -> Option<u64> {
-    let path = with_file(c, h, |fh| fh.host_path.clone())?;
-    std::fs::metadata(path).ok().map(|m| m.len())
+    let key = with_file(c, h, |fh| fh.key.clone())?;
+    c.p.fs.stat(&key).map(|m| m.size)
 }
 
 fn find_first(c: &mut Ctx, pattern: &str) -> u32 {
@@ -1637,10 +1596,10 @@ fn find_first(c: &mut Ctx, pattern: &str) -> u32 {
         None => (c.p.cwd.clone(), pattern.to_string()),
     };
     let mut entries = Vec::new();
-    for (name, hp) in c.p.list_dir(&dir) {
+    let dkey = c.p.vpath(&dir);
+    for (name, md) in c.p.fs.list(&dkey) {
         if glob_match(&pat.to_lowercase(), &name.to_lowercase()) {
-            let md = std::fs::metadata(&hp).ok();
-            entries.push(FindEntry { name, size: md.as_ref().map(|m| m.len()).unwrap_or(0), is_dir: md.map(|m| m.is_dir()).unwrap_or(false) });
+            entries.push(FindEntry { name, size: md.size, is_dir: md.is_dir });
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1880,16 +1839,7 @@ fn wstr(c: &Ctx, a: u32) -> String {
     if a == 0 { String::new() } else { c.host.read_wstr(a).unwrap_or_default() }
 }
 
-fn unix_to_filetime(secs: i64, nanos: u32) -> u64 {
-    ((secs + 11_644_473_600) as u64) * 10_000_000 + (nanos / 100) as u64
-}
 
-fn metadata_filetime(t: std::io::Result<std::time::SystemTime>) -> u64 {
-    match t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
-        Some(d) => unix_to_filetime(d.as_secs() as i64, d.subsec_nanos()),
-        None => 0,
-    }
-}
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -1907,7 +1857,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// SYSTEMTIME fields (year, month, weekday, day, hour, minute, second, ms) for the
 /// host clock plus the virtual clock offset.
 pub fn host_systemtime(c: &Ctx) -> [u16; 8] {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) + c.p.clock_us / 1_000_000;
+    let now = c.p.epoch_unix + c.p.clock_us / 1_000_000;
     let days = (now / 86_400) as i64;
     let (y, m, d) = civil_from_days(days);
     let dow = ((days + 4) % 7) as u16;
@@ -2210,13 +2160,65 @@ fn find_resource_api(c: &mut Ctx, wide: bool, ex: bool) -> ApiResult {
     }
 }
 
-fn write_attr_data(c: &mut Ctx, out: u32, md: &std::fs::Metadata) {
-    let _ = c.host.write_u32(out, if md.is_dir() { 0x10 } else { 0x80 });
-    let _ = c.host.write_u64(out + 4, metadata_filetime(md.created()));
-    let _ = c.host.write_u64(out + 12, metadata_filetime(md.accessed()));
-    let _ = c.host.write_u64(out + 20, metadata_filetime(md.modified()));
-    let _ = c.host.write_u32(out + 28, (md.len() >> 32) as u32);
-    let _ = c.host.write_u32(out + 32, md.len() as u32);
+fn write_attr_data(c: &mut Ctx, out: u32, md: &crate::vfs::Meta) {
+    let _ = c.host.write_u32(out, if md.is_dir { 0x10 } else { 0x80 });
+    let _ = c.host.write_u64(out + 4, md.mtime);
+    let _ = c.host.write_u64(out + 12, md.mtime);
+    let _ = c.host.write_u64(out + 20, md.mtime);
+    let _ = c.host.write_u32(out + 28, (md.size >> 32) as u32);
+    let _ = c.host.write_u32(out + 32, md.size as u32);
+}
+
+fn copy_file(c: &mut Ctx, src: &str, dst: &str, fail_if_exists: bool) -> bool {
+    let (a, b) = (c.p.vpath(src), c.p.vpath(dst));
+    if fail_if_exists && c.p.fs.exists(&b) {
+        c.set_last_error(super::ERROR_ALREADY_EXISTS);
+        return false;
+    }
+    let r = c.p.fs.is_file(&a) && c.p.fs.copy(&a, &b);
+    if !r {
+        c.set_last_error(ERROR_FILE_NOT_FOUND);
+    }
+    r
+}
+
+fn move_file(c: &mut Ctx, src: &str, dst: &str, replace: bool) -> bool {
+    let (a, b) = (c.p.vpath(src), c.p.vpath(dst));
+    if c.p.fs.exists(&b) {
+        if !replace {
+            c.set_last_error(super::ERROR_ALREADY_EXISTS);
+            return false;
+        }
+        c.p.fs.remove(&b);
+    }
+    let r = c.p.fs.rename(&a, &b);
+    if !r {
+        c.set_last_error(ERROR_FILE_NOT_FOUND);
+    }
+    r
+}
+
+fn delete_path(c: &mut Ctx, guest: &str, dir: bool) -> bool {
+    let key = c.p.vpath(guest);
+    let ok_ = if dir { c.p.fs.is_dir(&key) } else { c.p.fs.is_file(&key) };
+    let r = ok_ && c.p.fs.remove(&key);
+    if !r {
+        c.set_last_error(if ok_ { 145 } else { ERROR_FILE_NOT_FOUND });
+    }
+    r
+}
+
+fn create_dir(c: &mut Ctx, guest: &str) -> bool {
+    let key = c.p.vpath(guest);
+    if c.p.fs.exists(&key) {
+        c.set_last_error(super::ERROR_ALREADY_EXISTS);
+        return false;
+    }
+    let r = c.p.fs.mkdir(&key);
+    if !r {
+        c.set_last_error(super::ERROR_PATH_NOT_FOUND);
+    }
+    r
 }
 
 pub fn register_more(r: &mut Registry) {
@@ -2357,135 +2359,65 @@ pub fn register_more(r: &mut Registry) {
     // ---- files and directories ---------------------------------------------------
     r.add(k, "CopyFileW", |c| {
         let (src, dst, fail) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)), c.arg(2));
-        let (hs, hd) = (c.p.host_path(&src), c.p.host_path(&dst));
-        let hd = if fail != 0 && hd.exists() { hd } else { c.p.host_path_w(&dst) };
-        if fail != 0 && hd.exists() {
-            c.set_last_error(super::ERROR_ALREADY_EXISTS);
-            return ok(3, 0);
-        }
-        let r = std::fs::copy(&hs, &hd).is_ok();
+        let r = copy_file(c, &src, &dst, fail != 0);
         c.trace(format!("({src:?} -> {dst:?}) = {r}"));
-        if !r {
-            c.set_last_error(ERROR_FILE_NOT_FOUND);
-        }
         ok(3, r as u32)
     });
     r.add(k, "CopyFileA", |c| {
         let (src, dst, fail) = (c.str_arg(0), c.str_arg(1), c.arg(2));
-        let (hs, hd) = (c.p.host_path(&src), c.p.host_path(&dst));
-        let hd = if fail != 0 && hd.exists() { hd } else { c.p.host_path_w(&dst) };
-        if fail != 0 && hd.exists() {
-            c.set_last_error(super::ERROR_ALREADY_EXISTS);
-            return ok(3, 0);
-        }
-        let r = std::fs::copy(&hs, &hd).is_ok();
-        if !r {
-            c.set_last_error(ERROR_FILE_NOT_FOUND);
-        }
+        let r = copy_file(c, &src, &dst, fail != 0);
         ok(3, r as u32)
     });
     r.add(k, "MoveFileW", |c| {
         let (src, dst) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)));
-        let hs = c.p.host_path_w(&src);
-        let hd = c.p.host_path_w(&dst);
-        let r = std::fs::rename(hs, hd).is_ok();
-        if r {
-            c.p.mark_deleted(&src);
-        }
-        if !r {
-            c.set_last_error(ERROR_FILE_NOT_FOUND);
-        }
+        let r = move_file(c, &src, &dst, false);
         ok(2, r as u32)
     });
     r.add(k, "MoveFileA", |c| {
         let (src, dst) = (c.str_arg(0), c.str_arg(1));
-        let hs = c.p.host_path_w(&src);
-        let hd = c.p.host_path_w(&dst);
-        let r = std::fs::rename(hs, hd).is_ok();
-        if r {
-            c.p.mark_deleted(&src);
-        }
-        if !r {
-            c.set_last_error(ERROR_FILE_NOT_FOUND);
-        }
+        let r = move_file(c, &src, &dst, false);
         ok(2, r as u32)
     });
     r.add(k, "MoveFileExW", |c| {
-        let (src, dst) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)));
-        let hs = c.p.host_path_w(&src);
-        let hd = c.p.host_path_w(&dst);
-        let r = std::fs::rename(hs, hd).is_ok();
-        if r {
-            c.p.mark_deleted(&src);
-        }
+        let (src, dst, flags) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)), c.arg(2));
+        let r = move_file(c, &src, &dst, flags & 1 != 0);
+        ok(3, r as u32)
+    });
+    r.add(k, "MoveFileExA", |c| {
+        let (src, dst, flags) = (c.str_arg(0), c.str_arg(1), c.arg(2));
+        let r = move_file(c, &src, &dst, flags & 1 != 0);
         ok(3, r as u32)
     });
     r.add(k, "DeleteFileW", |c| {
         let p = wstr(c, c.arg(0));
-        let r = c.p.host_path(&p).is_file();
-        if r {
-            let w = c.p.host_path_w(&p);
-            let _ = std::fs::remove_file(w);
-            c.p.mark_deleted(&p);
-        }
+        let r = delete_path(c, &p, false);
         c.trace(format!("({p:?}) = {r}"));
-        if !r {
-            c.set_last_error(ERROR_FILE_NOT_FOUND);
-        }
         ok(1, r as u32)
     });
     r.add(k, "DeleteFileA", |c| {
         let p = c.str_arg(0);
-        let r = c.p.host_path(&p).is_file();
-        if r {
-            let w = c.p.host_path_w(&p);
-            let _ = std::fs::remove_file(w);
-            c.p.mark_deleted(&p);
-        }
-        if !r {
-            c.set_last_error(ERROR_FILE_NOT_FOUND);
-        }
+        let r = delete_path(c, &p, false);
         ok(1, r as u32)
     });
     r.add(k, "CreateDirectoryW", |c| {
         let p = wstr(c, c.arg(0));
-        if c.p.host_path(&p).exists() {
-            c.set_last_error(super::ERROR_ALREADY_EXISTS);
-            return ok(2, 0);
-        }
-        let hp = c.p.host_path_w(&p);
-        let r = std::fs::create_dir(&hp).is_ok() || hp.is_dir();
+        let r = create_dir(c, &p);
         c.trace(format!("({p:?}) = {r}"));
         ok(2, r as u32)
     });
     r.add(k, "CreateDirectoryA", |c| {
         let p = c.str_arg(0);
-        if c.p.host_path(&p).exists() {
-            c.set_last_error(super::ERROR_ALREADY_EXISTS);
-            return ok(2, 0);
-        }
-        let hp = c.p.host_path_w(&p);
-        let r = std::fs::create_dir(&hp).is_ok() || hp.is_dir();
+        let r = create_dir(c, &p);
         ok(2, r as u32)
     });
     r.add(k, "RemoveDirectoryW", |c| {
         let p = wstr(c, c.arg(0));
-        let r = c.p.list_dir(&p).is_empty() && c.p.host_path(&p).is_dir();
-        if r {
-            let w = c.p.host_path_w(&p);
-            let _ = std::fs::remove_dir(w);
-            c.p.mark_deleted(&p);
-        }
+        let r = delete_path(c, &p, true);
         ok(1, r as u32)
     });
     r.add(k, "RemoveDirectoryA", |c| {
         let p = c.str_arg(0);
-        let r = c.p.list_dir(&p).is_empty() && c.p.host_path(&p).is_dir();
-        if r {
-            let w = c.p.host_path_w(&p);
-            let _ = std::fs::remove_dir(w);
-            c.p.mark_deleted(&p);
-        }
+        let r = delete_path(c, &p, true);
         ok(1, r as u32)
     });
     r.add(k, "SetFileAttributesW", |_c| ok(2, 1));
@@ -2493,12 +2425,12 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "GetFileAttributesExW", |c| {
         let p = wstr(c, c.arg(0));
         let out = c.arg(2);
-        match std::fs::metadata(c.p.host_path(&p)) {
-            Ok(md) => {
+        match c.p.fs.stat(&c.p.vpath(&p)) {
+            Some(md) => {
                 write_attr_data(c, out, &md);
                 ok(3, 1)
             }
-            Err(_) => {
+            None => {
                 c.set_last_error(ERROR_FILE_NOT_FOUND);
                 ok(3, 0)
             }
@@ -2507,12 +2439,12 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "GetFileAttributesExA", |c| {
         let p = c.str_arg(0);
         let out = c.arg(2);
-        match std::fs::metadata(c.p.host_path(&p)) {
-            Ok(md) => {
+        match c.p.fs.stat(&c.p.vpath(&p)) {
+            Some(md) => {
                 write_attr_data(c, out, &md);
                 ok(3, 1)
             }
-            Err(_) => {
+            None => {
                 c.set_last_error(ERROR_FILE_NOT_FOUND);
                 ok(3, 0)
             }
@@ -2550,7 +2482,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "SearchPathW", |c| {
         let file = wstr(c, c.arg(1));
         let (cch, buf, part) = (c.arg(3), c.arg(4), c.arg(5));
-        if !c.p.host_path(&file).is_file() {
+        if !c.p.fs.is_file(&c.p.vpath(&file)) {
             c.set_last_error(ERROR_FILE_NOT_FOUND);
             return ok(6, 0);
         }
@@ -2569,7 +2501,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "SearchPathA", |c| {
         let file = c.str_arg(1);
         let (cch, buf, part) = (c.arg(3), c.arg(4), c.arg(5));
-        if !c.p.host_path(&file).is_file() {
+        if !c.p.fs.is_file(&c.p.vpath(&file)) {
             c.set_last_error(ERROR_FILE_NOT_FOUND);
             return ok(6, 0);
         }
@@ -2587,7 +2519,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "SetCurrentDirectoryW", |c| {
         let p = wstr(c, c.arg(0));
         let full = full_path(c, &p);
-        if !c.p.host_path(&full).is_dir() {
+        if !c.p.fs.is_dir(&c.p.vpath(&full)) {
             c.set_last_error(super::ERROR_PATH_NOT_FOUND);
             return ok(1, 0);
         }
@@ -2598,7 +2530,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(k, "SetCurrentDirectoryA", |c| {
         let p = c.str_arg(0);
         let full = full_path(c, &p);
-        if !c.p.host_path(&full).is_dir() {
+        if !c.p.fs.is_dir(&c.p.vpath(&full)) {
             c.set_last_error(super::ERROR_PATH_NOT_FOUND);
             return ok(1, 0);
         }

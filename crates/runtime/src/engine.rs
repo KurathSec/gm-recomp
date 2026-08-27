@@ -653,16 +653,20 @@ pub struct Started {
 }
 
 /// Maps the exe and the game DLLs it imports (dependencies first), lays out the main
-/// thread and static TLS, and sets the initial registers. `read` fetches a file of
-/// the game directory by name.
-pub fn start<M: Machine>(m: &mut M, exe: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Started, String> {
+/// thread and static TLS, and sets the initial registers. Files come from the
+/// process's VFS (game directory).
+pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let mut order = Vec::new();
     let mut seen = HashSet::new();
-    collect_order(exe, read, &mut seen, &mut order)?;
+    let read = |m: &M, name: &str| m.engine_ref().process().fs.read_all(name);
+    {
+        let r = |name: &str| read(m, name);
+        collect_order(exe, &r, &mut seen, &mut order)?;
+    }
     let mut attach = Vec::new();
     let (mut entry, mut image_base) = (0, 0);
     for name in order {
-        let bytes = read(&name).ok_or_else(|| format!("reading {name}"))?;
+        let bytes = read(m, &name).ok_or_else(|| format!("reading {name}"))?;
         let guest_path = format!("C:\\game\\{name}");
         let mut p = m.engine().p.take().ok_or("process not available")?;
         let loaded = {

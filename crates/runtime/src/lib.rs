@@ -7,6 +7,7 @@ pub mod hle;
 pub mod loader;
 pub mod mem;
 pub mod process;
+pub mod vfs;
 
 pub use hle::{ApiError, ApiId, ApiResult, Ctx, Host, Regs, Registry, Ret};
 pub use loader::{ImportResolver, LoadRequest, LoadedModule};

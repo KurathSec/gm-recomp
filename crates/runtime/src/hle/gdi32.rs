@@ -4,7 +4,7 @@
 //! and text metrics so the Delphi forms layer initialises.
 
 use super::{ApiResult, Ctx, Registry, Ret};
-use crate::mem::{Guest, PAGE_READWRITE};
+use crate::mem::PAGE_READWRITE;
 use crate::process::{GdiObject, Handle};
 
 fn ok(nargs: u32, v: u32) -> ApiResult {
