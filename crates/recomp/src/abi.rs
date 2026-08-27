@@ -44,9 +44,12 @@ pub enum Global {
     Xmm5,
     Xmm6,
     Xmm7,
+    /// Nonzero: stop running translated code and return to the dispatcher (the runtime
+    /// recorded why: a fault to raise, a context to resume, or a stop).
+    Ctl,
 }
 
-pub const GLOBALS: [(Global, &str, ValType); 26] = [
+pub const GLOBALS: [(Global, &str, ValType); 27] = [
     (Global::Eax, "eax", ValType::I32),
     (Global::Ecx, "ecx", ValType::I32),
     (Global::Edx, "edx", ValType::I32),
@@ -73,6 +76,7 @@ pub const GLOBALS: [(Global, &str, ValType); 26] = [
     (Global::Xmm5, "xmm5", ValType::V128),
     (Global::Xmm6, "xmm6", ValType::V128),
     (Global::Xmm7, "xmm7", ValType::V128),
+    (Global::Ctl, "ctl", ValType::I32),
 ];
 
 /// Runtime services imported by code modules, in import order.

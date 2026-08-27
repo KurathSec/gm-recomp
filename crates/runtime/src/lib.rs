@@ -2,6 +2,7 @@
 //! process state and the HLE API layer. The wasm host (native harness or browser)
 //! supplies memory, translation and the dispatcher.
 
+pub mod engine;
 pub mod hle;
 pub mod loader;
 pub mod mem;

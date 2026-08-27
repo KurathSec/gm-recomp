@@ -175,10 +175,32 @@ impl<'a> FuncEmit<'a> {
 
     pub(crate) fn trap(&mut self, kind: i32, arg: u32) {
         self.spill_all();
+        // The faulting instruction's address is part of the context the runtime sees.
+        self.c(self.ip);
+        self.i(W::GlobalSet(Global::Eip as u32));
         self.i(W::I32Const(kind));
         self.c(arg);
         self.call_rt(RtFunc::Trap);
+        self.return_if_ctl(false);
         self.reload_all();
+    }
+
+    /// `if (ctl) return;` — the runtime wants control back. `spill` first stores the
+    /// registers held in locals (call sites that did not spill before the call).
+    pub(crate) fn return_if_ctl(&mut self, spill: bool) {
+        self.i(W::GlobalGet(Global::Ctl as u32));
+        self.i(W::If(BlockType::Empty));
+        if spill {
+            // Materializing flags in this branch must not change what the code after
+            // the `if` believes about them.
+            let pending = self.pending.clone();
+            self.spill_all();
+            self.pending = pending;
+            self.c(self.ip);
+            self.i(W::GlobalSet(Global::Eip as u32));
+        }
+        self.i(W::Return);
+        self.i(W::End);
     }
 
     pub(crate) fn unimplemented(&mut self, instr: &Instruction) {
@@ -750,6 +772,8 @@ impl<'a> FuncEmit<'a> {
         self.i(W::GlobalGet(Global::Eip as u32));
         self.c(self.next_ip);
         self.i(W::I32Ne);
+        self.i(W::GlobalGet(Global::Ctl as u32));
+        self.i(W::I32Or);
         self.i(W::If(BlockType::Empty));
         self.i(W::Return);
         self.i(W::End);
@@ -2089,6 +2113,9 @@ impl<'a> FuncEmit<'a> {
         self.c(self.ip);
         self.c(self.cfg.fop.get(&self.ip).copied().unwrap_or(0) as u32);
         self.call_rt(RtFunc::Fpu);
+        // A pending unmasked x87 exception faults here (#MF): the runtime raises it once
+        // the registers are back in the globals.
+        self.return_if_ctl(true);
         if writes_ax {
             self.set(L_T1);
             self.write_reg_from(Register::AX, L_T1);
@@ -2152,4 +2179,4 @@ pub fn rt_index(f: RtFunc) -> u32 {
     f as u32
 }
 
-pub const _ASSERT_GLOBALS: () = assert!(abi::GLOBALS.len() == 26);
+pub const _ASSERT_GLOBALS: () = assert!(abi::GLOBALS.len() == 27);
