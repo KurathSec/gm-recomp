@@ -251,6 +251,10 @@ pub struct Process {
     pub d3d: crate::hle::gpu::DeviceState,
     pub gpu: Box<dyn crate::hle::gpu::Gpu>,
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
+    /// MCI devices: id -> (mode, element), and devices opened by name/alias.
+    pub mci: BTreeMap<u32, (u32, String)>,
+    pub mci_named: BTreeMap<String, u32>,
+    pub next_mci: u32,
     /// COM interface name -> vtable address in guest memory.
     pub com_vtables: HashMap<&'static str, u32>,
     /// Interface pointer -> (object base, interface index) for HLE COM objects.
@@ -341,6 +345,9 @@ impl Process {
             d3d: Default::default(),
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
+            mci: BTreeMap::new(),
+            mci_named: BTreeMap::new(),
+            next_mci: 0,
             com_vtables: HashMap::new(),
             com_ifaces: HashMap::new(),
             com_classes: HashMap::new(),

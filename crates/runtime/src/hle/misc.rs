@@ -470,6 +470,144 @@ fn imagelist_read(c: &mut Ctx, stream: u32) -> Result<u32, super::ApiError> {
     Ok(h)
 }
 
+// ---- MCI -----------------------------------------------------------------------------
+// Devices are tracked so media players see consistent state; sound output comes from
+// the host audio mixer (not connected yet).
+
+const MCI_OPEN: u32 = 0x803;
+const MCI_CLOSE: u32 = 0x804;
+const MCI_PLAY: u32 = 0x806;
+const MCI_SEEK: u32 = 0x807;
+const MCI_STOP: u32 = 0x808;
+const MCI_PAUSE: u32 = 0x809;
+const MCI_STATUS: u32 = 0x814;
+const MCI_RESUME: u32 = 0x855;
+const MCI_MODE_STOP: u32 = 525;
+const MCI_MODE_PLAY: u32 = 526;
+const MCI_MODE_PAUSE: u32 = 529;
+const MCIERR_INVALID_DEVICE_ID: u32 = 257;
+
+fn mci_command(c: &mut Ctx, wide: bool) -> ApiResult {
+    let (dev, msg, flags, parms) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    let str_at = |c: &Ctx, p: u32| if p == 0 { String::new() } else if p < 0x10000 { format!("#{p}") } else if wide { c.host.read_wstr(p).unwrap_or_default() } else { c.host.read_cstr_lossy(p) };
+    let r = match msg {
+        MCI_OPEN => {
+            // MCI_OPEN_PARMS: callback, device id (out), type, element, alias
+            let ty = if flags & 0x2000 != 0 { str_at(c, c.host.read_u32(parms + 8).unwrap_or(0)) } else { String::new() };
+            let element = if flags & 0x200 != 0 { str_at(c, c.host.read_u32(parms + 12).unwrap_or(0)) } else { String::new() };
+            c.p.next_mci += 1;
+            let id = c.p.next_mci;
+            c.p.mci.insert(id, (MCI_MODE_STOP, element.clone()));
+            let _ = c.host.write_u32(parms + 4, id);
+            c.p.log(format!("MCI open {ty:?} {element:?} = device {id}"));
+            0
+        }
+        _ if !c.p.mci.contains_key(&dev) && dev != 0xFFFF => MCIERR_INVALID_DEVICE_ID,
+        MCI_CLOSE => {
+            if dev == 0xFFFF {
+                c.p.mci.clear();
+            } else {
+                c.p.mci.remove(&dev);
+            }
+            0
+        }
+        MCI_PLAY | MCI_RESUME => {
+            if let Some(d) = c.p.mci.get_mut(&dev) {
+                d.0 = MCI_MODE_PLAY;
+            }
+            0
+        }
+        MCI_STOP | MCI_SEEK => {
+            if let Some(d) = c.p.mci.get_mut(&dev) {
+                d.0 = MCI_MODE_STOP;
+            }
+            0
+        }
+        MCI_PAUSE => {
+            if let Some(d) = c.p.mci.get_mut(&dev) {
+                d.0 = MCI_MODE_PAUSE;
+            }
+            0
+        }
+        MCI_STATUS => {
+            // MCI_STATUS_PARMS: callback, return (out), item, track
+            let item = c.host.read_u32(parms + 8).unwrap_or(0);
+            let mode = c.p.mci.get(&dev).map(|d| d.0).unwrap_or(MCI_MODE_STOP);
+            let v = match item {
+                4 => mode,  // MCI_STATUS_MODE
+                5 => 1,     // MCI_STATUS_READY
+                3 => 1,     // MCI_STATUS_NUMBER_OF_TRACKS
+                _ => 0,     // length, position, time format
+            };
+            let _ = c.host.write_u32(parms + 4, v);
+            0
+        }
+        _ => 0,
+    };
+    c.trace(format!("(device {dev}, msg {msg:#x}, flags {flags:#x}) = {r}"));
+    ok(4, r)
+}
+
+/// The string interface: "open <file> type <t> alias <a>", "play <a>", "status <a> mode"...
+fn mci_string(c: &mut Ctx, cmd: &str, ret: u32, cap: u32, wide: bool) -> u32 {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let verb = words.first().map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+    let name = words.get(1).map(|w| w.trim_matches('"').to_ascii_lowercase()).unwrap_or_default();
+    let alias = words.iter().position(|w| w.eq_ignore_ascii_case("alias")).and_then(|i| words.get(i + 1)).map(|w| w.to_ascii_lowercase());
+    let key = alias.clone().unwrap_or(name.clone());
+    let mut out = String::new();
+    let r = match verb.as_str() {
+        "open" => {
+            c.p.mci_named.insert(key.clone(), MCI_MODE_STOP);
+            c.p.log(format!("MCI string open {cmd:?}"));
+            0
+        }
+        "close" => {
+            if name == "all" {
+                c.p.mci_named.clear();
+            } else {
+                c.p.mci_named.remove(&key);
+            }
+            0
+        }
+        "play" | "resume" => {
+            c.p.mci_named.insert(key, MCI_MODE_PLAY);
+            0
+        }
+        "stop" | "seek" => {
+            c.p.mci_named.insert(key, MCI_MODE_STOP);
+            0
+        }
+        "pause" => {
+            c.p.mci_named.insert(key, MCI_MODE_PAUSE);
+            0
+        }
+        "status" => {
+            let mode = c.p.mci_named.get(&key).copied().unwrap_or(MCI_MODE_STOP);
+            out = if cmd.to_ascii_lowercase().contains("mode") {
+                match mode {
+                    MCI_MODE_PLAY => "playing",
+                    MCI_MODE_PAUSE => "paused",
+                    _ => "stopped",
+                }
+                .to_string()
+            } else {
+                "0".to_string()
+            };
+            0
+        }
+        _ => 0,
+    };
+    if ret != 0 && cap != 0 {
+        if wide {
+            super::kernel32::copy_wstr_out(c, ret, cap, &out);
+        } else {
+            super::kernel32_copy_str(c, ret, cap, out.as_bytes());
+        }
+    }
+    r
+}
+
 /// Data directory `dir` of the mapped image at `base` (address, writes size).
 fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
     let e = c.host.read_u32(base + 0x3C).unwrap_or(0);
@@ -1166,10 +1304,6 @@ pub fn register(r: &mut Registry) {
         "joyGetPosEx" => (2, 167),
         "joySetCapture" => (4, 165),
         "joyReleaseCapture" => (1, 165),
-        "mciSendCommandA" => (4, 262),
-        "mciSendCommandW" => (4, 262),
-        "mciSendStringA" => (4, 262),
-        "mciSendStringW" => (4, 262),
         "mciGetErrorStringA" => (3, 0),
         "mciGetErrorStringW" => (3, 0),
         "mciGetDeviceIDA" => (1, 0),
@@ -1227,6 +1361,19 @@ pub fn register(r: &mut Registry) {
         "mmioDescend" => (4, 265),
         "mmioAscend" => (3, 0),
         "mmioStringToFOURCCA" => (2, 0),
+    });
+
+    r.add(w, "mciSendCommandA", |c| mci_command(c, false));
+    r.add(w, "mciSendCommandW", |c| mci_command(c, true));
+    r.add(w, "mciSendStringA", |c| {
+        let cmd = c.str_arg(0);
+        let r = mci_string(c, &cmd, c.arg(1), c.arg(2), false);
+        ok(4, r)
+    });
+    r.add(w, "mciSendStringW", |c| {
+        let cmd = c.wstr_arg(0);
+        let r = mci_string(c, &cmd, c.arg(1), c.arg(2), true);
+        ok(4, r)
     });
 
     // ---- imm32 -------------------------------------------------------------------------

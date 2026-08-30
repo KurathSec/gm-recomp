@@ -639,6 +639,14 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
         }
         let idx = resolve_addr(m, eip)?;
         m.call_index(idx)?;
+        // The guest left this nested call without returning to it (Delphi's exception
+        // handlers jump into the `except` block on the handler frame's stack): unwind
+        // the host frames that made the call and continue in the outer dispatcher.
+        if let Some(top) = frame_top {
+            if m.global(Global::Esp) > top && m.global(Global::Ctl) == 0 {
+                return Err(UNWIND.into());
+            }
+        }
         if m.global(Global::Ctl) != 0 {
             m.set_global(Global::Ctl, 0);
             match m.engine().ctl.take() {

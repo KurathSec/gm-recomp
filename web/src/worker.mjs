@@ -37,7 +37,11 @@ self.onmessage = async ({ data }) => {
     const want = new Set(capture);
     // Scripted input for tests: [frame, code, down] applied after that frame.
     const onFrame = async (frame, gpu) => {
-      for (const [f, code, down] of script) if (f === frame) handleInput({ type: 'key', code, down });
+      for (const [f, code, a, b, c] of script) {
+        if (f !== frame) continue;
+        if (code === 'mouse') handleInput({ type: 'mouse', x: a, y: b, buttons: c });
+        else handleInput({ type: 'key', code, down: a });
+      }
       if (!want.has(frame)) return;
       const png = await gpu.snapshot();
       self.postMessage({ type: 'capture', frame, png }, [png]);
