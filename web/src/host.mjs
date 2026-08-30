@@ -37,7 +37,12 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   let gpu = null;
   let glue;
   let startReal;
+  // Wall-clock cost of each frame (Present to Present), for the summary.
+  const frameMs = [];
+  let lastPresent = 0;
   const present = (clockMs, x, y, w, h, dw, dh) => {
+    const t = performance.now();
+    if (lastPresent) frameMs.push(t - lastPresent);
     const resized = canvas.width !== dw || canvas.height !== dh;
     gpu.present(x, y, w, h, dw, dh);
     if (resized && onResize) onResize(dw, dh);
@@ -46,6 +51,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     const now = performance.now();
     if (startReal === undefined || now - (startReal + clockMs) > 250) startReal = now - clockMs;
     const wait = startReal + clockMs - now;
+    lastPresent = performance.now() + Math.max(0, pace ? wait : 0);
     return { frame, wait };
   };
   const gpuImports = {
@@ -151,6 +157,12 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   }
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   print(`modules instantiated: ${modules}`);
+  if (frameMs.length > 60) {
+    // Steady state: skip the loading frames.
+    const tail = frameMs.slice(Math.floor(frameMs.length / 2)).sort((a, b) => a - b);
+    const q = (p) => tail[Math.min(tail.length - 1, Math.floor(p * tail.length))].toFixed(2);
+    print(`frame cost (ms, second half of the run): median ${q(0.5)}  p95 ${q(0.95)}  p99 ${q(0.99)}  max ${q(1)}`);
+  }
   if (onExit) onExit({ guestMemory: glue.exports.mem });
   return status;
 }
