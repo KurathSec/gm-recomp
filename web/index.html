@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gmrecomp</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #e8e8e4; --muted: #9a9a93; } }
+      body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+      #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <div id="status">starting…</div>
+    <div id="log"></div>
+    <script type="module">
+      // ?game=<slug>&frames=N[&epoch=S][&report=1]
+      const q = new URLSearchParams(location.search);
+      const game = q.get('game') ?? 'not-another-needle-game-1-12';
+      const frames = Number(q.get('frames') ?? 0);
+      const epoch = q.has('epoch') ? Number(q.get('epoch')) : Math.floor(Date.now() / 1000);
+      const report = q.has('report');
+      const logEl = document.getElementById('log');
+      const statusEl = document.getElementById('status');
+      const send = (path, body) => report && fetch(path, { method: 'POST', body }).catch(() => {});
+      send('/log', `userAgent: ${navigator.userAgent}\ncrossOriginIsolated: ${self.crossOriginIsolated}`);
+      const w = new Worker('src/worker.mjs', { type: 'module' });
+      w.onmessage = ({ data }) => {
+        if (data.type === 'log') {
+          logEl.textContent += data.line + '\n';
+          send('/log', data.line);
+        } else if (data.type === 'done') {
+          statusEl.textContent = `finished (status ${data.status})`;
+          send('/done', `status ${data.status}`);
+        }
+      };
+      w.onerror = (e) => {
+        statusEl.textContent = `worker error: ${e.message}`;
+        send('/done', `worker error: ${e.message}`);
+      };
+      statusEl.textContent = `running ${game}…`;
+      w.postMessage({ game, frames, epoch });
+    </script>
+  </body>
+</html>
