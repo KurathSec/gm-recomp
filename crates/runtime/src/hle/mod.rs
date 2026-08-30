@@ -5,6 +5,7 @@
 pub mod com;
 pub mod d3d8;
 pub mod dsound;
+pub mod gpu;
 pub mod gdi32;
 pub mod kernel32;
 pub mod misc;
@@ -74,6 +75,20 @@ pub trait Host: Guest {
     fn fpu_push(&mut self, v: f64);
     /// Pops ST(0) (FSTP m64 semantics).
     fn fpu_pop(&mut self) -> f64;
+    /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
+    /// of frames presented so far.
+    fn poll_input(&mut self, _frame: u64) -> Vec<InputEvent> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum InputEvent {
+    /// Virtual-key code, scan code (with 0x100 for extended keys), pressed.
+    Key { vk: u8, scan: u16, down: bool },
+    /// Client coordinates of the game window and the button state (bit 0 left,
+    /// bit 1 right, bit 2 middle).
+    Mouse { x: i32, y: i32, buttons: u32 },
 }
 
 pub struct Ctx<'a> {

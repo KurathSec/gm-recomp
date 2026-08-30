@@ -81,7 +81,7 @@ impl Runner {
         let mut code = case.code.clone();
         code.resize(CODE_MAX, 0xF4);
         let mem = SegMem { segs: vec![(DATA_BASE, case.data.clone()), (CODE_BASE, code), (stack_base, case.stack.clone())] };
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: false });
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: false, ..Default::default() });
         let tables = HashMap::new();
         let entries_owned: Vec<u32> = entries.to_vec();
         let is_fn = move |a: u32| entries_owned.contains(&a);

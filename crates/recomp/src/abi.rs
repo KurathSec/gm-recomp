@@ -117,6 +117,8 @@ pub mod trap {
     pub const NO_TARGET: i32 = 7;
     /// A waiting x87 instruction found an unmasked exception pending (#MF).
     pub const FPU_EXCEPTION: i32 = 8;
+    /// Debugging: execution reached the entry of a probed function (`arg` = address).
+    pub const PROBE: i32 = 9;
 }
 
 /// Type indices inside every generated module.

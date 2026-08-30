@@ -3,7 +3,7 @@
 // line the page POSTs to /log and exits when the page POSTs /done.
 //   node web/dev/server.mjs [--port 8766] [--report] [--timeout SECONDS]
 import { createServer } from 'node:http';
-import { createReadStream, statSync } from 'node:fs';
+import { createReadStream, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,6 +18,7 @@ const opt = (name, dflt) => {
 const port = Number(opt('--port', 8766));
 const report = args.includes('--report');
 const timeout = Number(opt('--timeout', 0));
+const captureDir = opt('--capture-dir', null);
 
 const types = {
   '.html': 'text/html; charset=utf-8',
@@ -53,6 +54,18 @@ const server = createServer(async (req, res) => {
     'cache-control': 'no-store',
   };
   const url = new URL(req.url, 'http://x');
+  if (req.method === 'POST' && url.pathname.startsWith('/capture/')) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    res.writeHead(204, headers).end();
+    if (captureDir) {
+      mkdirSync(captureDir, { recursive: true });
+      const n = url.pathname.slice('/capture/'.length).replace(/[^0-9]/g, '');
+      writeFileSync(join(captureDir, `frame-${n.padStart(5, '0')}.png`), Buffer.concat(chunks));
+      if (report) console.log(`captured frame ${n}`);
+    }
+    return;
+  }
   if (req.method === 'POST' && (url.pathname === '/log' || url.pathname === '/done')) {
     let body = '';
     for await (const chunk of req) body += chunk;

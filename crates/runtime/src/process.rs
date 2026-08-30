@@ -115,11 +115,14 @@ pub struct Msg {
     pub pt: (i32, i32),
 }
 
-/// Simple first-fit heap inside one reserved region (HeapAlloc / GlobalAlloc / LocalAlloc).
+/// A first-fit heap (HeapAlloc / GlobalAlloc / LocalAlloc) over one or more regions;
+/// it grows by adding regions under the same handle.
 #[derive(Debug, Clone)]
 pub struct Heap {
+    /// The handle: base of the first region.
     pub base: u32,
-    pub size: u32,
+    /// (base, size) of each region.
+    pub regions: Vec<(u32, u32)>,
     /// addr -> size of live blocks
     pub blocks: BTreeMap<u32, u32>,
 }
@@ -127,18 +130,21 @@ pub struct Heap {
 impl Heap {
     pub fn alloc(&mut self, size: u32) -> Option<u32> {
         let size = size.max(1).div_ceil(16) * 16;
-        let mut cursor = self.base + 16;
-        for (&b, &s) in &self.blocks {
-            if b - cursor >= size {
-                break;
+        for &(rb, rs) in &self.regions {
+            let end = rb + rs;
+            let mut cursor = rb + 16;
+            for (&b, &s) in self.blocks.range(rb..end) {
+                if b - cursor >= size {
+                    break;
+                }
+                cursor = b + s;
             }
-            cursor = b + s;
+            if cursor.checked_add(size).is_some_and(|e| e <= end) {
+                self.blocks.insert(cursor, size);
+                return Some(cursor);
+            }
         }
-        if cursor + size > self.base + self.size {
-            return None;
-        }
-        self.blocks.insert(cursor, size);
-        Some(cursor)
+        None
     }
 
     pub fn free(&mut self, addr: u32) -> bool {
@@ -147,6 +153,10 @@ impl Heap {
 
     pub fn size_of(&self, addr: u32) -> Option<u32> {
         self.blocks.get(&addr).copied()
+    }
+
+    pub fn total(&self) -> u32 {
+        self.regions.iter().map(|r| r.1).sum()
     }
 }
 
@@ -237,6 +247,9 @@ pub struct Process {
     pub frames_presented: u64,
     pub frame_limit: u64,
     pub d3d_objects: HashMap<u32, D3dObject>,
+    /// Direct3D device state and the host renderer it drives.
+    pub d3d: crate::hle::gpu::DeviceState,
+    pub gpu: Box<dyn crate::hle::gpu::Gpu>,
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
     /// COM interface name -> vtable address in guest memory.
     pub com_vtables: HashMap<&'static str, u32>,
@@ -254,6 +267,9 @@ pub struct Process {
     pub api_calls: u64,
     pub unimplemented: Vec<String>,
     pub key_state: [u8; 256],
+    /// Last mouse position (client coordinates of the game window) and buttons.
+    pub mouse: (i32, i32),
+    pub mouse_buttons: u32,
     pub log: Vec<String>,
 }
 
@@ -322,6 +338,8 @@ impl Process {
             frames_presented: 0,
             frame_limit: u64::MAX,
             d3d_objects: HashMap::new(),
+            d3d: Default::default(),
+            gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
             com_vtables: HashMap::new(),
             com_ifaces: HashMap::new(),
@@ -336,6 +354,8 @@ impl Process {
             api_calls: 0,
             unimplemented: Vec::new(),
             key_state: [0; 256],
+            mouse: (0, 0),
+            mouse_buttons: 0,
             log: Vec::new(),
         }
     }
@@ -517,7 +537,7 @@ impl Process {
     pub fn create_heap(&mut self, mem: &mut dyn Guest, size: u32) -> Result<u32, String> {
         let base = self.vm.alloc(0, size, true, PAGE_READWRITE, false, "heap").ok_or("no space for heap")?;
         mem.ensure_mapped(base, size).map_err(|e| e.to_string())?;
-        let heap = Heap { base, size, blocks: BTreeMap::new() };
+        let heap = Heap { base, regions: vec![(base, size)], blocks: BTreeMap::new() };
         self.heaps.insert(base, heap);
         Ok(base)
     }
@@ -525,30 +545,27 @@ impl Process {
     pub fn heap_alloc(&mut self, mem: &mut dyn Guest, heap: u32, size: u32, zero: bool) -> u32 {
         let heap = if self.heaps.contains_key(&heap) { heap } else { self.process_heap };
         let Some(h) = self.heaps.get_mut(&heap) else { return 0 };
-        match h.alloc(size) {
-            Some(a) => {
-                if zero {
-                    let _ = mem.fill(a, size, 0);
-                }
-                a
-            }
+        let a = match h.alloc(size) {
+            Some(a) => a,
             None => {
-                // grow: a fresh heap region chained under the same handle is not needed; allocate a new one
-                let bigger = (h.size * 2).max(size + 0x10000);
-                match self.create_heap(mem, bigger) {
-                    Ok(nb) => {
-                        let nh = self.heaps.get_mut(&nb).unwrap();
-                        let a = nh.alloc(size).unwrap_or(0);
-                        // alias the new region under the requested handle as an overflow area
-                        if a != 0 && zero {
-                            let _ = mem.fill(a, size, 0);
-                        }
-                        a
-                    }
-                    Err(_) => 0,
+                // Grow: a new region at least as large as the heap so far.
+                let grow = (h.total().max(size.saturating_add(0x10000))).div_ceil(0x10_0000) * 0x10_0000;
+                let Some(base) = self.vm.alloc(0, grow, true, PAGE_READWRITE, false, "heap") else { return 0 };
+                if mem.ensure_mapped(base, grow).is_err() {
+                    return 0;
+                }
+                let h = self.heaps.get_mut(&heap).unwrap();
+                h.regions.push((base, grow));
+                match h.alloc(size) {
+                    Some(a) => a,
+                    None => return 0,
                 }
             }
+        };
+        if zero {
+            let _ = mem.fill(a, size, 0);
         }
+        a
     }
 
     pub fn heap_free(&mut self, addr: u32) -> bool {

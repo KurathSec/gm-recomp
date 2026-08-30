@@ -111,6 +111,12 @@ enum Cmd {
         /// Write the guest memory image to this file at the end.
         #[arg(long)]
         dump_mem: Option<PathBuf>,
+        /// Scripted key event after a frame: frame:vk:down (vk in hex, down 1/0), repeatable.
+        #[arg(long)]
+        key: Vec<String>,
+        /// Scripted mouse state after a frame: frame:x:y:buttons, repeatable.
+        #[arg(long)]
+        mouse: Vec<String>,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -155,7 +161,23 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem } => {
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, key, mouse } => {
+            let mouse = mouse
+                .iter()
+                .map(|k| {
+                    let p: Vec<&str> = k.split(':').collect();
+                    anyhow::ensure!(p.len() == 4, "--mouse wants frame:x:y:buttons");
+                    Ok((p[0].parse()?, p[1].parse()?, p[2].parse()?, p[3].parse()?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keys = key
+                .iter()
+                .map(|k| {
+                    let p: Vec<&str> = k.split(':').collect();
+                    anyhow::ensure!(p.len() == 3, "--key wants frame:vk:down");
+                    Ok((p[0].parse()?, u8::from_str_radix(p[1].trim_start_matches("0x"), 16)?, p[2] == "1"))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let dump = dump
                 .iter()
                 .map(|d| {
@@ -163,7 +185,7 @@ fn main() -> Result<()> {
                     Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem })
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, keys, mouse })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

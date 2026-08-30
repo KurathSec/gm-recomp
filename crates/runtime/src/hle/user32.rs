@@ -184,6 +184,7 @@ pub fn register(r: &mut Registry) {
     r.alias(u, "GetMessageW", u, "GetMessageA");
     r.add(u, "PeekMessageA", |c| {
         let (out, hwnd_filter, remove) = (c.arg(0), c.arg(1), c.arg(4) & 1 != 0);
+        pump_input(c);
         pump_timers(c);
         let found = peek_message(c, hwnd_filter, remove);
         match found {
@@ -195,7 +196,21 @@ pub fn register(r: &mut Registry) {
         }
     });
     r.alias(u, "PeekMessageW", u, "PeekMessageA");
-    r.add(u, "TranslateMessage", |_c| ok(1, 0));
+    r.add(u, "TranslateMessage", |c| {
+        let p = c.arg(0);
+        let (hwnd, msg, wp) = (c.host.read_u32(p).unwrap_or(0), c.host.read_u32(p + 4).unwrap_or(0), c.host.read_u32(p + 8).unwrap_or(0));
+        if msg != WM_KEYDOWN {
+            return ok(1, 0);
+        }
+        match key_char(&c.p.key_state, wp as u8) {
+            Some(ch) => {
+                let lp = c.host.read_u32(p + 12).unwrap_or(0);
+                post_message(c, hwnd, 0x0102, ch, lp);
+                ok(1, 1)
+            }
+            None => ok(1, 0),
+        }
+    });
     r.add(u, "DispatchMessageA", |c| {
         let p = c.arg(0);
         let (hwnd, msg, wp, lp) = (c.host.read_u32(p).unwrap_or(0), c.host.read_u32(p + 4).unwrap_or(0), c.host.read_u32(p + 8).unwrap_or(0), c.host.read_u32(p + 12).unwrap_or(0));
@@ -563,9 +578,15 @@ pub fn register(r: &mut Registry) {
     r.add(u, "GetCursor", |_c| ok(0, 0));
     r.add(u, "ShowCursor", |c| ok(1, if c.arg(0) != 0 { 1 } else { -1i32 as u32 }));
     r.add(u, "GetCursorPos", |c| {
+        pump_input(c);
         let p = c.arg(0);
-        let _ = c.host.write_u32(p, 400);
-        let _ = c.host.write_u32(p + 4, 300);
+        // The host reports client coordinates of the game window; map them the same
+        // way ClientToScreen does.
+        let win = mouse_window(c);
+        let (x, y) = c.p.windows.get(&win).map(|w| (w.x, w.y)).unwrap_or((0, 0));
+        let (mx, my) = c.p.mouse;
+        let _ = c.host.write_u32(p, (x + mx) as u32);
+        let _ = c.host.write_u32(p + 4, (y + my) as u32);
         ok(1, 1)
     });
     r.add(u, "SetCursorPos", |_c| ok(2, 1));
@@ -574,15 +595,19 @@ pub fn register(r: &mut Registry) {
         write_rect(c, c.arg(0), 0, 0, 1920, 1080);
         ok(1, 1)
     });
+    // SHORT results: bit 15 (sign-extended) when down, bit 0 the toggle state.
     r.add(u, "GetKeyState", |c| {
         let vk = c.arg(0) as usize & 0xFF;
-        ok(1, (c.p.key_state[vk] as u32) << 8)
+        let k = c.p.key_state[vk];
+        ok(1, (if k & 0x80 != 0 { 0xFFFF_8000 } else { 0 }) | (k & 1) as u32)
     });
     r.add(u, "GetAsyncKeyState", |c| {
+        pump_input(c);
         let vk = c.arg(0) as usize & 0xFF;
-        ok(1, (c.p.key_state[vk] as u32) << 8)
+        ok(1, if c.p.key_state[vk] & 0x80 != 0 { 0xFFFF_8000 } else { 0 })
     });
     r.add(u, "GetKeyboardState", |c| {
+        pump_input(c);
         let p = c.arg(0);
         let ks = c.p.key_state;
         let _ = c.host.write(p, &ks);
@@ -1246,6 +1271,113 @@ pub fn send_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> Resul
     c.call_guest(proc_, &[hwnd, msg, wp, lp])
 }
 
+/// Applies input from the host: key state, key messages to the focus window, mouse
+/// position and button messages.
+pub fn pump_input(c: &mut Ctx) {
+    let frame = c.p.frames_presented;
+    let events = c.host.poll_input(frame);
+    for ev in events {
+        match ev {
+            super::InputEvent::Key { vk, scan, down } => {
+                let k = &mut c.p.key_state[vk as usize];
+                let was_down = *k & 0x80 != 0;
+                if down {
+                    if !was_down {
+                        *k ^= 1;
+                    }
+                    *k |= 0x80;
+                } else {
+                    *k &= !0x80;
+                }
+                // Generic modifiers follow their left/right keys.
+                for (generic, l, r) in [(0x10usize, 0xA0usize, 0xA1usize), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)] {
+                    if vk as usize == l || vk as usize == r {
+                        let any = (c.p.key_state[l] | c.p.key_state[r]) & 0x80;
+                        c.p.key_state[generic] = (c.p.key_state[generic] & 1) | any;
+                    }
+                }
+                let target = if c.p.focus != 0 { c.p.focus } else { c.p.active };
+                if target == 0 {
+                    continue;
+                }
+                let msg_vk = match vk {
+                    0xA0 | 0xA1 => 0x10,
+                    0xA2 | 0xA3 => 0x11,
+                    0xA4 | 0xA5 => 0x12,
+                    v => v,
+                } as u32;
+                let ext = if scan & 0x100 != 0 { 1 << 24 } else { 0 };
+                let lp = 1 | ((scan as u32 & 0xFF) << 16) | ext | if down { if was_down { 1 << 30 } else { 0 } } else { 0xC000_0000 };
+                post_message(c, target, if down { WM_KEYDOWN } else { 0x0101 }, msg_vk, lp);
+            }
+            super::InputEvent::Mouse { x, y, buttons } => {
+                let target = if c.p.capture != 0 { c.p.capture } else { mouse_window(c) };
+                let old = c.p.mouse_buttons;
+                c.p.mouse = (x, y);
+                c.p.mouse_buttons = buttons;
+                for (bit, vk) in [(1u32, 0x01usize), (2, 0x02), (4, 0x04)] {
+                    c.p.key_state[vk] = (c.p.key_state[vk] & 1) | if buttons & bit != 0 { 0x80 } else { 0 };
+                }
+                if target == 0 {
+                    continue;
+                }
+                let lp = (x as u32 & 0xFFFF) | ((y as u32 & 0xFFFF) << 16);
+                let wp = (buttons & 1) | ((buttons & 2) << 0) | ((buttons & 4) << 2);
+                post_message(c, target, 0x0200, wp, lp);
+                for (bit, down_msg) in [(1u32, 0x0201u32), (2, 0x0204), (4, 0x0207)] {
+                    if (old ^ buttons) & bit != 0 {
+                        post_message(c, target, if buttons & bit != 0 { down_msg } else { down_msg + 1 }, wp, lp);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The window the game renders into (it receives mouse input).
+fn mouse_window(c: &Ctx) -> u32 {
+    if c.p.d3d.window != 0 { c.p.d3d.window } else { c.p.active }
+}
+
+/// The character a key produces with the current shift state (US layout).
+fn key_char(ks: &[u8; 256], vk: u8) -> Option<u32> {
+    let shift = ks[0x10] & 0x80 != 0;
+    let caps = ks[0x14] & 1 != 0;
+    let ch = match vk {
+        0x41..=0x5A => {
+            let upper = shift ^ caps;
+            if upper { vk } else { vk + 32 }
+        }
+        0x30..=0x39 => {
+            if shift { b")!@#$%^&*("[(vk - 0x30) as usize] } else { vk }
+        }
+        0x20 => b' ',
+        0x0D => b'\r',
+        0x08 => 8,
+        0x09 => b'\t',
+        0x1B => 0x1B,
+        0x60..=0x69 => b'0' + (vk - 0x60),
+        0x6A => b'*',
+        0x6B => b'+',
+        0x6D => b'-',
+        0x6E => b'.',
+        0x6F => b'/',
+        0xBA => if shift { b':' } else { b';' },
+        0xBB => if shift { b'+' } else { b'=' },
+        0xBC => if shift { b'<' } else { b',' },
+        0xBD => if shift { b'_' } else { b'-' },
+        0xBE => if shift { b'>' } else { b'.' },
+        0xBF => if shift { b'?' } else { b'/' },
+        0xC0 => if shift { b'~' } else { b'`' },
+        0xDB => if shift { b'{' } else { b'[' },
+        0xDC => if shift { b'|' } else { b'\\' },
+        0xDD => if shift { b'}' } else { b']' },
+        0xDE => if shift { b'"' } else { b'\'' },
+        _ => return None,
+    };
+    Some(ch as u32)
+}
+
 fn post_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) {
     let t = c.p.now_ms();
     c.p.messages.push_back(Msg { hwnd, msg, wparam: wp, lparam: lp, time: t, pt: (0, 0) });
@@ -1282,6 +1414,7 @@ fn peek_message(c: &mut Ctx, hwnd_filter: u32, remove: bool) -> Option<Msg> {
 
 fn get_message(c: &mut Ctx, hwnd_filter: u32, _remove: bool) -> Result<Msg, super::ApiError> {
     loop {
+        pump_input(c);
         pump_timers(c);
         if let Some(m) = peek_message(c, hwnd_filter, true) {
             return Ok(m);
@@ -1289,7 +1422,10 @@ fn get_message(c: &mut Ctx, hwnd_filter: u32, _remove: bool) -> Result<Msg, supe
         // Nothing queued: advance the virtual clock to the next timer, or idle in 1 ms steps.
         let next = c.p.windows.values().flat_map(|w| w.timers.values().map(|(_, when)| *when)).min();
         match next {
-            Some(when) if when > c.p.clock_us => c.p.clock_us = when,
+            Some(when) if when > c.p.clock_us => {
+                let d = when - c.p.clock_us;
+                c.advance_clock(d);
+            }
             _ => c.advance_clock(1000),
         }
         if c.p.frames_presented >= c.p.frame_limit {

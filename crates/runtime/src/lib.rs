@@ -9,7 +9,7 @@ pub mod mem;
 pub mod process;
 pub mod vfs;
 
-pub use hle::{ApiError, ApiId, ApiResult, Ctx, Host, Regs, Registry, Ret};
+pub use hle::{ApiError, ApiId, ApiResult, Ctx, Host, InputEvent, Regs, Registry, Ret};
 pub use loader::{ImportResolver, LoadRequest, LoadedModule};
 pub use mem::{Fault, Guest, Vm};
 pub use process::{Handle, Process, RET_TO_HOST, STUB_BASE};

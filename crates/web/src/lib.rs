@@ -23,6 +23,49 @@ unsafe extern "C" {
     fn now_us() -> f64;
 }
 
+#[link(wasm_import_module = "gpu")]
+unsafe extern "C" {
+    fn gpu_resize(w: u32, h: u32);
+    fn gpu_texture_create(id: u32, w: u32, h: u32, levels: u32, fmt: u32, rt: u32);
+    fn gpu_texture_upload(id: u32, level: u32, w: u32, h: u32, fmt: u32, pitch: u32, bits: u32);
+    fn gpu_texture_delete(id: u32);
+    fn gpu_set_target(id: u32, w: u32, h: u32);
+    fn gpu_clear(flags: u32, color: u32, z: f32, stencil: u32, x: i32, y: i32, w: i32, h: i32);
+    fn gpu_draw(call: *const runtime::hle::gpu::DrawCall);
+    /// Shows the frame; may suspend the guest until it is time for the next one.
+    fn gpu_present(clock_ms: f64, x: i32, y: i32, w: i32, h: i32, dst_w: u32, dst_h: u32);
+}
+
+/// The WebGL2 renderer in web/src/gpu.mjs.
+struct WebGpu;
+
+impl runtime::hle::gpu::Gpu for WebGpu {
+    fn resize(&mut self, w: u32, h: u32) {
+        unsafe { gpu_resize(w, h) }
+    }
+    fn texture_create(&mut self, id: u32, w: u32, h: u32, levels: u32, fmt: u32, rt: bool) {
+        unsafe { gpu_texture_create(id, w, h, levels, fmt, rt as u32) }
+    }
+    fn texture_upload(&mut self, id: u32, level: u32, w: u32, h: u32, fmt: u32, pitch: u32, bits: u32) {
+        unsafe { gpu_texture_upload(id, level, w, h, fmt, pitch, bits) }
+    }
+    fn texture_delete(&mut self, id: u32) {
+        unsafe { gpu_texture_delete(id) }
+    }
+    fn set_target(&mut self, id: u32, w: u32, h: u32) {
+        unsafe { gpu_set_target(id, w, h) }
+    }
+    fn clear(&mut self, flags: u32, color: u32, z: f32, stencil: u32, r: [i32; 4]) {
+        unsafe { gpu_clear(flags, color, z, stencil, r[0], r[1], r[2], r[3]) }
+    }
+    fn draw(&mut self, d: &runtime::hle::gpu::DrawCall) {
+        unsafe { gpu_draw(d) }
+    }
+    fn present(&mut self, clock_us: u64, src: [i32; 4], dst_w: u32, dst_h: u32) {
+        unsafe { gpu_present(clock_us as f64 / 1000.0, src[0], src[1], src[2], src[3], dst_w, dst_h) }
+    }
+}
+
 /// Guest address space limit (the stub and marker pages sit just below 2 GiB).
 const GUEST_MAX_PAGES: u64 = 32768;
 
@@ -42,13 +85,15 @@ const GLUE_FUNCS: [&str; 7] = ["g2r", "r2g", "fill", "get", "set", "size", "grow
 
 struct State {
     engine: Option<Engine>,
+    /// Input from the page, applied by the HLE layer at its next message poll.
+    input: Vec<runtime::InputEvent>,
     glue: Option<Glue>,
     fs: Option<MemFs>,
     started: Option<engine::Started>,
     guest_bytes: u64,
 }
 
-static mut STATE: State = State { engine: None, glue: None, fs: None, started: None, guest_bytes: 0 };
+static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0 };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -143,6 +188,15 @@ impl Machine for Web {
     }
     fn print(&mut self, s: &str) {
         log(s);
+    }
+    fn take_input(&mut self, _frame: u64) -> Vec<runtime::InputEvent> {
+        Web::take_input()
+    }
+}
+
+impl Web {
+    fn take_input() -> Vec<runtime::InputEvent> {
+        std::mem::take(&mut state().input)
     }
 }
 
@@ -318,7 +372,7 @@ pub unsafe extern "C" fn fs_add(path: *const u8, path_len: usize, data: *const u
 
 /// Creates the process and loads the executable. Returns 0 on success.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace: u32, epoch_unix: f64, nop_index: u32) -> i32 {
+pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace: u32, epoch_unix: f64, nop_index: u32, render: u32) -> i32 {
     let exe = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(exe, exe_len) }).into_owned();
     let fs = state().fs.take().unwrap_or_default();
     let exe_path = format!("C:\\game\\{exe}");
@@ -326,6 +380,9 @@ pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace
     p.frame_limit = if frames == 0 { u64::MAX } else { frames as u64 };
     p.trace = trace != 0;
     p.epoch_unix = epoch_unix as u64;
+    if render != 0 {
+        p.gpu = Box::new(WebGpu);
+    }
     let mut e = Engine::new(p);
     e.trace = trace != 0;
     e.nop_index = nop_index;
@@ -381,6 +438,19 @@ pub extern "C" fn run() -> i32 {
         log(&l);
     }
     if r.is_ok() { 0 } else { 1 }
+}
+
+/// A key event from the page (Windows virtual-key code, scan code with 0x100 for
+/// extended keys).
+#[unsafe(no_mangle)]
+pub extern "C" fn input_key(vk: u32, scan: u32, down: u32) {
+    state().input.push(runtime::InputEvent::Key { vk: vk as u8, scan: scan as u16, down: down != 0 });
+}
+
+/// Mouse position in game-window client pixels and button state (1 left, 2 right, 4 middle).
+#[unsafe(no_mangle)]
+pub extern "C" fn input_mouse(x: i32, y: i32, buttons: u32) {
+    state().input.push(runtime::InputEvent::Mouse { x, y, buttons });
 }
 
 #[unsafe(no_mangle)]

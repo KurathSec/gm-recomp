@@ -8,20 +8,30 @@
       :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; }
       @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #e8e8e4; --muted: #9a9a93; } }
       body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
-      #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; color: var(--muted); }
+      #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; color: var(--muted); max-height: 30vh; overflow: auto; }
+      #screen { display: block; margin: 8px 0; image-rendering: pixelated; background: #000; max-width: 100%; }
     </style>
   </head>
   <body>
     <div id="status">starting…</div>
+    <canvas id="screen" width="640" height="480"></canvas>
     <div id="log"></div>
     <script type="module">
-      // ?game=<slug>&frames=N[&epoch=S][&report=1]
+      // ?game=<slug>&frames=N[&epoch=S][&report=1][&capture=30,60][&nopace=1][&script=100:Enter:1,105:Enter:0]
       const q = new URLSearchParams(location.search);
       const game = q.get('game') ?? 'not-another-needle-game-1-12';
       const frames = Number(q.get('frames') ?? 0);
       const epoch = q.has('epoch') ? Number(q.get('epoch')) : Math.floor(Date.now() / 1000);
       const report = q.has('report');
+      const capture = (q.get('capture') ?? '').split(',').filter(Boolean).map(Number);
+      const pace = !q.has('nopace');
+      const script = (q.get('script') ?? '').split(',').filter(Boolean).map((s) => {
+        const [f, code, down] = s.split(':');
+        return [Number(f), code, down === '1'];
+      });
+      let gameW = 640, gameH = 480;
       const logEl = document.getElementById('log');
+      const screen = document.getElementById('screen');
       const statusEl = document.getElementById('status');
       const send = (path, body) => report && fetch(path, { method: 'POST', body }).catch(() => {});
       send('/log', `userAgent: ${navigator.userAgent}\ncrossOriginIsolated: ${self.crossOriginIsolated}`);
@@ -30,6 +40,11 @@
         if (data.type === 'log') {
           logEl.textContent += data.line + '\n';
           send('/log', data.line);
+        } else if (data.type === 'size') {
+          [gameW, gameH] = [data.w, data.h];
+          screen.style.width = `${data.w}px`;
+        } else if (data.type === 'capture') {
+          if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
         } else if (data.type === 'done') {
           statusEl.textContent = `finished (status ${data.status})`;
           send('/done', `status ${data.status}`);
@@ -40,7 +55,34 @@
         send('/done', `worker error: ${e.message}`);
       };
       statusEl.textContent = `running ${game}…`;
-      w.postMessage({ game, frames, epoch });
+      const offscreen = screen.transferControlToOffscreen();
+      w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, script }, [offscreen]);
+
+      // Input goes to the worker as it happens; the runtime applies it at the guest's
+      // next message poll.
+      const gameKeys = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|Digit|Escape|Numpad|Page|Home|End|Insert|Delete)/;
+      for (const type of ['keydown', 'keyup']) {
+        window.addEventListener(type, (e) => {
+          if (gameKeys.test(e.code) && !e.metaKey) e.preventDefault();
+          if (e.repeat) return;
+          w.postMessage({ type: 'key', code: e.code, down: type === 'keydown' });
+        });
+      }
+      window.addEventListener('blur', () => {
+        // Releasing everything avoids keys stuck down after switching away.
+        for (const code of ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space', 'KeyZ', 'KeyX', 'KeyR', 'KeyS'])
+          w.postMessage({ type: 'key', code, down: false });
+      });
+      let buttons = 0;
+      const mouse = (e) => {
+        const r = screen.getBoundingClientRect();
+        const sx = gameW / r.width;
+        const sy = gameH / r.height;
+        buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
+        w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy, buttons });
+      };
+      for (const t of ['mousemove', 'mousedown', 'mouseup']) screen.addEventListener(t, mouse);
+      screen.addEventListener('contextmenu', (e) => e.preventDefault());
     </script>
   </body>
 </html>

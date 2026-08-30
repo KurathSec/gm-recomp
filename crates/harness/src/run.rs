@@ -36,6 +36,10 @@ pub struct RunOpts {
     pub keep_writes: bool,
     /// Write the whole guest memory to this file when the run stops.
     pub dump_mem: Option<PathBuf>,
+    /// Scripted key events: (after frame, virtual-key code, pressed).
+    pub keys: Vec<(u64, u8, bool)>,
+    /// Scripted mouse state: (after frame, x, y, buttons).
+    pub mouse: Vec<(u64, i32, i32, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +54,9 @@ struct Hd {
     engine: Engine,
     linker: Option<Linker<Hd>>,
     t0: Instant,
+    /// Scripted input not delivered yet, by frame.
+    keys: Vec<(u64, u8, bool)>,
+    mouse: Vec<(u64, i32, i32, u32)>,
 }
 
 /// Store and Caller both give direct access to their data.
@@ -152,6 +159,16 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn print(&mut self, s: &str) {
         eprintln!("{s}");
     }
+    fn take_input(&mut self, frame: u64) -> Vec<runtime::InputEvent> {
+        let hd = self.cx.hd();
+        let due: Vec<(u64, u8, bool)> = hd.keys.iter().copied().filter(|k| k.0 <= frame).collect();
+        hd.keys.retain(|k| k.0 > frame);
+        let mice: Vec<(u64, i32, i32, u32)> = hd.mouse.iter().copied().filter(|k| k.0 <= frame).collect();
+        hd.mouse.retain(|k| k.0 > frame);
+        let mut out: Vec<runtime::InputEvent> = due.into_iter().map(|(_, vk, down)| runtime::InputEvent::Key { vk, scan: 0, down }).collect();
+        out.extend(mice.into_iter().map(|(_, x, y, buttons)| runtime::InputEvent::Mouse { x, y, buttons }));
+        out
+    }
 }
 
 pub fn run(opts: RunOpts) -> Result<()> {
@@ -200,8 +217,16 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eng.trace = opts.trace;
     eng.max_api_calls = opts.max_api_calls;
     eng.recent_cap = opts.recent;
+    // GMR_WATCH=hex,hex: report indirect calls to these addresses.
+    if let Ok(w) = std::env::var("GMR_WATCH") {
+        eng.watch = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
+    }
+    // GMR_PROBE=hex,hex: report every entry into these functions.
+    if let Ok(w) = std::env::var("GMR_PROBE") {
+        eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
+    }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now() });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone() });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;

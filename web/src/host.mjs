@@ -2,7 +2,10 @@
 // module and translated modules, and hands it the game files. Runs unchanged in a
 // browser worker and in Node.
 
+import { D3DGL } from './gpu.mjs';
+
 const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow'];
+const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 
 /**
  * @param {object} o
@@ -14,8 +17,14 @@ const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow'];
  * @param {number} [o.epoch]  wall-clock time at start (Unix seconds)
  * @param {(line: string) => void} [o.print]
  * @param {(state: {guestMemory: WebAssembly.Memory}) => void} [o.onExit]  inspection after the run
+ * @param {OffscreenCanvas} [o.canvas]  render target; without it nothing is drawn
+ * @param {boolean} [o.pace]  hold frames to the game's own timing (needs JSPI)
+ * @param {(frame: number, gpu: D3DGL) => void|Promise<void>} [o.onFrame]  after each Present
+ * @param {(input: {key: Function, mouse: Function}) => void} [o.onReady]  input entry points,
+ *   usable while the guest is suspended in Present
+ * @param {(w: number, h: number) => void} [o.onResize]  the shown frame changed size
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -24,6 +33,44 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   let rtImports;
   let modules = 0;
   const mem = () => new Uint8Array(rt.exports.memory.buffer);
+
+  let gpu = null;
+  let glue;
+  let startReal;
+  const present = (clockMs, x, y, w, h, dw, dh) => {
+    const resized = canvas.width !== dw || canvas.height !== dh;
+    gpu.present(x, y, w, h, dw, dh);
+    if (resized && onResize) onResize(dw, dh);
+    const frame = gpu.frames;
+    // The guest runs on virtual time; hold each frame until real time catches up.
+    const now = performance.now();
+    if (startReal === undefined || now - (startReal + clockMs) > 250) startReal = now - clockMs;
+    const wait = startReal + clockMs - now;
+    return { frame, wait };
+  };
+  const gpuImports = {
+    gpu_resize: (w, h) => gpu?.resize(w, h),
+    gpu_texture_create: (id, w, h, levels, fmt, rt) => gpu?.textureCreate(id, w, h, levels, fmt, rt),
+    gpu_texture_upload: (id, level, w, h, fmt, pitch, bits) => gpu?.textureUpload(id, level, w, h, fmt, pitch, bits),
+    gpu_texture_delete: (id) => gpu?.textureDelete(id),
+    gpu_set_target: (id, w, h) => gpu?.setTarget(id, w, h),
+    gpu_clear: (flags, color, z, stencil, x, y, w, h) => gpu?.clear(flags, color >>> 0, z, stencil, x, y, w, h),
+    gpu_draw: (ptr) => gpu?.draw(ptr),
+    gpu_present: (clockMs, x, y, w, h, dw, dh) => {
+      if (!gpu) return;
+      const { frame } = present(clockMs, x, y, w, h, dw, dh);
+      if (onFrame) onFrame(frame, gpu);
+    },
+  };
+  if (canvas && jspi) {
+    // Present suspends the guest: the worker's event loop runs, the canvas shows the
+    // frame, and input messages arrive.
+    gpuImports.gpu_present = new WebAssembly.Suspending(async (clockMs, x, y, w, h, dw, dh) => {
+      const { frame, wait } = present(clockMs, x, y, w, h, dw, dh);
+      if (onFrame) await onFrame(frame, gpu);
+      await new Promise((r) => setTimeout(r, pace ? Math.max(0, wait) : 0));
+    });
+  }
 
   const host = {
     print(ptr, len) {
@@ -52,14 +99,14 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
   };
 
-  ({ instance: rt } = await WebAssembly.instantiate(runtimeBytes, { host }));
+  ({ instance: rt } = await WebAssembly.instantiate(runtimeBytes, { host, gpu: gpuImports }));
   const x = rt.exports;
   table = x.__indirect_function_table;
 
   // The cpu glue module: guest memory, CPU-state globals and their accessors.
   const glueLen = x.glue_build(1024);
   const glueBytes = mem().slice(x.glue_ptr(), x.glue_ptr() + glueLen);
-  const glue = new WebAssembly.Instance(new WebAssembly.Module(glueBytes), { rt: { memory: x.memory } });
+  glue = new WebAssembly.Instance(new WebAssembly.Module(glueBytes), { rt: { memory: x.memory } });
   const glueBase = table.grow(GLUE_FUNCS.length);
   GLUE_FUNCS.forEach((n, i) => table.set(glueBase + i, glue.exports[n]));
   x.glue_install(glueBase);
@@ -92,10 +139,17 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   const e = enc.encode(exe);
   const ep = x.alloc(e.length);
   mem().set(e, ep);
-  if (x.init(ep, e.length, frames, trace ? 1 : 0, epoch, nopIndex) !== 0) {
+  if (canvas) gpu = new D3DGL(canvas, () => glue.exports.mem.buffer, () => x.memory.buffer);
+  if (onReady) {
+    onReady({
+      key: (vk, scan, down) => x.input_key(vk, scan, down ? 1 : 0),
+      mouse: (mx, my, buttons) => x.input_mouse(mx | 0, my | 0, buttons),
+    });
+  }
+  if (x.init(ep, e.length, frames, trace ? 1 : 0, epoch, nopIndex, gpu ? 1 : 0) !== 0) {
     throw new Error('init failed');
   }
-  const status = x.run();
+  const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   print(`modules instantiated: ${modules}`);
   if (onExit) onExit({ guestMemory: glue.exports.mem });
   return status;

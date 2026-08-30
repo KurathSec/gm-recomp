@@ -61,6 +61,10 @@ pub struct Engine {
     pub dispatches: u64,
     /// Declare guest memory shared in generated modules (browser threads).
     pub shared_memory: bool,
+    /// Addresses reported when translated code calls them indirectly (debugging).
+    pub watch: Vec<u32>,
+    /// Function entries translated with an entry report (debugging).
+    pub probes: Vec<u32>,
 }
 
 impl Engine {
@@ -84,6 +88,8 @@ impl Engine {
             recent_cap: 0,
             dispatches: 0,
             shared_memory: false,
+            watch: Vec::new(),
+            probes: Vec::new(),
         }
     }
 
@@ -106,6 +112,10 @@ pub trait Machine: Guest {
     /// Wall-clock microseconds (statistics only).
     fn now_us(&self) -> u64;
     fn print(&mut self, s: &str);
+    /// Input that arrived from the user since the last call (`frame`: frames shown).
+    fn take_input(&mut self, _frame: u64) -> Vec<crate::hle::InputEvent> {
+        Vec::new()
+    }
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -239,6 +249,10 @@ impl<M: Machine> Host for M {
         self.engine().fpu.exec(iced_x86::Mnemonic::Fld, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut s);
     }
 
+    fn poll_input(&mut self, frame: u64) -> Vec<crate::hle::InputEvent> {
+        self.take_input(frame)
+    }
+
     fn fpu_pop(&mut self) -> f64 {
         let mut s = Scratch([0; 8]);
         self.engine().fpu.exec(iced_x86::Mnemonic::Fstp, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut s);
@@ -356,6 +370,12 @@ pub fn raise_fault<M: Machine>(m: &mut M, code: u32, ip: u32) -> Result<(), Stri
 /// `rt.resolve`: table index of the function at `addr`, translating it if needed. An
 /// HLE stub runs its API and yields the no-op function.
 pub fn rt_resolve<M: Machine>(m: &mut M, addr: u32) -> u32 {
+    if !m.engine_ref().watch.is_empty() && m.engine_ref().watch.contains(&addr) {
+        let (esp, ra) = (m.global(Global::Esp), 0);
+        let ra = m.read_u32(esp).unwrap_or(ra);
+        let frame = m.engine_ref().p.as_ref().map(|p| p.frames_presented);
+        m.print(&format!("watch: {addr:#x} called (return {ra:#x}, frame {frame:?})"));
+    }
     match resolve_addr(m, addr) {
         Ok(i) => i,
         Err(e) => {
@@ -369,6 +389,21 @@ pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
     let ip = m.global(Global::Eip);
     match kind {
         trap::INT3 => m.print(&format!("int3 at {arg:#x} (ignored)")),
+        trap::PROBE => {
+            let r = read_regs(m);
+            let ra = m.read_u32(r.esp).unwrap_or(0);
+            let args: Vec<String> = (1..5).map(|i| format!("{:#x}", m.read_u32(r.esp + 4 * i).unwrap_or(0))).collect();
+            m.print(&format!(
+                "probe {arg:#x}: from {ra:#x} eax={:#x} ecx={:#x} edx={:#x} ebx={:#x} esi={:#x} edi={:#x} stack [{}]",
+                r.eax,
+                r.ecx,
+                r.edx,
+                r.ebx,
+                r.esi,
+                r.edi,
+                args.join(", ")
+            ));
+        }
         trap::DIVIDE_ERROR => request(m, Ctl::Fault { code: 0xC000_0094, ip: arg }),
         trap::UD2 => request(m, Ctl::Fault { code: 0xC000_001D, ip: arg }),
         trap::INT => stop(m, format!("int {arg:#x} at {ip:#x}")),
@@ -494,7 +529,8 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
     let mut errors = Vec::new();
     let out = {
         let mem = CodeMem(&*m);
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared });
+        let probes = m.engine_ref().probes.clone();
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes });
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = HashMap::new();

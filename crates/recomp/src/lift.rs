@@ -60,6 +60,8 @@ pub struct FuncEmit<'a> {
     /// Direct-call targets available in this module: entry -> wasm function index.
     func_index: &'a HashMap<u32, u32>,
     pending: Option<(FlagOp, u8)>,
+    /// Report entry to the runtime (debugging).
+    pub probe: bool,
     /// Flags some later instruction (or a successor) will read after the current one.
     needed: u8,
     ip: u32,
@@ -87,6 +89,7 @@ impl<'a> FuncEmit<'a> {
             live_out,
             func_index,
             pending: None,
+            probe: false,
             needed: 0,
             ip: 0,
             next_ip: 0,
@@ -816,6 +819,10 @@ impl<'a> FuncEmit<'a> {
 
     pub fn emit(&mut self) {
         self.load_state();
+        if self.probe {
+            self.ip = self.cfg.entry;
+            self.trap(trap::PROBE, self.cfg.entry);
+        }
         // Blocks are laid out by address; the entry need not be the first one.
         let entry_index = self.index[&self.cfg.entry];
         if entry_index != 0 {

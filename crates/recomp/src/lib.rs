@@ -16,9 +16,12 @@ use wasm_encoder::{
 
 pub use cfg::GuestMem as Memory;
 
+#[derive(Default)]
 pub struct Options {
     /// Declare the imported guest memory as shared (browser threads) or not (harness).
     pub shared_memory: bool,
+    /// Function entries that report to the runtime when reached (debugging).
+    pub probes: Vec<u32>,
 }
 
 pub struct Translator<'m> {
@@ -97,6 +100,7 @@ impl<'m> Translator<'m> {
         let mut out_funcs = Vec::new();
         for (&entry, cfg) in &self.cfgs {
             let mut fe = lift::FuncEmit::new(cfg, &func_index);
+            fe.probe = self.opts.probes.contains(&entry);
             fe.emit();
             self.unimplemented.extend(fe.unimplemented.drain(..));
             functions.function(types::FUNC);

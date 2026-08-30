@@ -4,6 +4,7 @@
 //! draws and counts `Present`s; the browser backend (R3) turns the same calls into
 //! WebGL2 work.
 
+use super::gpu::{self, DeviceState};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{D3dObject, Process};
@@ -28,6 +29,18 @@ fn okn(c: &mut Ctx) -> ApiResult {
 
 fn ret(c: &Ctx, v: u32) -> ApiResult {
     Ok(Ret::stdcall(c.nargs(), v))
+}
+
+/// Storage for resource contents (texture levels, vertex and index buffers): its own
+/// virtual-memory region, released with the resource.
+fn alloc_storage(c: &mut Ctx, size: u32) -> u32 {
+    let size = size.max(4).div_ceil(0x1000) * 0x1000;
+    let Some(a) = c.p.vm.alloc(0, size, true, crate::mem::PAGE_READWRITE, false, "d3d resource") else { return 0 };
+    if c.host.ensure_mapped(a, size).is_err() {
+        return 0;
+    }
+    let _ = c.host.fill(a, size, 0);
+    a
 }
 
 fn alloc(c: &mut Ctx, size: u32) -> u32 {
@@ -192,6 +205,25 @@ fn release(c: &mut Ctx) -> ApiResult {
     };
     if n == 0 {
         if let Some(o) = c.p.d3d_objects.remove(&t) {
+            if o.data.get("gpu").copied().unwrap_or(0) != 0 {
+                c.p.gpu.texture_delete(t);
+            }
+            // Release storage this object allocated (not views such as surface levels).
+            let owned = o.data.get("owned").copied().unwrap_or(0);
+            for level in 0..16u32 {
+                if owned & (1 << level) != 0 {
+                    if let Some(&b) = o.data.get(level_key(level)) {
+                        c.p.vm.release(b);
+                    }
+                }
+            }
+            if o.data.get("owned_bits").copied().unwrap_or(0) != 0 {
+                if let Some(&b) = o.data.get("bits") {
+                    c.p.vm.release(b);
+                }
+            }
+            let obj_mem = t;
+            c.p.heap_free(obj_mem);
             c.trace(format!(": freed {}", o.kind));
         }
     }
@@ -266,8 +298,24 @@ fn d3d_create_device(c: &mut Ctx) -> ApiResult {
     }
     let data = HashMap::from([("w", w), ("h", h), ("fmt", fmt), ("hwnd", hwnd), ("flags", flags), ("d3d", d3d)]);
     let dev = new_object(c, "IDirect3DDevice8", IDIRECT3DDEVICE8, data);
+    let auto_depth = c.host.read_u32(pp + 32).unwrap_or(0);
+    reset_state(c, w, h, auto_depth != 0);
+    c.p.d3d.window = if dev_hwnd != 0 { dev_hwnd } else { hwnd };
     out(c, ppdev, dev);
     ret(c, D3D_OK)
+}
+
+/// Device state after CreateDevice/Reset: defaults, a full-size viewport, the back
+/// buffer as render target.
+fn reset_state(c: &mut Ctx, w: u32, h: u32, auto_depth: bool) {
+    let mut st = DeviceState::default();
+    st.rs[gpu::rs::ZENABLE] = auto_depth as u32;
+    st.viewport = [0.0, 0.0, w as f32, h as f32, 0.0, 1.0];
+    st.target = (0, w, h);
+    st.backbuffer = (w, h);
+    c.p.d3d = st;
+    c.p.gpu.resize(w, h);
+    c.p.gpu.set_target(0, w, h);
 }
 
 const IDIRECT3D8: &[Method] = &[
@@ -332,6 +380,11 @@ fn dev_reset(c: &mut Ctx) -> ApiResult {
         set_field(c, t, "w", w);
         set_field(c, t, "h", h);
     }
+    let (w, h) = (field(c, t, "w"), field(c, t, "h"));
+    let auto_depth = c.host.read_u32(pp + 32).unwrap_or(0);
+    let window = c.p.d3d.window;
+    reset_state(c, w, h, auto_depth != 0);
+    c.p.d3d.window = window;
     c.trace(format!("({w}x{h})"));
     ret(c, D3D_OK)
 }
@@ -342,6 +395,27 @@ fn dev_present(c: &mut Ctx) -> ApiResult {
     let draws = c.p.draw_calls;
     c.p.draw_calls = 0;
     c.p.log(format!("Present #{n} ({draws} draw calls, t={}ms)", c.p.now_ms()));
+    // Source rectangle of the back buffer and the size it is shown at (the
+    // destination rectangle, else the device window's client area).
+    let (src, dst, hwnd) = (c.arg(1), c.arg(2), c.arg(3));
+    let (bw, bh) = c.p.d3d.backbuffer;
+    let rect = |c: &Ctx, p: u32| {
+        let g = |k: u32| c.host.read_u32(p + 4 * k).unwrap_or(0) as i32;
+        [g(0), g(1), g(2) - g(0), g(3) - g(1)]
+    };
+    let src_rect = if src != 0 { rect(c, src) } else { [0, 0, bw as i32, bh as i32] };
+    let dst_size = if dst != 0 {
+        let r = rect(c, dst);
+        (r[2], r[3])
+    } else {
+        let win = if hwnd != 0 { hwnd } else { field(c, this(c), "hwnd") };
+        match c.p.windows.get(&win) {
+            Some(w) if src == 0 => (w.w.max(1), w.h.max(1)),
+            _ => (src_rect[2], src_rect[3]),
+        }
+    };
+    let now = c.p.clock_us;
+    c.p.gpu.present(now, src_rect, dst_size.0.max(1) as u32, dst_size.1.max(1) as u32);
     if n >= c.p.frame_limit {
         return Err(super::ApiError(super::FRAME_LIMIT.into()));
     }
@@ -357,15 +431,58 @@ fn dev_get_back_buffer(c: &mut Ctx) -> ApiResult {
     let t = this(c);
     let (w, h, fmt) = (field(c, t, "w"), field(c, t, "h"), field(c, t, "fmt"));
     let s = new_surface(c, w, h, fmt, 1, 0);
+    set_field(c, s, "backbuffer", 1);
     out(c, c.arg(3), s);
     ret(c, D3D_OK)
 }
 
+/// A surface for the current render target: the back buffer, or level 0 of the
+/// texture being rendered to.
 fn dev_get_render_target(c: &mut Ctx) -> ApiResult {
     let t = this(c);
-    let (w, h, fmt) = (field(c, t, "w"), field(c, t, "h"), field(c, t, "fmt"));
-    let s = new_surface(c, w, h, fmt, 1, 0);
+    let (target, tw, th) = c.p.d3d.target;
+    let s = if target == 0 {
+        let (w, h, fmt) = (field(c, t, "w"), field(c, t, "h"), field(c, t, "fmt"));
+        let s = new_surface(c, w, h, fmt, 1, 0);
+        set_field(c, s, "backbuffer", 1);
+        s
+    } else if c.p.d3d_objects.get(&target).is_some_and(|o| o.kind == "IDirect3DSurface8") {
+        if let Some(o) = c.p.d3d_objects.get_mut(&target) {
+            o.refcount += 1;
+        }
+        target
+    } else {
+        let fmt = field(c, target, "fmt");
+        let s = new_surface(c, tw, th, fmt, 1, 0);
+        set_field(c, s, "owner", target);
+        s
+    };
     out(c, c.arg(1), s);
+    ret(c, D3D_OK)
+}
+
+fn dev_set_render_target(c: &mut Ctx) -> ApiResult {
+    let surf = c.arg(1);
+    if surf == 0 {
+        return ret(c, D3D_OK);
+    }
+    let (w, h) = (field(c, surf, "w"), field(c, surf, "h"));
+    let id = if field(c, surf, "backbuffer") != 0 {
+        0
+    } else {
+        let owner = field(c, surf, "owner");
+        if owner != 0 { owner } else { surf }
+    };
+    if id != 0 && field(c, id, "gpu") == 0 {
+        // A render target surface that is not a texture: give the host storage for it.
+        let fmt = field(c, id, "fmt");
+        c.p.gpu.texture_create(id, w, h, 1, fmt, true);
+        set_field(c, id, "gpu", 1);
+    }
+    c.p.d3d.target = (id, w, h);
+    c.p.d3d.viewport = [0.0, 0.0, w as f32, h as f32, 0.0, 1.0];
+    c.p.gpu.set_target(id, w, h);
+    c.trace(format!("({surf:#x}) -> target {id:#x} {w}x{h}"));
     ret(c, D3D_OK)
 }
 
@@ -394,6 +511,8 @@ fn dev_create_texture(c: &mut Ctx) -> ApiResult {
     let data = HashMap::from([("w", w), ("h", h), ("levels", levels), ("usage", usage), ("fmt", fmt), ("pool", pool), ("type", 3)]);
     let tex = new_object(c, "IDirect3DTexture8", IDIRECT3DTEXTURE8, data);
     c.p.textures_created += 1;
+    c.p.gpu.texture_create(tex, w, h, levels, fmt, usage & 1 != 0);
+    set_field(c, tex, "gpu", 1);
     c.trace(format!("({w}x{h} levels {levels} fmt {fmt} usage {usage:#x} pool {pool}) = {tex:#x}"));
     out(c, pp, tex);
     ret(c, D3D_OK)
@@ -405,8 +524,8 @@ fn dev_create_buffer(c: &mut Ctx, index: bool) -> ApiResult {
     let fvf_or_fmt = c.arg(3);
     let pool = c.arg(4);
     let pp = c.arg(5);
-    let bits = alloc(c, len.max(4));
-    let data = HashMap::from([("len", len), ("usage", usage), ("fvf", fvf_or_fmt), ("pool", pool), ("bits", bits)]);
+    let bits = alloc_storage(c, len.max(4));
+    let data = HashMap::from([("len", len), ("usage", usage), ("fvf", fvf_or_fmt), ("pool", pool), ("bits", bits), ("owned_bits", 1)]);
     let obj = if index {
         new_object(c, "IDirect3DIndexBuffer8", IDIRECT3DINDEXBUFFER8, data)
     } else {
@@ -438,21 +557,301 @@ fn dev_create_image_surface(c: &mut Ctx) -> ApiResult {
     ret(c, D3D_OK)
 }
 
-fn dev_get_transform(c: &mut Ctx) -> ApiResult {
-    let p = c.arg(2);
-    for i in 0..16u32 {
-        let v = if i % 5 == 0 { 1.0f32 } else { 0.0 };
-        let _ = c.host.write_u32(p + 4 * i, v.to_bits());
+fn transform_slot(st: &mut DeviceState, ty: u32) -> Option<&mut [f32; 16]> {
+    match ty {
+        2 => Some(&mut st.view),
+        3 => Some(&mut st.proj),
+        256 => Some(&mut st.world),
+        _ => None,
+    }
+}
+
+fn read_matrix(c: &Ctx, p: u32) -> [f32; 16] {
+    let mut m = [0f32; 16];
+    for (i, v) in m.iter_mut().enumerate() {
+        *v = f32::from_bits(c.host.read_u32(p + 4 * i as u32).unwrap_or(0));
+    }
+    m
+}
+
+fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut r = [0f32; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            r[i * 4 + j] = (0..4).map(|k| a[i * 4 + k] * b[k * 4 + j]).sum();
+        }
+    }
+    r
+}
+
+fn dev_set_transform(c: &mut Ctx) -> ApiResult {
+    let (ty, p) = (c.arg(1), c.arg(2));
+    let m = read_matrix(c, p);
+    if let Some(slot) = transform_slot(&mut c.p.d3d, ty) {
+        *slot = m;
     }
     ret(c, D3D_OK)
 }
 
-fn dev_get_viewport(c: &mut Ctx) -> ApiResult {
-    let t = this(c);
+fn dev_multiply_transform(c: &mut Ctx) -> ApiResult {
+    let (ty, p) = (c.arg(1), c.arg(2));
+    let m = read_matrix(c, p);
+    if let Some(slot) = transform_slot(&mut c.p.d3d, ty) {
+        *slot = mat_mul(&m, slot);
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_get_transform(c: &mut Ctx) -> ApiResult {
+    let (ty, p) = (c.arg(1), c.arg(2));
+    let m = transform_slot(&mut c.p.d3d, ty).map(|m| *m).unwrap_or(gpu::IDENTITY);
+    for (i, v) in m.iter().enumerate() {
+        let _ = c.host.write_u32(p + 4 * i as u32, v.to_bits());
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_set_viewport(c: &mut Ctx) -> ApiResult {
     let p = c.arg(1);
-    let (w, h) = (field(c, t, "w"), field(c, t, "h"));
-    for (i, v) in [0u32, 0, w, h, 0.0f32.to_bits(), 1.0f32.to_bits()].iter().enumerate() {
+    let g = |i: u32| c.host.read_u32(p + 4 * i).unwrap_or(0);
+    let vp = [g(0) as f32, g(1) as f32, g(2) as f32, g(3) as f32, f32::from_bits(g(4)), f32::from_bits(g(5))];
+    c.p.d3d.viewport = vp;
+    ret(c, D3D_OK)
+}
+
+fn dev_get_viewport(c: &mut Ctx) -> ApiResult {
+    let p = c.arg(1);
+    let vp = c.p.d3d.viewport;
+    for (i, v) in [vp[0] as u32, vp[1] as u32, vp[2] as u32, vp[3] as u32, vp[4].to_bits(), vp[5].to_bits()].iter().enumerate() {
         let _ = c.host.write_u32(p + 4 * i as u32, *v);
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_get_render_state(c: &mut Ctx) -> ApiResult {
+    let (state, p) = (c.arg(1) as usize, c.arg(2));
+    let v = c.p.d3d.rs.get(state).copied().unwrap_or(0);
+    out(c, p, v);
+    ret(c, D3D_OK)
+}
+
+fn dev_set_texture_stage_state(c: &mut Ctx) -> ApiResult {
+    let (stage, ty, v) = (c.arg(1) as usize, c.arg(2) as usize, c.arg(3));
+    if stage < gpu::STAGES && ty < gpu::TSS_COUNT {
+        c.p.d3d.tss[stage][ty] = v;
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_get_texture_stage_state(c: &mut Ctx) -> ApiResult {
+    let (stage, ty, p) = (c.arg(1) as usize, c.arg(2) as usize, c.arg(3));
+    let v = if stage < gpu::STAGES && ty < gpu::TSS_COUNT { c.p.d3d.tss[stage][ty] } else { 0 };
+    out(c, p, v);
+    ret(c, D3D_OK)
+}
+
+fn dev_set_texture(c: &mut Ctx) -> ApiResult {
+    let (stage, tex) = (c.arg(1) as usize, c.arg(2));
+    if stage < gpu::STAGES {
+        c.p.d3d.textures[stage] = tex;
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_get_texture(c: &mut Ctx) -> ApiResult {
+    let (stage, p) = (c.arg(1) as usize, c.arg(2));
+    let t = if stage < gpu::STAGES { c.p.d3d.textures[stage] } else { 0 };
+    if let Some(o) = c.p.d3d_objects.get_mut(&t) {
+        o.refcount += 1;
+    }
+    out(c, p, t);
+    ret(c, D3D_OK)
+}
+
+fn dev_set_vertex_shader(c: &mut Ctx) -> ApiResult {
+    let h = c.arg(1);
+    // FVF codes have bit 0 clear; shader handles from CreateVertexShader have it set.
+    if h & 1 == 0 {
+        c.p.d3d.fvf = h;
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_get_vertex_shader(c: &mut Ctx) -> ApiResult {
+    let p = c.arg(1);
+    let v = c.p.d3d.fvf;
+    out(c, p, v);
+    ret(c, D3D_OK)
+}
+
+fn dev_set_stream_source(c: &mut Ctx) -> ApiResult {
+    let (stream, vb, stride) = (c.arg(1), c.arg(2), c.arg(3));
+    if stream == 0 {
+        c.p.d3d.stream = (vb, stride);
+    }
+    ret(c, D3D_OK)
+}
+
+fn dev_set_indices(c: &mut Ctx) -> ApiResult {
+    let (ib, base) = (c.arg(1), c.arg(2));
+    c.p.d3d.indices = (ib, base);
+    ret(c, D3D_OK)
+}
+
+fn dev_clear(c: &mut Ctx) -> ApiResult {
+    let (count, rects, flags, color, z, stencil) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4), f32::from_bits(c.arg(5)), c.arg(6));
+    let vp = c.p.d3d.viewport;
+    let vrect = [vp[0] as i32, vp[1] as i32, vp[2] as i32, vp[3] as i32];
+    if count == 0 || rects == 0 {
+        c.p.gpu.clear(flags, color, z, stencil, vrect);
+    } else {
+        for i in 0..count.min(256) {
+            let g = |k: u32| c.host.read_u32(rects + 16 * i + 4 * k).unwrap_or(0) as i32;
+            let (x1, y1, x2, y2) = (g(0).max(vrect[0]), g(1).max(vrect[1]), g(2).min(vrect[0] + vrect[2]), g(3).min(vrect[1] + vrect[3]));
+            if x2 > x1 && y2 > y1 {
+                c.p.gpu.clear(flags, color, z, stencil, [x1, y1, x2 - x1, y2 - y1]);
+            }
+        }
+    }
+    ret(c, D3D_OK)
+}
+
+/// Uploads the levels of `tex` the guest changed since the last draw that used it.
+fn sync_texture(c: &mut Ctx, tex: u32) {
+    let dirty = field(c, tex, "dirty");
+    if dirty == 0 {
+        return;
+    }
+    set_field(c, tex, "dirty", 0);
+    let (w, h, fmt) = (field(c, tex, "w"), field(c, tex, "h"), field(c, tex, "fmt"));
+    for level in 0..16 {
+        if dirty & (1 << level) == 0 {
+            continue;
+        }
+        let bits = field(c, tex, level_key(level));
+        if bits == 0 {
+            continue;
+        }
+        let (lw, lh) = level_dims(w, h, level);
+        c.p.gpu.texture_upload(tex, level, lw, lh, fmt, lw * format_bpp(fmt), bits);
+    }
+}
+
+fn mark_dirty(c: &mut Ctx, tex: u32, level: u32) {
+    let d = field(c, tex, "dirty") | (1 << level.min(15));
+    set_field(c, tex, "dirty", d);
+}
+
+/// Builds the host's draw record from the device state.
+fn submit_draw(c: &mut Ctx, prim: u32, prim_count: u32, vertices: u32, stride: u32, vertex_count: u32, indices: u32, index_size: u32, min_index: u32) {
+    c.p.draw_calls += 1;
+    if prim_count == 0 || vertices == 0 {
+        return;
+    }
+    let mut tex = [0u32; 2];
+    let mut tex_format = [0u32; 2];
+    let mut tex_flip = [0u32; 2];
+    for stage in 0..2 {
+        let t = c.p.d3d.textures[stage];
+        if t != 0 && c.p.d3d_objects.contains_key(&t) {
+            sync_texture(c, t);
+            tex[stage] = t;
+            tex_format[stage] = field(c, t, "fmt");
+            tex_flip[stage] = (field(c, t, "usage") & 1 != 0) as u32;
+        }
+    }
+    if c.p.trace {
+        let (x, y) = (f32::from_bits(c.host.read_u32(vertices).unwrap_or(0)), f32::from_bits(c.host.read_u32(vertices + 4).unwrap_or(0)));
+        c.p.log(format!("    draw prim {prim} x{prim_count} fvf {:#x} tex {:#x} at ({x}, {y})", c.p.d3d.fvf, tex[0]));
+    }
+    let st = &c.p.d3d;
+    let d = gpu::DrawCall {
+        prim,
+        prim_count,
+        vertex_count,
+        fvf: st.fvf,
+        stride,
+        vertices,
+        indices,
+        index_size,
+        min_index,
+        texture: tex,
+        tex_format,
+        tex_flip,
+        target_w: st.target.1,
+        target_h: st.target.2,
+        viewport: st.viewport,
+        world: st.world,
+        view: st.view,
+        proj: st.proj,
+        rs: st.rs,
+        tss: [st.tss[0], st.tss[1]],
+    };
+    c.p.gpu.draw(&d);
+}
+
+fn dev_draw_primitive(c: &mut Ctx) -> ApiResult {
+    let (prim, start, count) = (c.arg(1), c.arg(2), c.arg(3));
+    let (vb, stride) = c.p.d3d.stream;
+    let bits = field(c, vb, "bits");
+    let n = gpu::vertices_for(prim, count);
+    submit_draw(c, prim, count, bits + start * stride, stride, n, 0, 0, 0);
+    ret(c, D3D_OK)
+}
+
+fn dev_draw_indexed_primitive(c: &mut Ctx) -> ApiResult {
+    let (prim, min_index, num_vertices, start_index, count) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5));
+    let (vb, stride) = c.p.d3d.stream;
+    let (ib, base) = c.p.d3d.indices;
+    let isize = if field(c, ib, "fvf") == 102 { 4 } else { 2 };
+    let (vbits, ibits) = (field(c, vb, "bits"), field(c, ib, "bits"));
+    submit_draw(c, prim, count, vbits + base * stride, stride, num_vertices, ibits + start_index * isize, isize, min_index);
+    ret(c, D3D_OK)
+}
+
+fn dev_draw_primitive_up(c: &mut Ctx) -> ApiResult {
+    let (prim, count, data, stride) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4));
+    let n = gpu::vertices_for(prim, count);
+    submit_draw(c, prim, count, data, stride, n, 0, 0, 0);
+    ret(c, D3D_OK)
+}
+
+fn dev_draw_indexed_primitive_up(c: &mut Ctx) -> ApiResult {
+    let (prim, min_index, num_vertices, count, idata, ifmt, vdata, stride) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5), c.arg(6), c.arg(7), c.arg(8));
+    let isize = if ifmt == 102 { 4 } else { 2 };
+    submit_draw(c, prim, count, vdata, stride, num_vertices, idata, isize, min_index);
+    ret(c, D3D_OK)
+}
+
+/// CopyRects between surfaces whose pixels live in guest memory.
+fn dev_copy_rects(c: &mut Ctx) -> ApiResult {
+    let (src, rects, n, dst, points) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5));
+    let (sw, sh, fmt) = (field(c, src, "w"), field(c, src, "h"), field(c, src, "fmt"));
+    let bpp = format_bpp(fmt);
+    let (sp, sbits) = level_bits(c, src, 0);
+    let (dp, dbits) = level_bits(c, dst, 0);
+    let list: Vec<(u32, u32, u32, u32, u32, u32)> = if n == 0 || rects == 0 {
+        vec![(0, 0, sw, sh, 0, 0)]
+    } else {
+        (0..n.min(1024))
+            .map(|i| {
+                let g = |k: u32| c.host.read_u32(rects + 16 * i + 4 * k).unwrap_or(0);
+                let (px, py) = if points != 0 { (c.host.read_u32(points + 8 * i).unwrap_or(0), c.host.read_u32(points + 8 * i + 4).unwrap_or(0)) } else { (g(0), g(1)) };
+                (g(0), g(1), g(2), g(3), px, py)
+            })
+            .collect()
+    };
+    for (x1, y1, x2, y2, dx, dy) in list {
+        let row = (x2.saturating_sub(x1) * bpp) as usize;
+        for y in y1..y2 {
+            let mut buf = vec![0u8; row];
+            let _ = c.host.read(sbits + y * sp + x1 * bpp, &mut buf);
+            let _ = c.host.write(dbits + (dy + y - y1) * dp + dx * bpp, &buf);
+        }
+    }
+    let owner = field(c, dst, "owner");
+    if owner != 0 {
+        mark_dirty(c, owner, field(c, dst, "level"));
     }
     ret(c, D3D_OK)
 }
@@ -478,10 +877,6 @@ fn dev_get_gamma_ramp(c: &mut Ctx) -> ApiResult {
     ret(c, D3D_OK)
 }
 
-fn dev_draw(c: &mut Ctx) -> ApiResult {
-    c.p.draw_calls += 1;
-    ret(c, D3D_OK)
-}
 
 fn dev_handle_out(c: &mut Ctx) -> ApiResult {
     let n = c.nargs();
@@ -506,6 +901,9 @@ fn dev_validate_device(c: &mut Ctx) -> ApiResult {
 fn dev_set_render_state(c: &mut Ctx) -> ApiResult {
     let state = c.arg(1);
     let v = c.arg(2);
+    if let Some(slot) = c.p.d3d.rs.get_mut(state as usize) {
+        *slot = v;
+    }
     c.trace(format!("({state}, {v:#x})"));
     ret(c, D3D_OK)
 }
@@ -539,19 +937,19 @@ const IDIRECT3DDEVICE8: &[Method] = &[
     ("CreateRenderTarget", 7, dev_create_render_target),
     ("CreateDepthStencilSurface", 6, dev_create_depth_stencil_surface),
     ("CreateImageSurface", 5, dev_create_image_surface),
-    ("CopyRects", 6, okn),
+    ("CopyRects", 6, dev_copy_rects),
     ("UpdateTexture", 3, okn),
     ("GetFrontBuffer", 2, okn),
-    ("SetRenderTarget", 3, okn),
+    ("SetRenderTarget", 3, dev_set_render_target),
     ("GetRenderTarget", 2, dev_get_render_target),
     ("GetDepthStencilSurface", 2, dev_get_depth_stencil),
     ("BeginScene", 1, okn),
     ("EndScene", 1, okn),
-    ("Clear", 7, okn),
-    ("SetTransform", 3, okn),
+    ("Clear", 7, dev_clear),
+    ("SetTransform", 3, dev_set_transform),
     ("GetTransform", 3, dev_get_transform),
-    ("MultiplyTransform", 3, okn),
-    ("SetViewport", 2, okn),
+    ("MultiplyTransform", 3, dev_multiply_transform),
+    ("SetViewport", 2, dev_set_viewport),
     ("GetViewport", 2, dev_get_viewport),
     ("SetMaterial", 2, okn),
     ("GetMaterial", 2, okn),
@@ -562,7 +960,7 @@ const IDIRECT3DDEVICE8: &[Method] = &[
     ("SetClipPlane", 3, okn),
     ("GetClipPlane", 3, okn),
     ("SetRenderState", 3, dev_set_render_state),
-    ("GetRenderState", 3, dev_get_dword),
+    ("GetRenderState", 3, dev_get_render_state),
     ("BeginStateBlock", 1, okn),
     ("EndStateBlock", 2, dev_handle_out),
     ("ApplyStateBlock", 2, okn),
@@ -571,32 +969,32 @@ const IDIRECT3DDEVICE8: &[Method] = &[
     ("CreateStateBlock", 3, dev_handle_out),
     ("SetClipStatus", 2, okn),
     ("GetClipStatus", 2, okn),
-    ("GetTexture", 3, dev_get_dword),
-    ("SetTexture", 3, okn),
-    ("GetTextureStageState", 4, dev_get_dword),
-    ("SetTextureStageState", 4, okn),
+    ("GetTexture", 3, dev_get_texture),
+    ("SetTexture", 3, dev_set_texture),
+    ("GetTextureStageState", 4, dev_get_texture_stage_state),
+    ("SetTextureStageState", 4, dev_set_texture_stage_state),
     ("ValidateDevice", 2, dev_validate_device),
     ("GetInfo", 4, |c| ret(c, S_FALSE)),
     ("SetPaletteEntries", 3, okn),
     ("GetPaletteEntries", 3, okn),
     ("SetCurrentTexturePalette", 2, okn),
     ("GetCurrentTexturePalette", 2, dev_get_dword),
-    ("DrawPrimitive", 4, dev_draw),
-    ("DrawIndexedPrimitive", 6, dev_draw),
-    ("DrawPrimitiveUP", 5, dev_draw),
-    ("DrawIndexedPrimitiveUP", 9, dev_draw),
+    ("DrawPrimitive", 4, dev_draw_primitive),
+    ("DrawIndexedPrimitive", 6, dev_draw_indexed_primitive),
+    ("DrawPrimitiveUP", 5, dev_draw_primitive_up),
+    ("DrawIndexedPrimitiveUP", 9, dev_draw_indexed_primitive_up),
     ("ProcessVertices", 6, okn),
     ("CreateVertexShader", 5, dev_create_vertex_shader),
-    ("SetVertexShader", 2, okn),
-    ("GetVertexShader", 2, dev_get_dword),
+    ("SetVertexShader", 2, dev_set_vertex_shader),
+    ("GetVertexShader", 2, dev_get_vertex_shader),
     ("DeleteVertexShader", 2, okn),
     ("SetVertexShaderConstant", 4, okn),
     ("GetVertexShaderConstant", 4, okn),
     ("GetVertexShaderDeclaration", 4, okn),
     ("GetVertexShaderFunction", 4, okn),
-    ("SetStreamSource", 4, okn),
+    ("SetStreamSource", 4, dev_set_stream_source),
     ("GetStreamSource", 4, okn),
-    ("SetIndices", 3, okn),
+    ("SetIndices", 3, dev_set_indices),
     ("GetIndices", 3, okn),
     ("CreatePixelShader", 3, dev_handle_out),
     ("SetPixelShader", 2, okn),
@@ -644,8 +1042,10 @@ fn level_bits(c: &mut Ctx, obj: u32, level: u32) -> (u32, u32) {
     let key = level_key(level);
     let mut bits = field(c, obj, key);
     if bits == 0 {
-        bits = alloc(c, (pitch * h).max(4));
+        bits = alloc_storage(c, (pitch * h).max(4));
         set_field(c, obj, key, bits);
+        let owned = field(c, obj, "owned") | (1 << level.min(15));
+        set_field(c, obj, "owned", owned);
     }
     (pitch, bits)
 }
@@ -677,6 +1077,7 @@ fn tex_get_surface_level(c: &mut Ctx) -> ApiResult {
     set_field(c, s, "bits0", bits);
     set_field(c, s, "pitch", pitch);
     set_field(c, s, "owner", t);
+    set_field(c, s, "level", level);
     out(c, c.arg(2), s);
     ret(c, D3D_OK)
 }
@@ -702,7 +1103,11 @@ const IDIRECT3DTEXTURE8: &[Method] = &[
     ("GetLevelDesc", 3, tex_get_level_desc),
     ("GetSurfaceLevel", 3, tex_get_surface_level),
     ("LockRect", 5, tex_lock_rect),
-    ("UnlockRect", 2, okn),
+    ("UnlockRect", 2, |c| {
+        let (t, level) = (this(c), c.arg(1));
+        mark_dirty(c, t, level);
+        ret(c, D3D_OK)
+    }),
     ("AddDirtyRect", 2, okn),
 ];
 
@@ -741,7 +1146,15 @@ const IDIRECT3DSURFACE8: &[Method] = &[
     ("GetContainer", 3, |c| ret(c, E_NOINTERFACE)),
     ("GetDesc", 2, surf_get_desc),
     ("LockRect", 4, surf_lock_rect),
-    ("UnlockRect", 1, okn),
+    ("UnlockRect", 1, |c| {
+        let s = this(c);
+        let owner = field(c, s, "owner");
+        if owner != 0 {
+            let level = field(c, s, "level");
+            mark_dirty(c, owner, level);
+        }
+        ret(c, D3D_OK)
+    }),
 ];
 
 fn buf_lock(c: &mut Ctx) -> ApiResult {
