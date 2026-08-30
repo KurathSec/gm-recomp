@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 encoding_rs = "0.8.42"
 fpu = { version = "0.1.0", path = "../fpu" }
+libm = "0.2.16"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 recomp = { version = "0.1.0", path = "../recomp" }
 wasm-encoder = "0.262.0"

@@ -413,7 +413,7 @@ pub fn register(r: &mut Registry) {
         let sa = read_wsized(c, a, na);
         let sb = read_wsized(c, b, nb);
         let ignore_case = c.arg(1) & 1 != 0;
-        let (x, y) = if ignore_case { (sa.to_lowercase(), sb.to_lowercase()) } else { (sa, sb) };
+        let (x, y) = if ignore_case { (super::nls::lower_str(&sa), super::nls::lower_str(&sb)) } else { (sa, sb) };
         ok(6, match x.cmp(&y) { std::cmp::Ordering::Less => 1, std::cmp::Ordering::Equal => 2, _ => 3 })
     });
     r.add(k, "LCMapStringA", |c| {
@@ -431,7 +431,7 @@ pub fn register(r: &mut Registry) {
     r.add(k, "LCMapStringW", |c| {
         let flags = c.arg(1);
         let s = read_wsized(c, c.arg(2), c.arg(3) as i32);
-        let out = if flags & 0x100 != 0 { s.to_lowercase() } else if flags & 0x200 != 0 { s.to_uppercase() } else { s };
+        let out = if flags & 0x100 != 0 { super::nls::lower_str(&s) } else if flags & 0x200 != 0 { super::nls::upper_str(&s) } else { s };
         let units: Vec<u16> = out.encode_utf16().collect();
         let (dst, cap) = (c.arg(4), c.arg(5));
         if cap == 0 {
@@ -504,7 +504,7 @@ pub fn register(r: &mut Registry) {
         ok(2, match a.cmp(&b) { std::cmp::Ordering::Less => -1i32 as u32, std::cmp::Ordering::Equal => 0, _ => 1 })
     });
     r.add(k, "lstrcmpiA", |c| {
-        let (a, b) = (c.str_arg(0).to_lowercase(), c.str_arg(1).to_lowercase());
+        let (a, b) = (super::nls::lower_str(&c.str_arg(0)), super::nls::lower_str(&c.str_arg(1)));
         ok(2, match a.cmp(&b) { std::cmp::Ordering::Less => -1i32 as u32, std::cmp::Ordering::Equal => 0, _ => 1 })
     });
     r.alias(k, "lstrcmpiW", k, "lstrcmpiA");

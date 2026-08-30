@@ -9,6 +9,7 @@ pub mod gdi32;
 pub mod kernel32;
 pub mod misc;
 pub mod msvcrt;
+pub mod nls;
 pub mod user32;
 
 use crate::mem::Guest;

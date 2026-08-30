@@ -5,4 +5,5 @@ version.workspace = true
 
 [dependencies]
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "instr_info"] }
+libm = "0.2.16"
 rustc_apfloat = "0.2.3"

@@ -34,6 +34,8 @@ pub struct RunOpts {
     pub dump: Vec<(u32, u32)>,
     /// Keep files written by earlier runs (saves) instead of starting clean.
     pub keep_writes: bool,
+    /// Write the whole guest memory to this file when the run stops.
+    pub dump_mem: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +262,9 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let final_regs = engine::read_regs(&mut m);
     let (hash, chunks) = engine::state_hash(&mut m, (MEM_PAGES * 65536 - 65536) as u32);
     eprintln!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)");
+    if let Some(path) = &opts.dump_mem {
+        std::fs::write(path, memory.data(&*m.cx))?;
+    }
     for &(addr, len) in &opts.dump {
         for row in (0..len).step_by(16) {
             let mut b = vec![0u8; 16.min((len - row) as usize)];

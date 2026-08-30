@@ -258,7 +258,8 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(fs: Box<dyn crate::vfs::Vfs>, exe_path: &str, cmdline: &str) -> Self {
+    pub fn new(mut fs: Box<dyn crate::vfs::Vfs>, exe_path: &str, cmdline: &str) -> Self {
+        crate::vfs::add_standard_dirs(fs.as_mut());
         Self::with_registry(Registry::new(), fs, exe_path, cmdline)
     }
 

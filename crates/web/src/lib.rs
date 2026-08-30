@@ -1,0 +1,419 @@
+//! The browser host: the engine compiled to wasm32, driven by a JS worker.
+//!
+//! Guest memory and the CPU-state globals live in a small "cpu" module generated here
+//! (`glue_module`): it defines them, imports this module's memory, and exports
+//! accessors (cross-memory `memory.copy`, typed global get/set). JS puts those
+//! accessors and every translated function into this module's function table, so all
+//! calls between the engine, the accessors and translated code are direct wasm calls.
+
+#![cfg(target_arch = "wasm32")]
+
+use recomp::abi::{self, GLOBALS, Global};
+use runtime::engine::{self, Engine, Machine};
+use runtime::mem::Fault;
+use runtime::vfs::MemFs;
+use runtime::{Guest, Process};
+
+#[link(wasm_import_module = "host")]
+unsafe extern "C" {
+    /// Compiles and instantiates a translated module; writes the table index of each
+    /// export named in `names` (newline-separated) to `out`. Returns 1 on success.
+    fn instantiate(wasm: *const u8, len: usize, names: *const u8, names_len: usize, out: *mut u32) -> i32;
+    fn print(ptr: *const u8, len: usize);
+    fn now_us() -> f64;
+}
+
+/// Guest address space limit (the stub and marker pages sit just below 2 GiB).
+const GUEST_MAX_PAGES: u64 = 32768;
+
+#[derive(Clone, Copy)]
+struct Glue {
+    g2r: extern "C" fn(u32, *mut u8, u32),
+    r2g: extern "C" fn(*const u8, u32, u32),
+    fill: extern "C" fn(u32, u32, u32),
+    get: extern "C" fn(u32) -> u32,
+    set: extern "C" fn(u32, u32),
+    size: extern "C" fn() -> u32,
+    grow: extern "C" fn(u32) -> i32,
+}
+
+/// Export order of the glue accessors; JS places them in the table in this order.
+const GLUE_FUNCS: [&str; 7] = ["g2r", "r2g", "fill", "get", "set", "size", "grow"];
+
+struct State {
+    engine: Option<Engine>,
+    glue: Option<Glue>,
+    fs: Option<MemFs>,
+    started: Option<engine::Started>,
+    guest_bytes: u64,
+}
+
+static mut STATE: State = State { engine: None, glue: None, fs: None, started: None, guest_bytes: 0 };
+
+#[allow(static_mut_refs)]
+fn state() -> &'static mut State {
+    // Single-threaded: one worker owns this instance.
+    unsafe { &mut STATE }
+}
+
+fn glue() -> Glue {
+    state().glue.expect("glue not installed")
+}
+
+fn log(s: &str) {
+    unsafe { print(s.as_ptr(), s.len()) }
+}
+
+struct Web;
+
+impl Web {
+    fn in_bounds(&self, addr: u32, len: usize) -> bool {
+        let end = addr as u64 + len as u64;
+        if end <= state().guest_bytes {
+            return true;
+        }
+        state().guest_bytes = (glue().size)() as u64 * 65536;
+        end <= state().guest_bytes
+    }
+}
+
+impl Guest for Web {
+    fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), Fault> {
+        if !self.in_bounds(addr, buf.len()) {
+            return Err(Fault { addr, write: false });
+        }
+        (glue().g2r)(addr, buf.as_mut_ptr(), buf.len() as u32);
+        Ok(())
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), Fault> {
+        if !self.in_bounds(addr, data.len()) {
+            return Err(Fault { addr, write: true });
+        }
+        (glue().r2g)(data.as_ptr(), addr, data.len() as u32);
+        Ok(())
+    }
+    fn ensure_mapped(&mut self, addr: u32, size: u32) -> Result<(), Fault> {
+        let end = addr as u64 + size as u64;
+        let have = (glue().size)() as u64 * 65536;
+        if end > have {
+            let pages = (end - have).div_ceil(65536);
+            if have / 65536 + pages > GUEST_MAX_PAGES || (glue().grow)(pages as u32) < 0 {
+                return Err(Fault { addr, write: true });
+            }
+            state().guest_bytes = (glue().size)() as u64 * 65536;
+        }
+        Ok(())
+    }
+    fn fill(&mut self, addr: u32, size: u32, byte: u8) -> Result<(), Fault> {
+        if !self.in_bounds(addr, size as usize) {
+            return Err(Fault { addr, write: true });
+        }
+        (glue().fill)(addr, byte as u32, size);
+        Ok(())
+    }
+}
+
+impl Machine for Web {
+    fn engine(&mut self) -> &mut Engine {
+        state().engine.as_mut().expect("engine not initialised")
+    }
+    fn engine_ref(&self) -> &Engine {
+        state().engine.as_ref().expect("engine not initialised")
+    }
+    fn global(&mut self, g: Global) -> u32 {
+        (glue().get)(g as u32)
+    }
+    fn set_global(&mut self, g: Global, v: u32) {
+        (glue().set)(g as u32, v)
+    }
+    fn call_index(&mut self, idx: u32) -> Result<(), String> {
+        // Table slots hold translated functions of type () -> ().
+        let f: extern "C" fn() = unsafe { std::mem::transmute(idx as usize) };
+        f();
+        Ok(())
+    }
+    fn instantiate(&mut self, wasm: &[u8], exports: &[String]) -> Result<Vec<u32>, String> {
+        let names = exports.join("\n");
+        let mut out = vec![0u32; exports.len()];
+        let ok = unsafe { instantiate(wasm.as_ptr(), wasm.len(), names.as_ptr(), names.len(), out.as_mut_ptr()) };
+        if ok == 1 { Ok(out) } else { Err("module rejected by the host (see console)".into()) }
+    }
+    fn now_us(&self) -> u64 {
+        unsafe { now_us() as u64 }
+    }
+    fn print(&mut self, s: &str) {
+        log(s);
+    }
+}
+
+// ---- the cpu glue module ------------------------------------------------------------------
+
+fn build_glue(initial_pages: u64) -> Vec<u8> {
+    use wasm_encoder::{
+        CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
+        ImportSection, Instruction as I, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32; 3], []); // 0: copy/fill
+    types.ty().function([ValType::I32], [ValType::I32]); // 1: get / grow
+    types.ty().function([ValType::I32; 2], []); // 2: set
+    types.ty().function([], [ValType::I32]); // 3: size
+    let mut imports = ImportSection::new();
+    imports.import("rt", "memory", EntityType::Memory(MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None }));
+    let mut mems = MemorySection::new();
+    mems.memory(MemoryType { minimum: initial_pages, maximum: Some(GUEST_MAX_PAGES), memory64: false, shared: false, page_size_log2: None });
+    let mut globals = GlobalSection::new();
+    for (_, _, ty) in GLOBALS {
+        let init = match ty {
+            ValType::V128 => ConstExpr::v128_const(0),
+            _ => ConstExpr::i32_const(0),
+        };
+        globals.global(GlobalType { val_type: ty, mutable: true, shared: false }, &init);
+    }
+    let mut funcs = FunctionSection::new();
+    let mut code = CodeSection::new();
+    // g2r(guest, rt, len): guest memory (1) -> runtime memory (0)
+    funcs.function(0);
+    let mut f = Function::new([]);
+    f.instruction(&I::LocalGet(1)).instruction(&I::LocalGet(0)).instruction(&I::LocalGet(2)).instruction(&I::MemoryCopy { src_mem: 1, dst_mem: 0 }).instruction(&I::End);
+    code.function(&f);
+    // r2g(rt, guest, len)
+    funcs.function(0);
+    let mut f = Function::new([]);
+    f.instruction(&I::LocalGet(1)).instruction(&I::LocalGet(0)).instruction(&I::LocalGet(2)).instruction(&I::MemoryCopy { src_mem: 0, dst_mem: 1 }).instruction(&I::End);
+    code.function(&f);
+    // fill(guest, byte, len)
+    funcs.function(0);
+    let mut f = Function::new([]);
+    f.instruction(&I::LocalGet(0)).instruction(&I::LocalGet(1)).instruction(&I::LocalGet(2)).instruction(&I::MemoryFill(1)).instruction(&I::End);
+    code.function(&f);
+    let i32_globals: Vec<u32> = GLOBALS.iter().enumerate().filter(|(_, g)| g.2 == ValType::I32).map(|(i, _)| i as u32).collect();
+    let n = GLOBALS.len() as u32;
+    // get(i): block ladder over every global index (v128 slots read as 0)
+    funcs.function(1);
+    let mut f = Function::new([]);
+    f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    for _ in 0..n {
+        f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    }
+    f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..n).collect::<Vec<_>>().into(), n));
+    for i in 0..n {
+        f.instruction(&I::End);
+        if i32_globals.contains(&i) {
+            f.instruction(&I::GlobalGet(i));
+        } else {
+            f.instruction(&I::I32Const(0));
+        }
+        f.instruction(&I::Return);
+    }
+    f.instruction(&I::End);
+    f.instruction(&I::I32Const(0)).instruction(&I::End);
+    code.function(&f);
+    // set(i, v)
+    funcs.function(2);
+    let mut f = Function::new([]);
+    f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    for _ in 0..n {
+        f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    }
+    f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..n).collect::<Vec<_>>().into(), n));
+    for i in 0..n {
+        f.instruction(&I::End);
+        if i32_globals.contains(&i) {
+            f.instruction(&I::LocalGet(1)).instruction(&I::GlobalSet(i));
+        }
+        f.instruction(&I::Return);
+    }
+    f.instruction(&I::End).instruction(&I::End);
+    code.function(&f);
+    // size() / grow(n) of guest memory
+    funcs.function(3);
+    let mut f = Function::new([]);
+    f.instruction(&I::MemorySize(1)).instruction(&I::End);
+    code.function(&f);
+    funcs.function(1);
+    let mut f = Function::new([]);
+    f.instruction(&I::LocalGet(0)).instruction(&I::MemoryGrow(1)).instruction(&I::End);
+    code.function(&f);
+
+    let mut exports = ExportSection::new();
+    exports.export(abi::MEMORY_NAME, ExportKind::Memory, 1);
+    for (i, (_, name, _)) in GLOBALS.iter().enumerate() {
+        exports.export(name, ExportKind::Global, i as u32);
+    }
+    for (i, name) in GLUE_FUNCS.iter().enumerate() {
+        exports.export(name, ExportKind::Func, i as u32);
+    }
+    let mut m = Module::new();
+    m.section(&types);
+    m.section(&imports);
+    m.section(&funcs);
+    m.section(&mems);
+    m.section(&globals);
+    m.section(&exports);
+    m.section(&code);
+    m.finish()
+}
+
+static mut GLUE_BYTES: Vec<u8> = Vec::new();
+
+// ---- exports ---------------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alloc(n: usize) -> *mut u8 {
+    let mut v = vec![0u8; n.max(1)];
+    let p = v.as_mut_ptr();
+    std::mem::forget(v);
+    p
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dealloc(p: *mut u8, n: usize) {
+    drop(unsafe { Vec::from_raw_parts(p, n.max(1), n.max(1)) });
+}
+
+/// Builds the cpu glue module; returns its length (bytes at `glue_ptr()`).
+#[unsafe(no_mangle)]
+#[allow(static_mut_refs)]
+pub extern "C" fn glue_build(initial_pages: u32) -> usize {
+    unsafe {
+        GLUE_BYTES = build_glue(initial_pages as u64);
+        GLUE_BYTES.len()
+    }
+}
+
+#[unsafe(no_mangle)]
+#[allow(static_mut_refs)]
+pub extern "C" fn glue_ptr() -> *const u8 {
+    unsafe { GLUE_BYTES.as_ptr() }
+}
+
+/// The glue accessors are at table slots `base..base + 7` in `GLUE_FUNCS` order.
+#[unsafe(no_mangle)]
+pub extern "C" fn glue_install(base: u32) {
+    let f = |i: u32| (base + i) as usize;
+    unsafe {
+        state().glue = Some(Glue {
+            g2r: std::mem::transmute(f(0)),
+            r2g: std::mem::transmute(f(1)),
+            fill: std::mem::transmute(f(2)),
+            get: std::mem::transmute(f(3)),
+            set: std::mem::transmute(f(4)),
+            size: std::mem::transmute(f(5)),
+            grow: std::mem::transmute(f(6)),
+        });
+    }
+}
+
+/// Adds a game file (`path` relative to the game directory, `\`-separated) with its
+/// last-write time in Unix milliseconds (0 if unknown).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fs_add(path: *const u8, path_len: usize, data: *const u8, data_len: usize, mtime_ms: f64) {
+    let path = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(path, path_len) }).into_owned();
+    let data = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
+    let ms = mtime_ms.max(0.0) as u64;
+    let filetime = if ms == 0 { 0 } else { (ms / 1000 + 11_644_473_600) * 10_000_000 + (ms % 1000) * 10_000 };
+    state().fs.get_or_insert_with(MemFs::new).insert_with_time(&path, data, filetime);
+}
+
+/// Creates the process and loads the executable. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace: u32, epoch_unix: f64, nop_index: u32) -> i32 {
+    let exe = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(exe, exe_len) }).into_owned();
+    let fs = state().fs.take().unwrap_or_default();
+    let exe_path = format!("C:\\game\\{exe}");
+    let mut p = Process::new(Box::new(fs), &exe_path, &format!("\"{exe_path}\""));
+    p.frame_limit = if frames == 0 { u64::MAX } else { frames as u64 };
+    p.trace = trace != 0;
+    p.epoch_unix = epoch_unix as u64;
+    let mut e = Engine::new(p);
+    e.trace = trace != 0;
+    e.nop_index = nop_index;
+    state().engine = Some(e);
+    let mut m = Web;
+    match engine::start(&mut m, &exe) {
+        Ok(s) => {
+            state().started = Some(s);
+            0
+        }
+        Err(e) => {
+            log(&format!("start failed: {e}"));
+            1
+        }
+    }
+}
+
+/// Runs the process until it exits or reaches the frame limit; prints a summary.
+/// Returns 0 when it ended normally.
+#[unsafe(no_mangle)]
+pub extern "C" fn run() -> i32 {
+    let mut m = Web;
+    let Some(started) = state().started.take() else {
+        log("run: not started");
+        return 2;
+    };
+    let t0 = m.now_us();
+    let r = engine::run_process(&mut m, &started);
+    let dt = (m.now_us() - t0) as f64 / 1e6;
+    let (hash, chunks) = engine::state_hash(&mut m, (GUEST_MAX_PAGES * 65536 - 65536) as u32);
+    let e = m.engine_ref();
+    let p = e.process();
+    let mut lines = vec![
+        format!("---- run finished in {dt:.2}s ----"),
+        match &r {
+            Ok(()) => "ended normally".to_string(),
+            Err(err) => format!("stopped: {err}"),
+        },
+        format!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)"),
+        format!(
+            "frames presented: {}  api calls: {}  dispatches: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
+            p.frames_presented,
+            p.api_calls,
+            e.dispatches,
+            e.translated,
+            e.translate_us as f64 / 1e6,
+            p.now_ms()
+        ),
+    ];
+    let presents: Vec<&String> = p.log.iter().filter(|l| l.starts_with("Present #")).collect();
+    lines.extend(presents.iter().skip(presents.len().saturating_sub(2)).map(|s| s.to_string()));
+    for l in lines {
+        log(&l);
+    }
+    if r.is_ok() { 0 } else { 1 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_resolve(addr: i32) -> i32 {
+    engine::rt_resolve(&mut Web, addr as u32) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_trap(kind: i32, arg: i32) {
+    engine::rt_trap(&mut Web, kind, arg as u32)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_fpu(code: i32, a: i32, b: i32, ip: i32, fop: i32) -> i32 {
+    engine::rt_fpu(&mut Web, code, a as u32, b as u32, ip as u32, fop as u32)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_cpuid() {
+    engine::rt_cpuid(&mut Web)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_rdtsc() {
+    engine::rt_rdtsc(&mut Web)
+}
+
+/// The no-op module's bytes (JS instantiates it first; its function's slot goes to `init`).
+#[unsafe(no_mangle)]
+#[allow(static_mut_refs)]
+pub extern "C" fn nop_build() -> usize {
+    unsafe {
+        GLUE_BYTES = engine::nop_module();
+        GLUE_BYTES.len()
+    }
+}

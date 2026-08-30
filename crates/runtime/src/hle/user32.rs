@@ -1620,7 +1620,7 @@ fn wprop_key(c: &Ctx, i: u32) -> String {
 fn case_map_w(c: &mut Ctx, p: u32, n: Option<u32>, upper: bool) -> u32 {
     if p < 0x10000 {
         let ch = char::from_u32(p).unwrap_or('\0');
-        let m = if upper { ch.to_uppercase().next() } else { ch.to_lowercase().next() }.unwrap_or(ch);
+        let m = if upper { super::nls::upper(ch) } else { super::nls::lower(ch) };
         return m as u32;
     }
     let count = match n {
@@ -1630,7 +1630,7 @@ fn case_map_w(c: &mut Ctx, p: u32, n: Option<u32>, upper: bool) -> u32 {
     for i in 0..count {
         let u = c.host.read_u16(p + 2 * i).unwrap_or(0);
         if let Some(ch) = char::from_u32(u as u32) {
-            let m = if upper { ch.to_uppercase().next() } else { ch.to_lowercase().next() }.unwrap_or(ch);
+            let m = if upper { super::nls::upper(ch) } else { super::nls::lower(ch) };
             if (m as u32) < 0x10000 {
                 let _ = c.host.write_u16(p + 2 * i, m as u16);
             }
@@ -1725,8 +1725,8 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(u, "IsCharAlphaW", |c| ok(1, char::from_u32(c.arg(0)).map(|ch| ch.is_alphabetic()).unwrap_or(false) as u32));
     r.add(u, "IsCharAlphaNumericW", |c| ok(1, char::from_u32(c.arg(0)).map(|ch| ch.is_alphanumeric()).unwrap_or(false) as u32));
-    r.add(u, "IsCharUpperW", |c| ok(1, char::from_u32(c.arg(0)).map(|ch| ch.is_uppercase()).unwrap_or(false) as u32));
-    r.add(u, "IsCharLowerW", |c| ok(1, char::from_u32(c.arg(0)).map(|ch| ch.is_lowercase()).unwrap_or(false) as u32));
+    r.add(u, "IsCharUpperW", |c| ok(1, char::from_u32(c.arg(0)).map(|ch| super::nls::lower(ch) != ch).unwrap_or(false) as u32));
+    r.add(u, "IsCharLowerW", |c| ok(1, char::from_u32(c.arg(0)).map(|ch| super::nls::upper(ch) != ch).unwrap_or(false) as u32));
     r.add(u, "IsCharAlphaA", |c| ok(1, (c.arg(0) as u8).is_ascii_alphabetic() as u32));
     r.add(u, "IsCharAlphaNumericA", |c| ok(1, (c.arg(0) as u8).is_ascii_alphanumeric() as u32));
     r.add(u, "IsCharUpperA", |c| ok(1, (c.arg(0) as u8).is_ascii_uppercase() as u32));

@@ -750,40 +750,40 @@ pub fn register(r: &mut Registry) {
 
     // ---- math (results in ST0) -------------------------------------------------------------
     for (name, f) in [
-        ("log10", f64::log10 as fn(f64) -> f64),
-        ("log", f64::ln),
-        ("exp", f64::exp),
-        ("sqrt", f64::sqrt),
-        ("sin", f64::sin),
-        ("cos", f64::cos),
-        ("tan", f64::tan),
-        ("asin", f64::asin),
-        ("acos", f64::acos),
-        ("atan", f64::atan),
-        ("floor", f64::floor),
-        ("ceil", f64::ceil),
-        ("fabs", f64::abs),
-        ("sinh", f64::sinh),
-        ("cosh", f64::cosh),
-        ("tanh", f64::tanh),
+        ("log10", libm::log10 as fn(f64) -> f64),
+        ("log", libm::log),
+        ("exp", libm::exp),
+        ("sqrt", libm::sqrt),
+        ("sin", libm::sin),
+        ("cos", libm::cos),
+        ("tan", libm::tan),
+        ("asin", libm::asin),
+        ("acos", libm::acos),
+        ("atan", libm::atan),
+        ("floor", libm::floor),
+        ("ceil", libm::ceil),
+        ("fabs", libm::fabs),
+        ("sinh", libm::sinh),
+        ("cosh", libm::cosh),
+        ("tanh", libm::tanh),
     ] {
         r.add_math(m, name, f);
     }
     r.add(m, "pow", |c| {
         let (x, y) = (arg_f64(c, 0), arg_f64(c, 2));
-        ret_f64(c, x.powf(y))
+        ret_f64(c, libm::pow(x, y))
     });
     r.add(m, "atan2", |c| {
         let (y, x) = (arg_f64(c, 0), arg_f64(c, 2));
-        ret_f64(c, y.atan2(x))
+        ret_f64(c, libm::atan2(y, x))
     });
     r.add(m, "fmod", |c| {
         let (x, y) = (arg_f64(c, 0), arg_f64(c, 2));
-        ret_f64(c, x % y)
+        ret_f64(c, libm::fmod(x, y))
     });
     r.add(m, "ldexp", |c| {
         let (x, e) = (arg_f64(c, 0), c.arg_i32(2));
-        ret_f64(c, x * 2f64.powi(e))
+        ret_f64(c, libm::ldexp(x, e))
     });
     r.add(m, "frexp", |c| {
         let (x, pe) = (arg_f64(c, 0), c.arg(2));
@@ -805,32 +805,32 @@ pub fn register(r: &mut Registry) {
     r.add(m, "_CIpow", |c| {
         let y = c.host.fpu_pop();
         let x = c.host.fpu_pop();
-        ret_f64(c, x.powf(y))
+        ret_f64(c, libm::pow(x, y))
     });
     r.add(m, "_CIatan2", |c| {
         let x = c.host.fpu_pop();
         let y = c.host.fpu_pop();
-        ret_f64(c, y.atan2(x))
+        ret_f64(c, libm::atan2(y, x))
     });
     r.add(m, "_CIfmod", |c| {
         let y = c.host.fpu_pop();
         let x = c.host.fpu_pop();
-        ret_f64(c, x % y)
+        ret_f64(c, libm::fmod(x, y))
     });
     for (name, f) in [
-        ("_CIsqrt", f64::sqrt as fn(f64) -> f64),
-        ("_CIsin", f64::sin),
-        ("_CIcos", f64::cos),
-        ("_CItan", f64::tan),
-        ("_CIasin", f64::asin),
-        ("_CIacos", f64::acos),
-        ("_CIatan", f64::atan),
-        ("_CIexp", f64::exp),
-        ("_CIlog", f64::ln),
-        ("_CIlog10", f64::log10),
-        ("_CIsinh", f64::sinh),
-        ("_CIcosh", f64::cosh),
-        ("_CItanh", f64::tanh),
+        ("_CIsqrt", libm::sqrt as fn(f64) -> f64),
+        ("_CIsin", libm::sin),
+        ("_CIcos", libm::cos),
+        ("_CItan", libm::tan),
+        ("_CIasin", libm::asin),
+        ("_CIacos", libm::acos),
+        ("_CIatan", libm::atan),
+        ("_CIexp", libm::exp),
+        ("_CIlog", libm::log),
+        ("_CIlog10", libm::log10),
+        ("_CIsinh", libm::sinh),
+        ("_CIcosh", libm::cosh),
+        ("_CItanh", libm::tanh),
     ] {
         r.add_ci(m, name, f);
     }
@@ -843,7 +843,7 @@ fn frexp(x: f64) -> (f64, i32) {
     let bits = x.to_bits();
     let exp = ((bits >> 52) & 0x7FF) as i32;
     if exp == 0 {
-        let (m, e) = frexp(x * 2f64.powi(64));
+        let (m, e) = frexp(x * 18_446_744_073_709_551_616.0);
         return (m, e - 64);
     }
     let m = f64::from_bits((bits & !(0x7FFu64 << 52)) | (1022u64 << 52));

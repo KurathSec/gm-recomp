@@ -1415,20 +1415,20 @@ impl Fpu {
                     return;
                 }
                 let r = match mn {
-                    Fsin => from_f64(xf.sin()),
-                    Fcos => from_f64(xf.cos()),
+                    Fsin => from_f64(libm::sin(xf)),
+                    Fcos => from_f64(libm::cos(xf)),
                     _ => Ext::ZERO,
                 };
                 if !x.is_zero() { self.raise(SW_PE); }
                 match mn {
                     Fsincos => {
-                        let sn = self.round_constant_rm(from_f64(xf.sin()));
+                        let sn = self.round_constant_rm(from_f64(libm::sin(xf)));
                         self.set_st(0, sn);
-                        let c = self.round_constant_rm(from_f64(xf.cos()));
+                        let c = self.round_constant_rm(from_f64(libm::cos(xf)));
                         self.push(c);
                     }
                     Fptan => {
-                        let t = self.round_constant_rm(from_f64(xf.tan()));
+                        let t = self.round_constant_rm(from_f64(libm::tan(xf)));
                         self.set_st(0, t);
                         self.push(ext_from_bits(0x3FFF_8000_0000_0000_0000));
                     }
@@ -1439,7 +1439,7 @@ impl Fpu {
                 }
             }
             F2xm1 => {
-                let r = if x.is_nan() { self.nan_result(x, x) } else { from_f64((2f64).powf(xf) - 1.0) };
+                let r = if x.is_nan() { self.nan_result(x, x) } else { from_f64(libm::pow(2.0, xf) - 1.0) };
                 if !x.is_zero() && !x.is_nan() { self.raise(SW_PE); }
                 let r = self.round_constant_rm(r);
                 self.set_st(0, r);
@@ -1449,7 +1449,7 @@ impl Fpu {
                 let r = if x.is_nan() || y.is_nan() {
                     self.nan_result(x, y)
                 } else {
-                    let l = if mn == Fyl2x { xf.log2() } else { (1.0 + xf).ln() / std::f64::consts::LN_2 };
+                    let l = if mn == Fyl2x { libm::log2(xf) } else { libm::log(1.0 + xf) / std::f64::consts::LN_2 };
                     if mn == Fyl2x && xf < 0.0 || mn == Fyl2xp1 && xf < -1.0 { self.raise(SW_IE); Self::indefinite() }
                     else if mn == Fyl2x && xf == 0.0 { self.raise(SW_ZE); if yf == 0.0 { self.raise(SW_IE); Self::indefinite() } else { from_f64(if yf > 0.0 { f64::NEG_INFINITY } else { f64::INFINITY }) } }
                     else { from_f64(yf * l) }
@@ -1461,7 +1461,7 @@ impl Fpu {
             }
             Fpatan => {
                 // ST(1) = atan(ST(1) / ST(0)); pop
-                let r = if x.is_nan() || y.is_nan() { self.nan_result(x, y) } else { from_f64(yf.atan2(xf)) };
+                let r = if x.is_nan() || y.is_nan() { self.nan_result(x, y) } else { from_f64(libm::atan2(yf, xf)) };
                 if !r.is_nan() { self.raise(SW_PE); }
                 let r = self.round_constant_rm(r);
                 self.set_st(1, r);

@@ -57,6 +57,38 @@ pub trait Vfs {
     }
 }
 
+/// Directories every Windows system has (relative to `C:\\game`, drive roots below it).
+pub const STANDARD_DIRS: &[&str] = &[
+    "C",
+    "C\\Temp",
+    "C\\Windows",
+    "C\\Windows\\system32",
+    "C\\Windows\\Fonts",
+    "C\\ProgramData",
+    "C\\Program Files",
+    "C\\Program Files\\Common Files",
+    "C\\Users",
+    "C\\Users\\player",
+    "C\\Users\\player\\Desktop",
+    "C\\Users\\player\\Documents",
+    "C\\Users\\player\\Music",
+    "C\\Users\\player\\Pictures",
+    "C\\Users\\player\\Videos",
+    "C\\Users\\player\\AppData",
+    "C\\Users\\player\\AppData\\Roaming",
+    "C\\Users\\player\\AppData\\Local",
+    "C\\Users\\player\\AppData\\Local\\Temp",
+];
+
+/// Creates the standard directories that are missing.
+pub fn add_standard_dirs(fs: &mut dyn Vfs) {
+    for d in STANDARD_DIRS {
+        if !fs.exists(d) {
+            fs.mkdir(d);
+        }
+    }
+}
+
 pub fn parent(path: &str) -> &str {
     path.rsplit_once('\\').map(|(d, _)| d).unwrap_or("")
 }
@@ -200,7 +232,7 @@ impl Vfs for DirFs {
     }
 
     fn mkdir(&mut self, path: &str) -> bool {
-        if self.exists(path) {
+        if self.exists(path) || (path.contains('\\') && !self.is_dir(parent(path))) {
             return false;
         }
         let p = self.write_path(path);
@@ -262,9 +294,15 @@ impl MemFs {
 
     /// Adds a file (and its parent directories), e.g. from the game's download.
     pub fn insert(&mut self, path: &str, data: Vec<u8>) {
+        let now = self.now;
+        self.insert_with_time(path, data, now);
+    }
+
+    /// Adds a file with a given last-write time (FILETIME).
+    pub fn insert_with_time(&mut self, path: &str, data: Vec<u8>, mtime: u64) {
         self.ensure_parents(path);
         let name = path.rsplit('\\').next().unwrap_or(path).to_string();
-        self.nodes.insert(path.to_lowercase(), Node { name, is_dir: false, data, mtime: self.now });
+        self.nodes.insert(path.to_lowercase(), Node { name, is_dir: false, data, mtime });
     }
 
     fn ensure_parents(&mut self, path: &str) {

@@ -108,6 +108,9 @@ enum Cmd {
         /// Keep files the game wrote in earlier runs.
         #[arg(long)]
         keep_writes: bool,
+        /// Write the guest memory image to this file at the end.
+        #[arg(long)]
+        dump_mem: Option<PathBuf>,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -152,7 +155,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes } => {
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem } => {
             let dump = dump
                 .iter()
                 .map(|d| {
@@ -160,7 +163,7 @@ fn main() -> Result<()> {
                     Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes })
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

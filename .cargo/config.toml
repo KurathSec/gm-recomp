@@ -1,0 +1,3 @@
+# The browser runtime (crates/web) shares its function table with translated modules.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=--growable-table"]
