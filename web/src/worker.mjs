@@ -51,7 +51,11 @@ self.onmessage = async ({ data }) => {
       early.splice(0).forEach(handleInput);
     };
     const onResize = (w, h) => self.postMessage({ type: 'size', w, h });
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, onFrame, onReady, onResize });
+    // One second of 48 kHz stereo; the page plays it once the user allows audio.
+    const ringFrames = 48000;
+    const audioRing = { sab: new SharedArrayBuffer(8 + ringFrames * 8), frames: ringFrames };
+    self.postMessage({ type: 'audio', sab: audioRing.sab, frames: ringFrames, rate: 48000 });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, onFrame, onReady, onResize, audioRing });
     self.postMessage({ type: 'done', status });
   } catch (e) {
     post(`error: ${e && e.stack ? e.stack : e}`);

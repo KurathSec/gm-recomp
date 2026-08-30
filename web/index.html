@@ -17,7 +17,7 @@
     <canvas id="screen" width="640" height="480"></canvas>
     <div id="log"></div>
     <script type="module">
-      // ?game=<slug>&frames=N[&epoch=S][&report=1][&capture=30,60][&nopace=1][&script=100:Enter:1,105:Enter:0]
+      // ?game=<slug>&frames=N[&epoch=S][&report=1][&capture=30,60][&nopace=1][&script=100:Enter:1,105:Enter:0][&audio=1]
       const q = new URLSearchParams(location.search);
       const game = q.get('game') ?? 'not-another-needle-game-1-12';
       const frames = Number(q.get('frames') ?? 0);
@@ -32,6 +32,37 @@
         return [Number(p[0]), p[1], p[2] === '1'];
       });
       let gameW = 640, gameH = 480;
+      // Sound starts with the first user gesture (browser autoplay rules).
+      // audio=1 starts it without one (for tests, with autoplay allowed).
+      let audio = null;
+      let audioStarted = false;
+      let audioNode = null;
+      const startAudio = async () => {
+        if (audioStarted || !audio) return;
+        audioStarted = true;
+        try {
+          const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 'interactive' });
+          await ctx.audioWorklet.addModule('src/audio-worklet.js');
+          const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames } });
+          node.connect(ctx.destination);
+          audioNode = node;
+          // Skip what piled up before the user enabled sound.
+          const idx = new Int32Array(audio.sab, 0, 2);
+          Atomics.store(idx, 1, Atomics.load(idx, 0));
+        } catch (e) {
+          audioStarted = false;
+          send('/log', `audio failed: ${e}`);
+        }
+      };
+      for (const t of ['pointerdown', 'keydown']) window.addEventListener(t, startAudio);
+      const audioStats = () => !audioNode ? Promise.resolve(audioStarted ? 'audio: not running' : null) : new Promise((res) => {
+        audioNode.port.onmessage = ({ data: a }) => {
+          const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
+          const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
+          res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
+        };
+        audioNode.port.postMessage(0);
+      });
       const logEl = document.getElementById('log');
       const screen = document.getElementById('screen');
       const statusEl = document.getElementById('status');
@@ -42,6 +73,9 @@
         if (data.type === 'log') {
           logEl.textContent += data.line + '\n';
           send('/log', data.line);
+        } else if (data.type === 'audio') {
+          audio = data;
+          if (q.has('audio')) startAudio();
         } else if (data.type === 'size') {
           [gameW, gameH] = [data.w, data.h];
           screen.style.width = `${data.w}px`;
@@ -49,7 +83,10 @@
           if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
         } else if (data.type === 'done') {
           statusEl.textContent = `finished (status ${data.status})`;
-          send('/done', `status ${data.status}`);
+          audioStats().then((a) => {
+            if (a) send('/log', a);
+            send('/done', `status ${data.status}`);
+          });
         }
       };
       w.onerror = (e) => {

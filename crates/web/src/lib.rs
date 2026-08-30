@@ -36,6 +36,21 @@ unsafe extern "C" {
     fn gpu_present(clock_ms: f64, x: i32, y: i32, w: i32, h: i32, dst_w: u32, dst_h: u32);
 }
 
+#[link(wasm_import_module = "audio")]
+unsafe extern "C" {
+    /// Interleaved stereo f32 frames at `rate`.
+    fn audio_push(samples: *const f32, len: usize, rate: u32);
+}
+
+/// The audio ring in web/src/host.mjs.
+struct WebAudio;
+
+impl runtime::hle::audio::AudioSink for WebAudio {
+    fn push(&mut self, samples: &[f32], rate: u32) {
+        unsafe { audio_push(samples.as_ptr(), samples.len(), rate) }
+    }
+}
+
 /// The WebGL2 renderer in web/src/gpu.mjs.
 struct WebGpu;
 
@@ -382,6 +397,7 @@ pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace
     p.epoch_unix = epoch_unix as u64;
     if render != 0 {
         p.gpu = Box::new(WebGpu);
+        p.audio = Box::new(WebAudio);
     }
     let mut e = Engine::new(p);
     e.trace = trace != 0;

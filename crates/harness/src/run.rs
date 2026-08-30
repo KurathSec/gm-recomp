@@ -40,6 +40,8 @@ pub struct RunOpts {
     pub keys: Vec<(u64, u8, bool)>,
     /// Scripted mouse state: (after frame, x, y, buttons).
     pub mouse: Vec<(u64, i32, i32, u32)>,
+    /// Write the mixed sound output to this WAV file.
+    pub audio_out: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +215,9 @@ pub fn run(opts: RunOpts) -> Result<()> {
     process.frame_limit = opts.frames;
     // A fixed date keeps runs reproducible.
     process.epoch_unix = 1_767_225_600;
+    if let Some(path) = &opts.audio_out {
+        process.audio = Box::new(runtime::hle::audio::WavSink { path: path.clone(), samples: Vec::new(), rate: runtime::hle::audio::RATE });
+    }
     let mut eng = Engine::new(process);
     eng.trace = opts.trace;
     eng.max_api_calls = opts.max_api_calls;

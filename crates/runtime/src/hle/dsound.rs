@@ -38,25 +38,23 @@ fn read_format(c: &Ctx, p: u32) -> (u16, u16, u32, u16, u16) {
     (tag, ch, rate, align, bits)
 }
 
-/// Advances a buffer's play cursor to the current virtual time.
-pub fn update_buffer(b: &mut SoundBuffer, now_us: u64) {
-    if !b.playing || b.primary {
-        b.last_us = now_us;
-        return;
-    }
-    let bytes_per_sec = b.freq as u64 * b.block_align.max(1) as u64;
-    let elapsed = now_us.saturating_sub(b.last_us);
-    // Carry the fractional byte so the cursor does not drift.
-    let total = b.frac + elapsed * bytes_per_sec;
-    let adv = total / 1_000_000;
-    b.frac = total % 1_000_000;
+/// Advances a buffer's play cursor to `now_us`, mixing the samples it passes into
+/// `mixer`, and records the notification events it crossed.
+pub fn update_buffer(b: &mut SoundBuffer, now_us: u64, mem: &dyn Guest, mixer: &mut super::audio::Mixer) {
+    let t0 = b.last_us;
     b.last_us = now_us;
-    let adv = adv - adv % b.block_align.max(1) as u64;
-    if adv == 0 || b.size == 0 {
+    if !b.playing || b.primary || b.size == 0 || now_us <= t0 {
         return;
     }
-    let old = b.play as u64;
-    let np = old + adv;
+    let align = b.block_align.max(1) as u64;
+    let frames = b.size as u64 / align;
+    if frames == 0 {
+        return;
+    }
+    let start = b.cursor;
+    super::audio::mix(mixer, mem, b, start, t0, now_us);
+    let end = start + (now_us - t0) as f64 * b.freq as f64 / 1e6;
+    let (old, np) = (start.floor() as u64 * align, end.floor() as u64 * align);
     // Notification positions crossed in (old, np].
     for &(pos, ev) in &b.notify {
         let crossed = if pos == 0xFFFF_FFFF {
@@ -70,28 +68,41 @@ pub fn update_buffer(b: &mut SoundBuffer, now_us: u64) {
         }
     }
     if b.looping {
-        b.play = (np % b.size as u64) as u32;
-    } else if np >= b.size as u64 {
-        b.play = 0;
+        b.cursor = end % frames as f64;
+    } else if end >= frames as f64 {
+        b.cursor = 0.0;
         b.playing = false;
     } else {
-        b.play = np as u32;
+        b.cursor = end;
     }
+    b.play = (b.cursor.floor() as u64 * align) as u32;
 }
 
-/// Brings every buffer to the current time and signals the notification events
-/// they crossed.
+/// Brings every buffer to the current time (mixing what they played) and signals the
+/// notification events they crossed.
 pub fn tick(c: &mut Ctx) {
     let now = c.p.clock_us;
     let mut fired = Vec::new();
-    for b in c.p.sound_buffers.values_mut() {
-        update_buffer(b, now);
+    let p = &mut *c.p;
+    for b in p.sound_buffers.values_mut() {
+        update_buffer(b, now, &*c.host, &mut p.mixer);
         fired.append(&mut b.fired);
     }
     for ev in fired {
         if let Some(Handle::Event { signaled, .. }) = c.p.handles.get_mut(&ev) {
             *signaled = true;
         }
+    }
+}
+
+/// Hands the finished part of the mix to the host (called at each Present).
+pub fn flush_audio(c: &mut Ctx) {
+    tick(c);
+    let now = c.p.clock_us;
+    let out = c.p.mixer.drain(now);
+    if !out.is_empty() {
+        let rate = c.p.mixer.rate;
+        c.p.audio.push(&out, rate);
     }
 }
 
@@ -136,7 +147,7 @@ fn ds_create_buffer(c: &mut Ctx) -> ApiResult {
             playing: false,
             looping: false,
             last_us: c.p.clock_us,
-            frac: 0,
+            cursor: 0.0,
             notify: Vec::new(),
             fired: Vec::new(),
         },
@@ -163,6 +174,7 @@ fn ds_duplicate(c: &mut Ctx) -> ApiResult {
     let Some(mut b) = c.p.sound_buffers.get(&base).cloned() else { return ret(c, DSERR_INVALIDPARAM) };
     b.playing = false;
     b.play = 0;
+    b.cursor = 0.0;
     b.notify.clear();
     let obj = com::create(c, "DirectSoundBuffer", &BUFFER_CLASS, HashMap::new());
     c.p.sound_buffers.insert(obj, b);
@@ -175,8 +187,9 @@ fn ds_duplicate(c: &mut Ctx) -> ApiResult {
 fn with_buffer<T>(c: &mut Ctx, f: impl FnOnce(&mut SoundBuffer) -> T) -> Option<T> {
     let id = buffer_id(c)?;
     let now = c.p.clock_us;
-    let b = c.p.sound_buffers.get_mut(&id)?;
-    update_buffer(b, now);
+    let p = &mut *c.p;
+    let b = p.sound_buffers.get_mut(&id)?;
+    update_buffer(b, now, &*c.host, &mut p.mixer);
     Some(f(b))
 }
 
@@ -269,7 +282,7 @@ fn buf_set_position(c: &mut Ctx) -> ApiResult {
     let pos = c.arg(1);
     let Some(()) = with_buffer(c, |b| {
         b.play = if b.size == 0 { 0 } else { pos.min(b.size - 1) };
-        b.frac = 0;
+        b.cursor = (b.play / b.block_align.max(1) as u32) as f64;
     }) else {
         return ret(c, DSERR_INVALIDCALL);
     };

@@ -13,8 +13,10 @@ server=$!
 sleep 1
 url="http://127.0.0.1:$port/?$query&report=1"
 case $browser in
-  chrome) flatpak run com.google.Chrome --headless=new --user-data-dir="$tmp/profile" --no-first-run "$url" > "$tmp/browser.log" 2>&1 & ;;
-  firefox) firefox --headless --no-remote --profile "$tmp" "$url" > "$tmp/browser.log" 2>&1 & ;;
+  chrome) flatpak run com.google.Chrome --headless=new --user-data-dir="$tmp/profile" --no-first-run --autoplay-policy=no-user-gesture-required "$url" > "$tmp/browser.log" 2>&1 & ;;
+  firefox)
+    echo 'user_pref("media.autoplay.default", 0); user_pref("media.autoplay.blocking_policy", 0);' > "$tmp/user.js"
+    firefox --headless --no-remote --profile "$tmp" "$url" > "$tmp/browser.log" 2>&1 & ;;
 esac
 browser_pid=$!
 wait $server || true

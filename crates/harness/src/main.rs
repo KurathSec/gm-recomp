@@ -117,6 +117,9 @@ enum Cmd {
         /// Scripted mouse state after a frame: frame:x:y:buttons, repeatable.
         #[arg(long)]
         mouse: Vec<String>,
+        /// Write the game's sound output to this WAV file.
+        #[arg(long)]
+        audio_out: Option<PathBuf>,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -161,7 +164,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, key, mouse } => {
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, key, mouse, audio_out } => {
             let mouse = mouse
                 .iter()
                 .map(|k| {
@@ -185,7 +188,7 @@ fn main() -> Result<()> {
                     Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, keys, mouse })
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, keys, mouse, audio_out })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

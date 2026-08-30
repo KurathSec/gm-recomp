@@ -2,6 +2,7 @@
 //! stdcall arguments from the guest stack and returns the value for EAX plus how
 //! many argument bytes the callee pops.
 
+pub mod audio;
 pub mod com;
 pub mod d3d8;
 pub mod dsound;

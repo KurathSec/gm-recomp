@@ -23,8 +23,9 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(input: {key: Function, mouse: Function}) => void} [o.onReady]  input entry points,
  *   usable while the guest is suspended in Present
  * @param {(w: number, h: number) => void} [o.onResize]  the shown frame changed size
+ * @param {{sab: SharedArrayBuffer, frames: number}} [o.audioRing]  where the sound mix goes
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize, audioRing }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -105,7 +106,28 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
   };
 
-  ({ instance: rt } = await WebAssembly.instantiate(runtimeBytes, { host, gpu: gpuImports }));
+  // Sound: the runtime pushes finished mix samples; they go into the ring the page's
+  // AudioWorklet plays (dropped when the ring is full, e.g. before audio started).
+  const ring = audioRing && { idx: new Int32Array(audioRing.sab, 0, 2), data: new Float32Array(audioRing.sab, 8, audioRing.frames * 2), frames: audioRing.frames };
+  const audioImports = {
+    audio_push(ptr, len) {
+      if (!ring) return;
+      const src = new Float32Array(rt.exports.memory.buffer, ptr, len);
+      const n = len >> 1;
+      const w = Atomics.load(ring.idx, 0);
+      const rd = Atomics.load(ring.idx, 1);
+      const free = ring.frames - (w - rd);
+      const take = Math.min(n, free);
+      for (let i = 0; i < take; i++) {
+        const k = ((w + i) % ring.frames) * 2;
+        ring.data[k] = src[2 * i];
+        ring.data[k + 1] = src[2 * i + 1];
+      }
+      Atomics.store(ring.idx, 0, w + take);
+    },
+  };
+
+  ({ instance: rt } = await WebAssembly.instantiate(runtimeBytes, { host, gpu: gpuImports, audio: audioImports }));
   const x = rt.exports;
   table = x.__indirect_function_table;
 

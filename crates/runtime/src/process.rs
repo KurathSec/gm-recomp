@@ -192,7 +192,8 @@ pub struct SoundBuffer {
     pub looping: bool,
     /// Virtual time the cursor was last advanced to.
     pub last_us: u64,
-    pub frac: u64,
+    /// Play position in frames (fractional).
+    pub cursor: f64,
     /// (offset or DSBPN_OFFSETSTOP, event handle)
     pub notify: Vec<(u32, u32)>,
     pub fired: Vec<u32>,
@@ -251,6 +252,9 @@ pub struct Process {
     pub d3d: crate::hle::gpu::DeviceState,
     pub gpu: Box<dyn crate::hle::gpu::Gpu>,
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
+    /// The sound mix and where finished samples go.
+    pub mixer: crate::hle::audio::Mixer,
+    pub audio: Box<dyn crate::hle::audio::AudioSink>,
     /// MCI devices: id -> (mode, element), and devices opened by name/alias.
     pub mci: BTreeMap<u32, (u32, String)>,
     pub mci_named: BTreeMap<String, u32>,
@@ -345,6 +349,8 @@ impl Process {
             d3d: Default::default(),
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
+            mixer: Default::default(),
+            audio: Box::new(crate::hle::audio::NullSink),
             mci: BTreeMap::new(),
             mci_named: BTreeMap::new(),
             next_mci: 0,
