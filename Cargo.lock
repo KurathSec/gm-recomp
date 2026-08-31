@@ -1185,6 +1185,7 @@ dependencies = [
 name = "recomp"
 version = "0.1.0"
 dependencies = [
+ "fpu",
  "iced-x86",
  "pe",
  "wasm-encoder 0.262.0",
