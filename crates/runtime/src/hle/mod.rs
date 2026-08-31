@@ -5,10 +5,12 @@
 pub mod audio;
 pub mod com;
 pub mod d3d8;
+pub mod dmusic;
 pub mod dsound;
 pub mod gpu;
 pub mod gdi32;
 pub mod kernel32;
+pub mod mci;
 pub mod misc;
 pub mod msvcrt;
 pub mod nls;
@@ -186,6 +188,7 @@ impl Registry {
         misc::register(&mut r);
         d3d8::register(&mut r);
         com::register(&mut r);
+        dmusic::register(&mut r);
         msvcrt::register(&mut r);
         dsound::register(&mut r);
         kernel32::register_more(&mut r);

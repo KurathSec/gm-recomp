@@ -93,6 +93,8 @@ pub fn tick(c: &mut Ctx) {
             *signaled = true;
         }
     }
+    super::dmusic::tick(c);
+    super::mci::tick(c);
 }
 
 /// Hands the finished part of the mix to the host (called at each Present).

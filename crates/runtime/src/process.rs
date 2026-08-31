@@ -254,10 +254,18 @@ pub struct Process {
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
     /// The sound mix and where finished samples go.
     pub mixer: crate::hle::audio::Mixer,
+    /// DirectMusic: loaded sounds, playing segments, master volume (mB), default path,
+    /// loader search directories.
+    pub dm_sounds: Vec<crate::hle::dmusic::DmSound>,
+    pub dm_voices: Vec<crate::hle::dmusic::DmVoice>,
+    pub dm_master_volume: i32,
+    pub dm_default_path: u32,
+    pub dm_search_dirs: HashMap<u32, String>,
     pub audio: Box<dyn crate::hle::audio::AudioSink>,
     /// MCI devices: id -> (mode, element), and devices opened by name/alias.
-    pub mci: BTreeMap<u32, (u32, String)>,
-    pub mci_named: BTreeMap<String, u32>,
+    pub mci: crate::hle::mci::Devices,
+    /// Decoded MCI media by file, kept for reopening.
+    pub mci_media: HashMap<String, std::rc::Rc<crate::hle::mci::Media>>,
     pub next_mci: u32,
     /// COM interface name -> vtable address in guest memory.
     pub com_vtables: HashMap<&'static str, u32>,
@@ -352,9 +360,14 @@ impl Process {
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
             mixer: Default::default(),
+            dm_sounds: Vec::new(),
+            dm_voices: Vec::new(),
+            dm_master_volume: 0,
+            dm_default_path: 0,
+            dm_search_dirs: HashMap::new(),
             audio: Box::new(crate::hle::audio::NullSink),
             mci: BTreeMap::new(),
-            mci_named: BTreeMap::new(),
+            mci_media: HashMap::new(),
             next_mci: 0,
             com_vtables: HashMap::new(),
             com_ifaces: HashMap::new(),

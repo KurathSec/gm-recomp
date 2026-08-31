@@ -12,3 +12,4 @@ recomp = { version = "0.1.0", path = "../recomp" }
 wasm-encoder = "0.262.0"
 pe = { version = "0.1.0", path = "../pe" }
 x86 = { version = "0.1.0", path = "../x86" }
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }

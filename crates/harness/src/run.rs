@@ -383,7 +383,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         let notable: Vec<&String> = p
             .log
             .iter()
-            .filter(|l| l.starts_with('[') || l.starts_with("exception") || l.starts_with("MessageBox") || l.contains("not implemented") || l.contains("not registered"))
+            .filter(|l| l.starts_with('[') || l.starts_with("exception") || l.starts_with("MessageBox") || l.starts_with("MCI") || l.starts_with("DirectMusic") || l.contains("not implemented") || l.contains("not registered"))
             .collect();
         if !notable.is_empty() && !opts.trace {
             eprintln!("---- notable log lines ({}) ----", notable.len());

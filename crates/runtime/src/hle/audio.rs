@@ -78,11 +78,33 @@ fn frame(mem: &dyn Guest, b: &SoundBuffer, i: u64, frames: u64) -> (f32, f32) {
     }
 }
 
-/// Mixes what `b` plays between `t0` and `t1` (µs), starting at source frame `start`.
-/// Returns false when a non-looping buffer ran past its end.
+/// Something that plays: `frames` stereo frames at `freq` Hz read through `frame`.
+pub struct Source<'a> {
+    pub frame: &'a dyn Fn(u64) -> (f32, f32),
+    pub frames: u64,
+    pub freq: u32,
+    pub looping: bool,
+    /// Hundredths of a decibel, and DirectSound pan.
+    pub volume: i32,
+    pub pan: i32,
+}
+
+/// Mixes what a DirectSound buffer plays between `t0` and `t1` (µs), starting at
+/// source frame `start`.
 pub fn mix(mixer: &mut Mixer, mem: &dyn Guest, b: &SoundBuffer, start: f64, t0: u64, t1: u64) {
     let frames = (b.size / b.block_align.max(1) as u32) as u64;
     if frames == 0 || b.format_tag != 1 || !(b.bits == 8 || b.bits == 16) {
+        return;
+    }
+    let read = |i: u64| frame(mem, b, i, frames);
+    mix_source(mixer, &Source { frame: &read, frames, freq: b.freq, looping: b.looping, volume: b.volume, pan: b.pan }, start, t0, t1);
+}
+
+/// Mixes what `src` plays between `t0` and `t1` (µs), starting at source frame `start`
+/// (fractional; negative = not yet started).
+pub fn mix_source(mixer: &mut Mixer, src: &Source, start: f64, t0: u64, t1: u64) {
+    let frames = src.frames;
+    if frames == 0 {
         return;
     }
     let (k0, k1) = (mixer.frame_at(t0).max(mixer.base), mixer.frame_at(t1));
@@ -93,25 +115,26 @@ pub fn mix(mixer: &mut Mixer, mem: &dyn Guest, b: &SoundBuffer, start: f64, t0: 
     if mixer.buf.len() < need {
         mixer.buf.resize(need, 0.0);
     }
-    let (gl, gr) = gains(b.volume, b.pan);
+    let (gl, gr) = gains(src.volume, src.pan);
     if gl == 0.0 && gr == 0.0 {
         return;
     }
-    let step = b.freq as f64 / mixer.rate as f64;
+    let step = src.freq as f64 / mixer.rate as f64;
     // Source position of output frame k0.
-    let mut pos = start + (k0 as f64 * 1e6 / mixer.rate as f64 - t0 as f64) * b.freq as f64 / 1e6;
+    let mut pos = start + (k0 as f64 * 1e6 / mixer.rate as f64 - t0 as f64) * src.freq as f64 / 1e6;
     for k in k0..k1 {
         if pos < 0.0 {
             pos += step;
             continue;
         }
-        if !b.looping && pos >= frames as f64 {
+        if !src.looping && pos >= frames as f64 {
             break;
         }
         let i = pos.floor();
         let f = (pos - i) as f32;
-        let (l0, r0) = frame(mem, b, i as u64, frames);
-        let (l1, r1) = if b.looping || (i as u64) + 1 < frames { frame(mem, b, i as u64 + 1, frames) } else { (l0, r0) };
+        let i = i as u64 % frames;
+        let (l0, r0) = (src.frame)(i);
+        let (l1, r1) = if src.looping || i + 1 < frames { (src.frame)((i + 1) % frames) } else { (l0, r0) };
         let o = 2 * (k - mixer.base) as usize;
         mixer.buf[o] += (l0 + (l1 - l0) * f) * gl;
         mixer.buf[o + 1] += (r0 + (r1 - r0) * f) * gr;
@@ -160,4 +183,80 @@ impl Drop for WavSink {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.path, self.bytes());
     }
+}
+
+/// Decoded sound: interleaved stereo frames at `rate` Hz.
+#[derive(Clone, Default)]
+pub struct Pcm {
+    pub samples: Vec<f32>,
+    pub rate: u32,
+}
+
+impl Pcm {
+    pub fn frames(&self) -> u64 {
+        (self.samples.len() / 2) as u64
+    }
+
+    pub fn frame(&self, i: u64) -> (f32, f32) {
+        let k = 2 * i as usize;
+        match self.samples.get(k..k + 2) {
+            Some(s) => (s[0], s[1]),
+            None => (0.0, 0.0),
+        }
+    }
+}
+
+/// Decodes a RIFF WAVE file with PCM (8/16/24/32-bit) or IEEE float samples.
+pub fn parse_wav(b: &[u8]) -> Result<Pcm, String> {
+    if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return Err("not a RIFF WAVE file".into());
+    }
+    let (mut fmt, mut data) = (None, None);
+    let mut p = 12;
+    while p + 8 <= b.len() {
+        let id = &b[p..p + 4];
+        let len = u32::from_le_bytes(b[p + 4..p + 8].try_into().unwrap()) as usize;
+        let body = &b[p + 8..(p + 8 + len).min(b.len())];
+        match id {
+            b"fmt " => fmt = Some(body),
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        p += 8 + len + (len & 1);
+    }
+    let fmt = fmt.ok_or("no fmt chunk")?;
+    let data = data.ok_or("no data chunk")?;
+    if fmt.len() < 16 {
+        return Err("short fmt chunk".into());
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([fmt[o], fmt[o + 1]]);
+    let mut tag = u16_at(0);
+    let channels = u16_at(2).max(1) as usize;
+    let rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
+    let bits = u16_at(14) as usize;
+    if tag == 0xFFFE && fmt.len() >= 26 {
+        tag = u16_at(24); // WAVE_FORMAT_EXTENSIBLE: the subformat GUID starts with the tag
+    }
+    let bytes = bits.div_ceil(8);
+    if !(tag == 1 && matches!(bits, 8 | 16 | 24 | 32) || tag == 3 && bits == 32) {
+        return Err(format!("unsupported wave format {tag} with {bits} bits"));
+    }
+    let sample = |s: &[u8]| -> f32 {
+        match (tag, bits) {
+            (1, 8) => (s[0] as f32 - 128.0) / 128.0,
+            (1, 16) => i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0,
+            (1, 24) => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32 / 8_388_608.0,
+            (1, _) => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f32 / 2_147_483_648.0,
+            _ => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        }
+    };
+    let frame_len = bytes * channels;
+    let mut samples = Vec::with_capacity(data.len() / frame_len * 2);
+    for f in data.chunks_exact(frame_len) {
+        let l = sample(&f[..bytes]);
+        let r = if channels >= 2 { sample(&f[bytes..2 * bytes]) } else { l };
+        samples.push(l);
+        samples.push(r);
+    }
+    Ok(Pcm { samples, rate })
 }

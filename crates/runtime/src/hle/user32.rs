@@ -1378,6 +1378,11 @@ fn key_char(ks: &[u8; 256], vk: u8) -> Option<u32> {
     Some(ch as u32)
 }
 
+/// Queues a message for `hwnd` (PostMessage).
+pub(crate) fn post(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) {
+    post_message(c, hwnd, msg, wp, lp);
+}
+
 fn post_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) {
     let t = c.p.now_ms();
     c.p.messages.push_back(Msg { hwnd, msg, wparam: wp, lparam: lp, time: t, pt: (0, 0) });
