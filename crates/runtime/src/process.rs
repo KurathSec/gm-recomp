@@ -296,6 +296,8 @@ impl Process {
         let mut vm = Vm::new();
         vm.alloc(STUB_BASE, 0x0010_0000, true, PAGE_READWRITE, false, "hle stubs");
         vm.alloc(RET_TO_HOST, 0x1000, true, PAGE_READWRITE, false, "host return");
+        // The page below each TEB holds the thread's x87 state (fpu::block).
+        vm.alloc(TEB_BASE - 0x1000, 0x1000, true, PAGE_READWRITE, false, "thread state");
         vm.alloc(TEB_BASE, 0x1000, true, PAGE_READWRITE, false, "teb");
         vm.alloc(PEB_BASE, 0x1000, true, PAGE_READWRITE, false, "peb");
         vm.alloc(STACK_BASE, STACK_SIZE, true, PAGE_READWRITE, false, "stack");
@@ -476,10 +478,13 @@ impl Process {
 
     /// Lays out the main thread: TEB, PEB, stack, process heap, command line in guest memory.
     pub fn setup_main_thread(&mut self, mem: &mut dyn Guest, image_base: u32) -> Result<(u32, u32), String> {
-        for (base, size) in [(TEB_BASE, 0x1000u32), (PEB_BASE, 0x1000), (STACK_BASE, STACK_SIZE), (RET_TO_HOST, 0x1000), (STUB_BASE, 0x0010_0000)] {
+        for (base, size) in [(TEB_BASE - 0x1000, 0x1000u32), (TEB_BASE, 0x1000), (PEB_BASE, 0x1000), (STACK_BASE, STACK_SIZE), (RET_TO_HOST, 0x1000), (STUB_BASE, 0x0010_0000)] {
             mem.ensure_mapped(base, size).map_err(|e| e.to_string())?;
         }
         let stack_top = STACK_BASE + STACK_SIZE;
+        let mut fpu_state = [0u8; fpu::block::SIZE];
+        fpu::Fpu::new().to_block(&mut fpu_state);
+        mem.write(TEB_BASE - fpu::block::OFFSET, &fpu_state).map_err(|e| e.to_string())?;
         // TEB
         let w = |mem: &mut dyn Guest, off: u32, v: u32| mem.write_u32(TEB_BASE + off, v).map_err(|e| e.to_string());
         w(mem, 0x00, 0xFFFF_FFFF)?; // NtTib.ExceptionList

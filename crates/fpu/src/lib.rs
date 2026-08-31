@@ -11,6 +11,8 @@ use rustc_apfloat::ieee::{Double, IeeeFloat, Semantics, Single, X87DoubleExtende
 use rustc_apfloat::{Float, FloatConvert, Round, Status};
 use std::cmp::Ordering;
 
+pub mod block;
+
 pub type Ext = X87DoubleExtended;
 
 /// 53-bit significand with the 15-bit exponent range: x87 precision control = double.
@@ -432,6 +434,11 @@ impl Fpu {
             self.clear_c1();
             return None;
         }
+        let bits = self.st_bits(i);
+        if (bits >> 64) & 0x7fff == 0 && bits & ((1u128 << 64) - 1) != 0 {
+            // denormal or pseudo-denormal: DE even where apfloat sees a normal value
+            self.reg_denormal = true;
+        }
         Some(self.st(i))
     }
 
@@ -626,6 +633,10 @@ impl Fpu {
         let rm = round_mode(self.cw);
         match size {
             MemorySize::Float32 => {
+                let (r, _) = narrow::<X87SingleS>(v, rm);
+                if self.store_overflow(v, widen(r), widen(Single::largest())) {
+                    return true;
+                }
                 let (s, f) = narrow::<rustc_apfloat::ieee::SingleS>(v, rm);
                 let s = if v.is_signaling() { self.raise(SW_IE); quiet_single(s) } else { s };
                 self.raise(f);
@@ -633,6 +644,10 @@ impl Fpu {
                 if !self.aborted { m.write(addr, &(s.to_bits() as u32).to_le_bytes()); }
             }
             MemorySize::Float64 => {
+                let (r, _) = narrow::<X87DoubleS>(v, rm);
+                if self.store_overflow(v, widen(r), widen(Double::largest())) {
+                    return true;
+                }
                 let (d, f) = narrow::<rustc_apfloat::ieee::DoubleS>(v, rm);
                 let d = if v.is_signaling() { self.raise(SW_IE); quiet_double(d) } else { d };
                 self.raise(f);
@@ -646,6 +661,25 @@ impl Fpu {
             _ => return false,
         }
         true
+    }
+
+    /// A store whose value, rounded to the target precision, is beyond the target's
+    /// largest finite number overflows in every rounding mode (apfloat only reports
+    /// it when the result becomes infinite). Unmasked, nothing is stored and only OE
+    /// is raised (measured); masked, the caller stores the rounded result with OE|PE.
+    /// Returns true when the store must not happen.
+    fn store_overflow(&mut self, v: Ext, rounded: Ext, largest: Ext) -> bool {
+        if !v.is_finite() || rounded.abs() <= largest {
+            return false;
+        }
+        if self.cw & SW_OE == 0 {
+            self.raise(SW_OE);
+            self.clear_c1();
+            self.aborted = true;
+            return true;
+        }
+        self.raise(SW_OE | SW_PE);
+        false
     }
 
     fn c1_from_store(&mut self, stored: Ext, v: Ext, flags: u16) {

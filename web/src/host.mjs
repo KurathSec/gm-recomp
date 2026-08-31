@@ -32,6 +32,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   let table;
   let cpuImports;
   let rtImports;
+  let x87Imports;
   let modules = 0;
   const mem = () => new Uint8Array(rt.exports.memory.buffer);
 
@@ -90,7 +91,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       try {
         const bytes = mem().slice(ptr, ptr + len);
         const names = dec.decode(mem().subarray(namesPtr, namesPtr + namesLen)).split('\n');
-        const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { cpu: cpuImports, rt: rtImports });
+        const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { cpu: cpuImports, rt: rtImports, x87: x87Imports });
         const base = table.grow(names.length);
         const o = new Uint32Array(rt.exports.memory.buffer, out, names.length);
         names.forEach((n, i) => {
@@ -143,6 +144,10 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     if (!GLUE_FUNCS.includes(name)) cpuImports[name] = v;
   }
   rtImports = { resolve: x.rt_resolve, trap: x.rt_trap, fpu: x.rt_fpu, cpuid: x.rt_cpuid, rdtsc: x.rt_rdtsc };
+
+  // The x87 fast paths translated modules import.
+  const x87Len = x.x87_build();
+  x87Imports = new WebAssembly.Instance(new WebAssembly.Module(mem().slice(x.glue_ptr(), x.glue_ptr() + x87Len)), { cpu: cpuImports }).exports;
 
   // The no-op function `resolve` returns after an API call.
   const nopLen = x.nop_build();

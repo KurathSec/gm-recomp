@@ -30,13 +30,20 @@ impl recomp::Memory for SegMem {
     }
 }
 
+/// Where the test's x87 state block lives (fs_base = FPU_BLOCK + fpu::block::OFFSET),
+/// clear of the data, code and stack windows.
+pub const FPU_BLOCK: u32 = 0x2000_3000;
+
 pub struct Host {
     pub trap: Option<(i32, u32)>,
     pub fpu_calls: u32,
     pub unresolved: Option<u32>,
     /// Guest entry address -> table index, for `resolve`.
     pub funcs: HashMap<u32, u32>,
-    pub fpu: fpu::Fpu,
+}
+
+fn block(mem: &[u8]) -> &[u8] {
+    &mem[FPU_BLOCK as usize..FPU_BLOCK as usize + fpu::block::SIZE]
 }
 
 struct MemView<'a>(&'a mut [u8]);
@@ -57,6 +64,8 @@ impl fpu::Mem for MemView<'_> {
 
 pub struct Runner {
     engine: Engine,
+    /// The x87 fast-path module, compiled once.
+    x87: Module,
 }
 
 pub struct RunResult {
@@ -74,14 +83,17 @@ impl Runner {
         cfg.wasm_simd(true);
         cfg.wasm_bulk_memory(true);
         cfg.wasm_multi_value(true);
-        Ok(Runner { engine: Engine::new(&cfg).map_err(wt)? })
+        let engine = Engine::new(&cfg).map_err(wt)?;
+        let x87 = Module::new(&engine, recomp::x87::module(false)).map_err(wt)?;
+        Ok(Runner { engine, x87 })
     }
 
     pub fn translate(&self, case: &CaseIn, stack_base: u32, entries: &[u32]) -> Result<recomp::Output> {
         let mut code = case.code.clone();
         code.resize(CODE_MAX, 0xF4);
         let mem = SegMem { segs: vec![(DATA_BASE, case.data.clone()), (CODE_BASE, code), (stack_base, case.stack.clone())] };
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: false, ..Default::default() });
+        let no_x87_inline = std::env::var_os("GMR_X87_SLOW").is_some();
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: false, no_x87_inline, ..Default::default() });
         let tables = HashMap::new();
         let entries_owned: Vec<u32> = entries.to_vec();
         let is_fn = move |a: u32| entries_owned.contains(&a);
@@ -104,8 +116,7 @@ impl Runner {
             }
         };
 
-        let mut host = Host { trap: None, fpu_calls: 0, unresolved: None, funcs: HashMap::new(), fpu: fpu::Fpu::new() };
-        host.fpu.read_fxsave(&case.fx);
+        let host = Host { trap: None, fpu_calls: 0, unresolved: None, funcs: HashMap::new() };
         let mut store = Store::new(&self.engine, host);
         let top = (stack_base as u64 + STACK_SIZE as u64).max(CODE_BASE as u64 + CODE_MAX as u64);
         let pages = top.div_ceil(65536) + 1;
@@ -143,13 +154,14 @@ impl Runner {
         let fpu = Func::wrap(&mut store, move |mut caller: Caller<'_, Host>, code: i32, a: i32, b: i32, ip: i32, fop: i32| -> wasmtime::Result<i32> {
             caller.data_mut().fpu_calls += 1;
             let mn = iced_x86::Code::try_from(code as usize).map(|c| c.mnemonic()).unwrap_or(iced_x86::Mnemonic::INVALID);
-            if caller.data().fpu.fault_pending(mn) {
+            let mut f = fpu::Fpu::from_block(block(fpu_mem.data(&caller)));
+            if f.fault_pending(mn) {
                 caller.data_mut().trap = Some((trap::FPU_EXCEPTION, ip as u32));
                 return Err(WtError::msg("x87 exception pending"));
             }
-            let mut f = std::mem::take(&mut caller.data_mut().fpu);
-            let r = f.exec(mn, a as u32, b as u32, ip as u32, fop as u16, &mut MemView(fpu_mem.data_mut(&mut caller)));
-            caller.data_mut().fpu = f;
+            let mem = fpu_mem.data_mut(&mut caller);
+            let r = f.exec(mn, a as u32, b as u32, ip as u32, fop as u16, &mut MemView(mem));
+            f.to_block(&mut mem[FPU_BLOCK as usize..FPU_BLOCK as usize + fpu::block::SIZE]);
             Ok(r)
         });
         let cpuid = Func::wrap(&mut store, |_caller: Caller<'_, Host>| {});
@@ -164,6 +176,8 @@ impl Runner {
             };
             linker.define(&store, abi::RT_MODULE, name, Extern::Func(func)).map_err(wt)?;
         }
+        let x87 = linker.instantiate(&mut store, &self.x87).map_err(wt)?;
+        linker.instance(&mut store, recomp::x87::MODULE, x87).map_err(wt)?;
         let instance = linker.instantiate(&mut store, &module).map_err(wt).context("instantiating generated wasm")?;
         // Every translated function gets a table slot so `call reg` can reach it.
         for (entry, name) in &output.functions {
@@ -178,6 +192,12 @@ impl Runner {
         code.resize(CODE_MAX, 0xF4);
         memory.write(&mut store, CODE_BASE as usize, &code).map_err(|e| anyhow!("{e:?}"))?;
         memory.write(&mut store, stack_base as usize, &case.stack).map_err(|e| anyhow!("{e:?}"))?;
+        let mut f = fpu::Fpu::new();
+        f.read_fxsave(&case.fx);
+        let mut img = [0u8; fpu::block::SIZE];
+        f.to_block(&mut img);
+        memory.write(&mut store, FPU_BLOCK as usize, &img).map_err(|e| anyhow!("{e:?}"))?;
+        globals[abi::Global::FsBase as usize].set(&mut store, Val::I32((FPU_BLOCK + fpu::block::OFFSET) as i32)).map_err(wt)?;
         for r in 0..8 {
             let v = if r == 4 { stack_base + (case.regs[4] & (STACK_SIZE as u32 - 1)) } else { case.regs[r] };
             globals[r].set(&mut store, Val::I32(v as i32)).map_err(wt)?;
@@ -233,7 +253,7 @@ impl Runner {
             | bit(&mut store, abi::Global::Df, 10)
             | bit(&mut store, abi::Global::Of, 11);
         let mut fx = case.fx;
-        store.data().fpu.write_fxsave(&mut fx);
+        fpu::Fpu::from_block(block(memory.data(&store))).write_fxsave(&mut fx);
         fx[24..28].copy_from_slice(&(globals[abi::Global::Mxcsr as usize].get(&mut store).i32().unwrap() as u32).to_le_bytes());
         for x in 0..8 {
             let v = globals[abi::Global::Xmm0 as usize + x].get(&mut store).v128().unwrap().as_u128();

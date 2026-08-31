@@ -16,7 +16,44 @@ Crates: `recomp` (lifter), `fpu` (x87 model), `harness` (tests).
   calls are wasm `call`s (same module) or `call_indirect` through `rt.resolve`; `ret` sets
   `eip` and returns, and each call site checks that `eip` is its continuation (an unwind
   keeps returning until a frame matches). `jmp reg` is a `return_call_indirect`.
-- x87 instructions call `rt.fpu(code, a, b, ip, fop)`; SSE is emitted inline on wasm SIMD.
+- x87 instructions first call a fast path in the shared `x87` module (`recomp::x87`), then
+  `rt.fpu(code, a, b, ip, fop)` when it declines; SSE is emitted inline on wasm SIMD.
+
+## x87 state and the fast paths
+
+The x87 state of each thread lives in guest memory, in a block just below its TEB
+(`fpu::block`, `fs_base - 0x100`): registers that hold a zero, an infinity or a normal
+double are stored as f64, any other value as its 80-bit image; plus TOP, CW, SW, FIP and
+a word saying which fast paths the control word allows. `rt.fpu` loads the block into
+the soft model (`fpu::Fpu`), executes, and stores it back, so the soft model stays the
+reference for everything.
+
+The `x87` module (instantiated once per thread; every translated module imports its
+~110 helpers `f<k>(a, ip) -> i32`) implements the frequent instruction forms directly
+on the f64 registers: loads and stores of every format, fild/fist(p)/fisttp, fxch,
+fchs/fabs, frndint, fld1/fldz, compares (fcom family, fcomi family, ftst), add/sub/mul/
+div in all operand forms, fnstsw/fnstcw/fldcw, ffree/fincstp/fdecstp, wait. A helper
+returns -1 (and has changed nothing) whenever the result might differ from the 80-bit
+unit's, and translated code then calls `rt.fpu`:
+
+- arithmetic needs precision control 53 bits, round-to-nearest and PM masked; with
+  operands that are doubles, an f64 operation then rounds exactly like the x87 does,
+  except where its narrower exponent range shows. Results that are infinite from finite
+  operands, NaN, or at/below 2^-1022 are rejected, as are operands near the limits where
+  the error terms would overflow or underflow.
+- PE and C1 ("rounded up in magnitude") come from the exact rounding error: TwoSum for
+  add/sub, Dekker's product for mul, the exact remainder a - q*b for div.
+- memory operands that are NaNs or denormals, empty source registers, full destination
+  registers and pending unmasked exceptions all fall back.
+- fild m64 of integers wider than 53 bits keeps the exact 80-bit image, and fistp m64
+  stores such an image directly (Delphi copies Int64 values this way).
+
+`cpu-diff --mode x87fast` tests these paths: doubles in registers and memory, 53-bit
+precision, RC mostly nearest, GameMaker's unmasked IE/ZE/OE in 30 % of cases, values
+near every limit the helpers check. `GMR_X87_SLOW=1` turns the fast paths off (harness
+runs and tests); Needle's 300-frame state hash is the same either way, and the fast
+paths take its x87 work through `rt.fpu` from 488 M to 1.3 M instructions (300 frames:
+40 s -> 9.5 s in the harness, 44 s -> 13 s in Chrome).
 - Unsupported instructions become `rt.trap(UNIMPLEMENTED, ip)` and are listed by the
   translator, so a module always translates.
 
@@ -56,6 +93,9 @@ Results at commit time (5000 cases per run, two seeds each): integer `mixed`, `f
 - SSE: `min/max` return the source on NaN or equal zeros; conversions give 0x80000000 for
   NaN/out-of-range; packed shifts saturate on counts ≥ lane width.
 
+x87fast (5000 cases, seeds 1-7): 0-1 failures per run, all in the soft model's handling
+of extended denormals reached through misaligned random `fld m80` reads (see below).
+
 ## Known deviations
 
 - Transcendental x87 instructions (`fsin/fcos/fsincos/fptan/fpatan/fyl2x/fyl2xp1/f2xm1`) are
@@ -63,6 +103,9 @@ Results at commit time (5000 cases per run, two seeds each): integer `mixed`, `f
 - SSE NaN payloads follow wasm (canonical), not the x86 "first operand" rule; MXCSR exception
   flags are not updated; `rcpps/rsqrtps/rcpss/rsqrtss` are not implemented (hardware
   approximations differ between vendors anyway).
+- Soft model corners with extended denormals or reserved precision control (found by
+  `x87fast`, not seen in the corpus): `fsqrt` of an 80-bit denormal is off by 8 exponent
+  bits; one `fidivr` with PC=01 and an operand at the largest exponent misses OE.
 - MMX (`mm` registers), 3DNow!, SSSE3/SSE4 forms are not lifted; they only occur on CPUID-
   guarded paths in the corpus. The runtime's CPUID will not advertise them.
 - `lock` prefixes are ignored (single-threaded until R5).

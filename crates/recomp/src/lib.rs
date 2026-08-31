@@ -5,6 +5,7 @@ pub mod cfg;
 pub mod flags;
 pub mod lift;
 pub mod sse;
+pub mod x87;
 
 use abi::{GLOBALS, RT_FUNCS, types};
 use cfg::{Cfg, FuncInfo, GuestMem};
@@ -22,6 +23,8 @@ pub struct Options {
     pub shared_memory: bool,
     /// Function entries that report to the runtime when reached (debugging).
     pub probes: Vec<u32>,
+    /// Send every x87 instruction through `rt.fpu` (to check the inline paths).
+    pub no_x87_inline: bool,
 }
 
 pub struct Translator<'m> {
@@ -54,7 +57,8 @@ impl<'m> Translator<'m> {
     }
 
     pub fn finish(mut self) -> Output {
-        let n_rt = RT_FUNCS.len() as u32;
+        // Imported functions: the runtime services, then every x87 fast path.
+        let n_rt = (RT_FUNCS.len() + x87::FORMS.len()) as u32;
         let func_index: HashMap<u32, u32> = self.cfgs.keys().enumerate().map(|(i, &e)| (e, n_rt + i as u32)).collect();
 
         let mut types = TypeSection::new();
@@ -63,6 +67,8 @@ impl<'m> Translator<'m> {
         types.ty().function([ValType::I32, ValType::I32], []); // TRAP
         types.ty().function([ValType::I32; 5], [ValType::I32]); // FPU
         debug_assert_eq!(types::FPU, 3);
+        let (p, r) = x87::form_type();
+        types.ty().function(p, r); // X87
 
         let mut imports = ImportSection::new();
         imports.import(
@@ -93,6 +99,9 @@ impl<'m> Translator<'m> {
             };
             imports.import(abi::RT_MODULE, name, EntityType::Function(ty));
         }
+        for k in 0..x87::FORMS.len() {
+            imports.import(x87::MODULE, &x87::export_name(k), EntityType::Function(types::X87));
+        }
 
         let mut functions = FunctionSection::new();
         let mut exports = ExportSection::new();
@@ -101,6 +110,7 @@ impl<'m> Translator<'m> {
         for (&entry, cfg) in &self.cfgs {
             let mut fe = lift::FuncEmit::new(cfg, &func_index);
             fe.probe = self.opts.probes.contains(&entry);
+            fe.x87_inline = !self.opts.no_x87_inline;
             fe.emit();
             self.unimplemented.extend(fe.unimplemented.drain(..));
             functions.function(types::FUNC);
@@ -114,6 +124,7 @@ impl<'m> Translator<'m> {
         for (entry, name) in &out_funcs {
             names.append(func_index[entry], name);
         }
+
         let mut name_section = wasm_encoder::NameSection::new();
         name_section.functions(&names);
 

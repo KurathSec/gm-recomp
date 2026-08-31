@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+fpu = { version = "0.1.0", path = "../fpu" }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info", "fast_fmt"] }
 pe = { version = "0.1.0", path = "../pe" }
 wasm-encoder = "0.262.0"

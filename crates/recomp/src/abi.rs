@@ -131,6 +131,8 @@ pub mod types {
     pub const TRAP: u32 = 2;
     /// `(i32, i32, i32, i32, i32) -> i32`: fpu.
     pub const FPU: u32 = 3;
+    /// `(i32, i32) -> i32`: the x87 module's fast paths.
+    pub const X87: u32 = 4;
 }
 
 pub fn export_name(entry_va: u32) -> String {

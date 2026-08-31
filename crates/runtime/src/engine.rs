@@ -40,7 +40,6 @@ pub struct ModInfo {
 /// Host-independent engine state; the host keeps it where callbacks can reach it.
 pub struct Engine {
     pub p: Option<Process>,
-    pub fpu: fpu::Fpu,
     /// Guest entry address -> function table index.
     pub funcs: HashMap<u32, u32>,
     /// Table index of a function that does nothing (returned after an API call).
@@ -59,19 +58,23 @@ pub struct Engine {
     pub recent: VecDeque<[u32; 4]>,
     pub recent_cap: usize,
     pub dispatches: u64,
+    /// x87/MMX instructions run through `rt.fpu`, by mnemonic when `fpu_profile` is on.
+    pub fpu_ops: u64,
+    pub fpu_profile: Option<HashMap<iced_x86::Mnemonic, u64>>,
     /// Declare guest memory shared in generated modules (browser threads).
     pub shared_memory: bool,
     /// Addresses reported when translated code calls them indirectly (debugging).
     pub watch: Vec<u32>,
     /// Function entries translated with an entry report (debugging).
     pub probes: Vec<u32>,
+    /// Translate x87 code without the inline paths (checking them).
+    pub no_x87_inline: bool,
 }
 
 impl Engine {
     pub fn new(p: Process) -> Self {
         Engine {
             p: Some(p),
-            fpu: fpu::Fpu::new(),
             funcs: HashMap::new(),
             nop_index: 0,
             mods: Vec::new(),
@@ -87,9 +90,12 @@ impl Engine {
             recent: VecDeque::new(),
             recent_cap: 0,
             dispatches: 0,
+            fpu_ops: 0,
+            fpu_profile: None,
             shared_memory: false,
             watch: Vec::new(),
             probes: Vec::new(),
+            no_x87_inline: false,
         }
     }
 
@@ -180,6 +186,21 @@ impl fpu::Mem for Scratch {
     }
 }
 
+/// The current thread's x87 state, read from its block below the TEB.
+pub fn fpu_load<M: Machine + ?Sized>(m: &mut M) -> fpu::Fpu {
+    let at = m.global(Global::FsBase).wrapping_sub(fpu::block::OFFSET);
+    let mut b = [0u8; fpu::block::SIZE];
+    let _ = m.read(at, &mut b);
+    fpu::Fpu::from_block(&b)
+}
+
+pub fn fpu_store<M: Machine + ?Sized>(m: &mut M, f: &fpu::Fpu) {
+    let at = m.global(Global::FsBase).wrapping_sub(fpu::block::OFFSET);
+    let mut b = [0u8; fpu::block::SIZE];
+    f.to_block(&mut b);
+    let _ = m.write(at, &b);
+}
+
 /// Guest memory as the x87 model sees it.
 struct FpuMem<'a, M: ?Sized>(&'a mut M);
 impl<M: Machine + ?Sized> fpu::Mem for FpuMem<'_, M> {
@@ -246,7 +267,9 @@ impl<M: Machine> Host for M {
 
     fn fpu_push(&mut self, v: f64) {
         let mut s = Scratch(v.to_bits().to_le_bytes());
-        self.engine().fpu.exec(iced_x86::Mnemonic::Fld, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut s);
+        let mut f = fpu_load(self);
+        f.exec(iced_x86::Mnemonic::Fld, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut s);
+        fpu_store(self, &f);
     }
 
     fn poll_input(&mut self, frame: u64) -> Vec<crate::hle::InputEvent> {
@@ -255,7 +278,9 @@ impl<M: Machine> Host for M {
 
     fn fpu_pop(&mut self) -> f64 {
         let mut s = Scratch([0; 8]);
-        self.engine().fpu.exec(iced_x86::Mnemonic::Fstp, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut s);
+        let mut f = fpu_load(self);
+        f.exec(iced_x86::Mnemonic::Fstp, 0, (iced_x86::MemorySize::Float64 as u32) << 8, 0, 0, &mut s);
+        fpu_store(self, &f);
         f64::from_bits(u64::from_le_bytes(s.0))
     }
 }
@@ -418,11 +443,9 @@ pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
 /// (#MF) raised once the translated code has stored its registers.
 pub fn rt_fpu<M: Machine>(m: &mut M, code: i32, a: u32, b: u32, ip: u32, fop: u32) -> i32 {
     let mn = iced_x86::Code::try_from(code as usize).map(|c| c.mnemonic()).unwrap_or(iced_x86::Mnemonic::INVALID);
-    if m.engine_ref().fpu.fault_pending(mn) {
-        let (sw, cw) = {
-            let f = &m.engine_ref().fpu;
-            (f.status_word(), f.control_word())
-        };
+    let mut f = fpu_load(m);
+    if f.fault_pending(mn) {
+        let (sw, cw) = (f.status_word(), f.control_word());
         let pending = sw & !cw & 0x3F;
         let status = if pending & 1 != 0 {
             0xC000_0090 // invalid operation
@@ -439,13 +462,18 @@ pub fn rt_fpu<M: Machine>(m: &mut M, code: i32, a: u32, b: u32, ip: u32, fop: u3
         };
         // The kernel reports the fault with the exception bits cleared from the live
         // state (handlers see them in the saved context).
-        m.engine().fpu.set_status_word(sw & !0x80BF);
+        f.set_status_word(sw & !0x80BF);
+        fpu_store(m, &f);
         request(m, Ctl::Fault { code: status, ip });
         return 0;
     }
-    let mut f = std::mem::take(&mut m.engine().fpu);
+    let e = m.engine();
+    e.fpu_ops += 1;
+    if let Some(h) = e.fpu_profile.as_mut() {
+        *h.entry(mn).or_default() += 1;
+    }
     let r = f.exec(mn, a, b, ip, fop as u16, &mut FpuMem(m));
-    m.engine().fpu = f;
+    fpu_store(m, &f);
     r
 }
 
@@ -530,7 +558,8 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
     let out = {
         let mem = CodeMem(&*m);
         let probes = m.engine_ref().probes.clone();
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes });
+        let no_x87_inline = m.engine_ref().no_x87_inline;
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline });
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = HashMap::new();
@@ -812,12 +841,22 @@ pub fn state_hash<M: Machine>(m: &mut M, limit: u32) -> (u64, u32) {
     for r in [regs.eax, regs.ecx, regs.edx, regs.ebx, regs.esp, regs.ebp, regs.esi, regs.edi, regs.eip] {
         mix(&mut h, &r.to_le_bytes());
     }
+    // The x87 state by value (its FXSAVE image): the block's bytes depend on which
+    // path (inline or rt.fpu) last wrote it, its contents do not.
+    let mut fx = [0u8; 512];
+    fpu_load(m).write_fxsave(&mut fx);
+    mix(&mut h, &fx[..160]);
+    let block = regs.fs_base.wrapping_sub(fpu::block::OFFSET);
     let mut chunks = 0;
     let mut buf = vec![0u8; 65536];
     let mut addr: u64 = 0;
     while addr < limit as u64 {
         if m.read(addr as u32, &mut buf).is_err() {
             break;
+        }
+        if let Some(off) = (block as u64).checked_sub(addr).filter(|&o| o < 65536) {
+            let off = off as usize;
+            buf[off..(off + fpu::block::SIZE).min(65536)].fill(0);
         }
         if buf.iter().any(|&b| b != 0) {
             mix(&mut h, &((addr / 65536) as u32).to_le_bytes());

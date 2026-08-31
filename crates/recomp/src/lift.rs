@@ -62,6 +62,8 @@ pub struct FuncEmit<'a> {
     pending: Option<(FlagOp, u8)>,
     /// Report entry to the runtime (debugging).
     pub probe: bool,
+    /// Call the `x87` module's fast paths before `rt.fpu`.
+    pub x87_inline: bool,
     /// Flags some later instruction (or a successor) will read after the current one.
     needed: u8,
     ip: u32,
@@ -90,6 +92,7 @@ impl<'a> FuncEmit<'a> {
             func_index,
             pending: None,
             probe: false,
+            x87_inline: true,
             needed: 0,
             ip: 0,
             next_ip: 0,
@@ -1032,7 +1035,7 @@ impl<'a> FuncEmit<'a> {
     fn emit_instr(&mut self, instr: &Instruction) {
         use Mnemonic::*;
         match instr.mnemonic() {
-            Nop | Wait | Pause | Lfence | Mfence | Sfence | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchnta | Endbr32 => {}
+            Nop | Pause | Lfence | Mfence | Sfence | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchnta | Endbr32 => {}
             Mov => {
                 if instr.op0_kind() == OpKind::Register && instr.op0_register().is_segment_register()
                     || instr.op1_kind() == OpKind::Register && instr.op1_register().is_segment_register()
@@ -1470,8 +1473,8 @@ impl<'a> FuncEmit<'a> {
                 // Only reached when not a block terminator (cannot happen); treat as trap.
                 self.trap(trap::UNIMPLEMENTED, self.ip);
             }
-            Femms | Emms => self.x87(instr),
-            m if format!("{m:?}").starts_with('F') && m != Wait => self.x87(instr),
+            Femms | Emms | Wait => self.x87(instr),
+            m if format!("{m:?}").starts_with('F') => self.x87(instr),
             _ => {
                 if !self.sse(instr) {
                     self.unimplemented(instr);
@@ -2061,6 +2064,55 @@ impl<'a> FuncEmit<'a> {
 
     fn x87(&mut self, instr: &Instruction) {
         use Mnemonic::*;
+        let writes_flags = matches!(instr.mnemonic(), Fcomi | Fcomip | Fucomi | Fucomip);
+        let writes_ax = instr.mnemonic() == Fnstsw && !(0..instr.op_count()).any(|n| instr.op_kind(n) == OpKind::Memory);
+        if writes_flags {
+            self.materialize(flags::ALL);
+        }
+        match crate::x87::form_of(instr).filter(|_| self.x87_inline) {
+            Some((k, arg)) => {
+                // block (result i32) { x87.f<k>(a, ip); != -1: done; rt.fpu }
+                self.depth += 1;
+                self.i(W::Block(BlockType::Result(ValType::I32)));
+                match arg {
+                    crate::x87::Arg::Mem => self.addr(instr),
+                    crate::x87::Arg::St(i) => self.c(i),
+                    crate::x87::Arg::None => self.c(0),
+                }
+                self.c(self.ip);
+                self.i(W::Call(abi::RT_FUNCS.len() as u32 + k));
+                self.tee(L_T1);
+                self.get(L_T1);
+                self.c(u32::MAX);
+                self.i(W::I32Ne);
+                self.i(W::BrIf(0));
+                self.i(W::Drop);
+                self.x87_call(instr);
+                self.i(W::End);
+                self.depth -= 1;
+            }
+            None => self.x87_call(instr),
+        }
+        if writes_ax {
+            self.set(L_T1);
+            self.write_reg_from(Register::AX, L_T1);
+        } else if writes_flags {
+            self.set(L_T1);
+            // return value uses EFLAGS bit positions: CF=0, PF=2, ZF=6
+            self.get(L_T1); self.c(1); self.i(W::I32And); self.set(L_FLAG);
+            self.get(L_T1); self.c(2); self.i(W::I32ShrU); self.c(1); self.i(W::I32And); self.set(L_FLAG + 1);
+            self.get(L_T1); self.c(6); self.i(W::I32ShrU); self.c(1); self.i(W::I32And); self.set(L_FLAG + 3);
+            self.c(0); self.set(L_FLAG + 2);
+            self.c(0); self.set(L_FLAG + 4);
+            self.c(0); self.set(L_FLAG + 5);
+        } else {
+            self.i(W::Drop);
+        }
+    }
+
+    /// `rt.fpu` for one instruction; leaves its i32 result on the stack.
+    fn x87_call(&mut self, instr: &Instruction) {
+        use Mnemonic::*;
         // a = memory address or ST index of op0; b packs op1's ST index, the memory operand
         // size and which operands are ST registers (see fpu::args).
         let has_mem = (0..instr.op_count()).any(|n| instr.op_kind(n) == OpKind::Memory);
@@ -2109,11 +2161,6 @@ impl<'a> FuncEmit<'a> {
             self.c(b);
         }
         self.set(L_T2);
-        let writes_flags = matches!(instr.mnemonic(), Fcomi | Fcomip | Fucomi | Fucomip);
-        let writes_ax = instr.mnemonic() == Fnstsw && !has_mem;
-        if writes_flags {
-            self.materialize(flags::ALL);
-        }
         self.i(W::I32Const(instr.code() as i32));
         self.get(L_T1);
         self.get(L_T2);
@@ -2123,21 +2170,6 @@ impl<'a> FuncEmit<'a> {
         // A pending unmasked x87 exception faults here (#MF): the runtime raises it once
         // the registers are back in the globals.
         self.return_if_ctl(true);
-        if writes_ax {
-            self.set(L_T1);
-            self.write_reg_from(Register::AX, L_T1);
-        } else if writes_flags {
-            self.set(L_T1);
-            // return value uses EFLAGS bit positions: CF=0, PF=2, ZF=6
-            self.get(L_T1); self.c(1); self.i(W::I32And); self.set(L_FLAG);
-            self.get(L_T1); self.c(2); self.i(W::I32ShrU); self.c(1); self.i(W::I32And); self.set(L_FLAG + 1);
-            self.get(L_T1); self.c(6); self.i(W::I32ShrU); self.c(1); self.i(W::I32And); self.set(L_FLAG + 3);
-            self.c(0); self.set(L_FLAG + 2);
-            self.c(0); self.set(L_FLAG + 4);
-            self.c(0); self.set(L_FLAG + 5);
-        } else {
-            self.i(W::Drop);
-        }
     }
 }
 

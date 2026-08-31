@@ -503,3 +503,13 @@ pub extern "C" fn nop_build() -> usize {
         GLUE_BYTES.len()
     }
 }
+
+/// The x87 fast-path module's bytes (JS instantiates it once; translated modules import it).
+#[unsafe(no_mangle)]
+#[allow(static_mut_refs)]
+pub extern "C" fn x87_build() -> usize {
+    unsafe {
+        GLUE_BYTES = recomp::x87::module(false);
+        GLUE_BYTES.len()
+    }
+}

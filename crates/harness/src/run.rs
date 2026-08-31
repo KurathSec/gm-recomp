@@ -222,6 +222,12 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eng.trace = opts.trace;
     eng.max_api_calls = opts.max_api_calls;
     eng.recent_cap = opts.recent;
+    // GMR_X87_SLOW=1: no inline x87 (every instruction through rt.fpu).
+    eng.no_x87_inline = std::env::var_os("GMR_X87_SLOW").is_some();
+    // GMR_FPU_PROFILE=1: count x87 instructions by mnemonic.
+    if std::env::var_os("GMR_FPU_PROFILE").is_some() {
+        eng.fpu_profile = Some(Default::default());
+    }
     // GMR_WATCH=hex,hex: report indirect calls to these addresses.
     if let Ok(w) = std::env::var("GMR_WATCH") {
         eng.watch = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
@@ -274,6 +280,10 @@ pub fn run(opts: RunOpts) -> Result<()> {
         };
         linker.define(&store, abi::RT_MODULE, name, Extern::Func(func)).map_err(|e| anyhow!("{e:?}"))?;
     }
+    // The x87 fast paths every translated module imports.
+    let x87 = Module::new(&wt_engine, recomp::x87::module(false)).map_err(|e| anyhow!("{e:?}"))?;
+    let x87 = linker.instantiate(&mut store, &x87).map_err(|e| anyhow!("{e:?}"))?;
+    linker.instance(&mut store, recomp::x87::MODULE, x87).map_err(|e| anyhow!("{e:?}"))?;
     store.data_mut().linker = Some(linker);
 
     let mut m = Wt { cx: &mut store, cpu };
@@ -290,6 +300,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let outcome = engine::run_process(&mut m, &started);
     let elapsed = t0.elapsed().as_secs_f64();
     let final_regs = engine::read_regs(&mut m);
+    let final_fpu = engine::fpu_load(&mut m);
     let (hash, chunks) = engine::state_hash(&mut m, (MEM_PAGES * 65536 - 65536) as u32);
     eprintln!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)");
     if let Some(path) = &opts.dump_mem {
@@ -322,7 +333,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
             );
         }
     }
-    eprintln!("fpu: cw={:#06x} sw={:#06x} tw={:#06x}", e.fpu.control_word(), e.fpu.status_word(), e.fpu.tag_word());
+    eprintln!("fpu: cw={:#06x} sw={:#06x} tw={:#06x}", final_fpu.control_word(), final_fpu.status_word(), final_fpu.tag_word());
     if let Some(p) = p {
         eprintln!(
             "frames presented: {}  api calls: {}  dispatches: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
@@ -333,6 +344,13 @@ pub fn run(opts: RunOpts) -> Result<()> {
             e.translate_us as f64 / 1e6,
             p.now_ms()
         );
+        eprintln!("x87 instructions via rt.fpu: {}", e.fpu_ops);
+        if let Some(h) = &e.fpu_profile {
+            let mut v: Vec<_> = h.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = v.iter().take(30).map(|(k, n)| format!("{k:?} {n}")).collect();
+            eprintln!("  {}", top.join(", "));
+        }
         if !e.recent.is_empty() {
             eprintln!("---- last {} dispatches (eip esp eax ebx) ----", e.recent.len());
             for r in &e.recent {
