@@ -30,6 +30,13 @@ pub trait Vfs {
     fn remove(&mut self, path: &str) -> bool;
     fn rename(&mut self, from: &str, to: &str) -> bool;
 
+    /// Files changed since the last call, for hosts that persist them: (path as
+    /// stored, Some((contents, FILETIME)) or None if it was removed). Directories are
+    /// implied by their files.
+    fn take_changes(&mut self) -> Vec<(String, Option<(Vec<u8>, u64)>)> {
+        Vec::new()
+    }
+
     fn exists(&self, path: &str) -> bool {
         self.stat(path).is_some()
     }
@@ -58,6 +65,15 @@ pub trait Vfs {
 }
 
 /// Directories every Windows system has (relative to `C:\\game`, drive roots below it).
+/// Where a host keeps the files a game writes (its saves) between sessions.
+pub trait SaveSink {
+    /// Changed files: (path as stored, Some((contents, FILETIME)) or None if removed).
+    fn save(&mut self, _changes: &[(String, Option<(Vec<u8>, u64)>)]) {}
+}
+
+pub struct NullSaves;
+impl SaveSink for NullSaves {}
+
 pub const STANDARD_DIRS: &[&str] = &[
     "C",
     "C\\Temp",
@@ -324,12 +340,38 @@ impl MemFs {
         v
     }
 
+    /// The path of a key with each component as it was created (keys are lowercase).
+    fn stored_path(&self, key: &str) -> String {
+        let mut acc = String::new();
+        let mut out = Vec::new();
+        for c in key.split('\\') {
+            if !acc.is_empty() {
+                acc.push('\\');
+            }
+            acc.push_str(c);
+            out.push(self.nodes.get(&acc).map(|n| n.name.clone()).unwrap_or_else(|| c.to_string()));
+        }
+        out.join("\\")
+    }
+
     fn touch(&mut self, key: &str) {
         self.dirty.insert(key.to_string());
     }
 }
 
 impl Vfs for MemFs {
+    fn take_changes(&mut self) -> Vec<(String, Option<(Vec<u8>, u64)>)> {
+        let mut out = Vec::new();
+        for key in self.take_dirty() {
+            match self.nodes.get(&key) {
+                Some(n) if n.is_dir => {}
+                Some(n) => out.push((self.stored_path(&key), Some((n.data.clone(), n.mtime)))),
+                None => out.push((self.stored_path(&key), None)),
+            }
+        }
+        out
+    }
+
     fn stat(&self, path: &str) -> Option<Meta> {
         if path.is_empty() {
             return Some(Meta { is_dir: true, size: 0, mtime: 0 });

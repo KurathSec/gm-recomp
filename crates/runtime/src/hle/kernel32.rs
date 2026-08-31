@@ -140,12 +140,14 @@ pub fn register(r: &mut Registry) {
     r.add(k, "GetCurrentThread", |_c| ok(0, 0xFFFF_FFFE));
     r.add(k, "ExitProcess", |c| {
         let code = c.arg(0);
+        c.p.flush_saves();
         c.p.exit_code = Some(code);
         c.host.request_exit(code);
         ok(1, 0)
     });
     r.add(k, "TerminateProcess", |c| {
         let code = c.arg(1);
+        c.p.flush_saves();
         c.p.exit_code = Some(code);
         c.host.request_exit(code);
         ok(2, 1)

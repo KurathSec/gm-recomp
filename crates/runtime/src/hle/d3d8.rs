@@ -415,6 +415,9 @@ fn dev_present(c: &mut Ctx) -> ApiResult {
         }
     };
     super::dsound::flush_audio(c);
+    if c.p.frames_presented % 25 == 0 {
+        c.p.flush_saves();
+    }
     let now = c.p.clock_us;
     c.p.gpu.present(now, src_rect, dst_size.0.max(1) as u32, dst_size.1.max(1) as u32);
     if n >= c.p.frame_limit {

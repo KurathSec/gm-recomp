@@ -1,6 +1,8 @@
 #!/bin/sh
 # Runs a game page in a headless browser and prints what the page reports.
 #   web/tools/run-browser.sh chrome|firefox '<query string>' [capture dir] [port]
+# PROFILE=<dir> keeps the browser profile (and with it the games' saves) across runs;
+# flatpak Chrome only sees directories it may access, e.g. ~/.var/app/com.google.Chrome/.
 set -e
 browser=$1
 query=$2
@@ -13,15 +15,17 @@ server=$!
 sleep 1
 url="http://127.0.0.1:$port/?$query&report=1"
 case $browser in
-  chrome) flatpak run com.google.Chrome --headless=new --user-data-dir="$tmp/profile" --no-first-run --autoplay-policy=no-user-gesture-required "$url" > "$tmp/browser.log" 2>&1 & ;;
+  chrome) flatpak run com.google.Chrome --headless=new --user-data-dir="${PROFILE:-$tmp/profile}" --no-first-run --autoplay-policy=no-user-gesture-required "$url" > "$tmp/browser.log" 2>&1 & ;;
   firefox)
-    echo 'user_pref("media.autoplay.default", 0); user_pref("media.autoplay.blocking_policy", 0);' > "$tmp/user.js"
-    firefox --headless --no-remote --profile "$tmp" "$url" > "$tmp/browser.log" 2>&1 & ;;
+    ff=${PROFILE:-$tmp}
+    mkdir -p "$ff"
+    echo 'user_pref("media.autoplay.default", 0); user_pref("media.autoplay.blocking_policy", 0);' > "$ff/user.js"
+    firefox --headless --no-remote --profile "$ff" "$url" > "$tmp/browser.log" 2>&1 & ;;
 esac
 browser_pid=$!
 wait $server || true
 kill $browser_pid 2>/dev/null || true
 [ "$browser" = chrome ] && flatpak kill com.google.Chrome 2>/dev/null || true
-pkill -f "profile $tmp" 2>/dev/null || true
+pkill -f "profile ${PROFILE:-$tmp}" 2>/dev/null || true
 cat "$tmp/out"
 rm -rf "$tmp"

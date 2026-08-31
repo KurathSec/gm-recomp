@@ -42,6 +42,40 @@ unsafe extern "C" {
     fn audio_push(samples: *const f32, len: usize, rate: u32);
 }
 
+#[link(wasm_import_module = "host")]
+unsafe extern "C" {
+    /// Changed files, serialized as by `WebSaves`.
+    fn fs_persist(data: *const u8, len: usize);
+}
+
+/// Hands the game's file changes to the page (web/src/host.mjs `onSave`): per entry
+/// u32 path length, path (UTF-8), i32 data length (-1: removed), data, f64 last-write
+/// time (ms since 1970).
+struct WebSaves;
+
+impl runtime::vfs::SaveSink for WebSaves {
+    fn save(&mut self, changes: &[(String, Option<(Vec<u8>, u64)>)]) {
+        let mut out = Vec::new();
+        for (path, data) in changes {
+            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            out.extend_from_slice(path.as_bytes());
+            match data {
+                Some((d, filetime)) => {
+                    out.extend_from_slice(&(d.len() as i32).to_le_bytes());
+                    out.extend_from_slice(d);
+                    let ms = *filetime as f64 / 10_000.0 - 11_644_473_600_000.0;
+                    out.extend_from_slice(&ms.to_le_bytes());
+                }
+                None => {
+                    out.extend_from_slice(&(-1i32).to_le_bytes());
+                    out.extend_from_slice(&0f64.to_le_bytes());
+                }
+            }
+        }
+        unsafe { fs_persist(out.as_ptr(), out.len()) }
+    }
+}
+
 /// The audio ring in web/src/host.mjs.
 struct WebAudio;
 
@@ -398,6 +432,7 @@ pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace
     if render != 0 {
         p.gpu = Box::new(WebGpu);
         p.audio = Box::new(WebAudio);
+        p.saves = Box::new(WebSaves);
     }
     let mut e = Engine::new(p);
     e.trace = trace != 0;

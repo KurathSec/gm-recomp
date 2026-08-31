@@ -223,6 +223,8 @@ pub struct Process {
     pub cwd: String,
     /// The guest's file system (`C:\\game` and everything below it).
     pub fs: Box<dyn crate::vfs::Vfs>,
+    /// Receives the game's file changes (not the temp directory) for persistence.
+    pub saves: Box<dyn crate::vfs::SaveSink>,
     /// Host wall-clock time at process start (Unix seconds); dates follow it plus the
     /// virtual clock.
     pub epoch_unix: u64,
@@ -325,6 +327,7 @@ impl Process {
             exe_path: exe_path.to_string(),
             cwd,
             fs,
+            saves: Box::new(crate::vfs::NullSaves),
             epoch_unix: 1_767_225_600,
             env: vec![
                 ("PATH".into(), "C:\\Windows\\system32;C:\\Windows".into()),
@@ -474,6 +477,14 @@ impl Process {
     /// The VFS path of a guest path.
     pub fn vpath(&self, guest: &str) -> String {
         self.guest_rel(guest).join("\\")
+    }
+
+    /// Hands the files changed since the last call to the save sink (temp files stay).
+    pub fn flush_saves(&mut self) {
+        let changes: Vec<_> = self.fs.take_changes().into_iter().filter(|(p, _)| !p.to_ascii_lowercase().starts_with("c\\temp\\")).collect();
+        if !changes.is_empty() {
+            self.saves.save(&changes);
+        }
     }
 
     pub fn now_ms(&self) -> u32 {

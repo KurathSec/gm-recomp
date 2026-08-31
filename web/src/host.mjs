@@ -24,8 +24,10 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   usable while the guest is suspended in Present
  * @param {(w: number, h: number) => void} [o.onResize]  the shown frame changed size
  * @param {{sab: SharedArrayBuffer, frames: number}} [o.audioRing]  where the sound mix goes
+ * @param {(changes: {path: string, data: Uint8Array|null, mtime: number}[]) => void} [o.onSave]
+ *   files the game wrote or removed (its saves; not the temp directory)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize, audioRing }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize, audioRing, onSave }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -86,6 +88,25 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
     now_us() {
       return performance.now() * 1000;
+    },
+    fs_persist(ptr, len) {
+      if (!onSave) return;
+      const view = new DataView(rt.exports.memory.buffer, ptr, len);
+      const bytes = mem();
+      const changes = [];
+      for (let o = 0; o < len; ) {
+        const n = view.getUint32(o, true);
+        const path = dec.decode(bytes.subarray(ptr + o + 4, ptr + o + 4 + n));
+        o += 4 + n;
+        const size = view.getInt32(o, true);
+        o += 4;
+        const data = size < 0 ? null : bytes.slice(ptr + o, ptr + o + size);
+        o += Math.max(0, size);
+        const mtime = view.getFloat64(o, true);
+        o += 8;
+        changes.push({ path, data, mtime });
+      }
+      onSave(changes);
     },
     instantiate(ptr, len, namesPtr, namesLen, out) {
       try {

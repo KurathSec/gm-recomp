@@ -17,7 +17,7 @@
     <canvas id="screen" width="640" height="480"></canvas>
     <div id="log"></div>
     <script type="module">
-      // ?game=<slug>&frames=N[&epoch=S][&report=1][&capture=30,60][&nopace=1][&script=100:Enter:1,105:Enter:0][&audio=1]
+      // ?game=<slug>&frames=N[&epoch=S][&report=1][&capture=30,60][&nopace=1][&script=100:Enter:1,105:Enter:0][&audio=1][&nosave=1]
       const q = new URLSearchParams(location.search);
       const game = q.get('game') ?? 'not-another-needle-game-1-12';
       const frames = Number(q.get('frames') ?? 0);
@@ -95,7 +95,7 @@
       };
       statusEl.textContent = `running ${game}…`;
       const offscreen = screen.transferControlToOffscreen();
-      w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, script }, [offscreen]);
+      w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, script, persist: !q.has('nosave') }, [offscreen]);
 
       // Input goes to the worker as it happens; the runtime applies it at the guest's
       // next message poll.
