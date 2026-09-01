@@ -66,6 +66,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_set_target: (id, w, h) => gpu?.setTarget(id, w, h),
     gpu_clear: (flags, color, z, stencil, x, y, w, h) => gpu?.clear(flags, color >>> 0, z, stencil, x, y, w, h),
     gpu_draw: (ptr) => gpu?.draw(ptr),
+    gpu_draw9: (ptr) => gpu?.draw9(ptr),
+    gpu_shader_create: (id, vertex, ptr, len) => gpu?.shaderCreate(id, !!vertex, dec.decode(mem().subarray(ptr, ptr + len))),
+    gpu_shader_delete: (id) => gpu?.shaderDelete(id),
+    gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
+    gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst, pitch),
     gpu_present: (clockMs, x, y, w, h, dw, dh) => {
       if (!gpu) return;
       const { frame } = present(clockMs, x, y, w, h, dw, dh);

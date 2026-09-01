@@ -129,6 +129,8 @@ fn identifier_strings(data: &[u8]) -> BTreeSet<&[u8]> {
 /// Export names of the system DLLs, read from Wine's PE builds.
 pub struct SystemExports {
     by_dll: HashMap<String, BTreeSet<String>>,
+    /// The folder they were read from (also where missing runtime DLLs come from).
+    pub dir: std::path::PathBuf,
 }
 
 impl SystemExports {
@@ -147,7 +149,7 @@ impl SystemExports {
                 by_dll.insert(name, names);
             }
         }
-        SystemExports { by_dll }
+        SystemExports { by_dll, dir: dir.to_path_buf() }
     }
 
     pub fn is_empty(&self) -> bool {

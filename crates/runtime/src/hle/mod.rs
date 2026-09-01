@@ -5,6 +5,8 @@
 pub mod audio;
 pub mod com;
 pub mod d3d8;
+pub mod d3d9;
+pub mod d3d9_shader;
 pub mod dmusic;
 pub mod dsound;
 pub mod gpu;
@@ -207,6 +209,7 @@ impl Registry {
         gdi32::register(&mut r);
         misc::register(&mut r);
         d3d8::register(&mut r);
+        d3d9::register(&mut r);
         com::register(&mut r);
         dmusic::register(&mut r);
         msvcrt::register(&mut r);

@@ -496,7 +496,8 @@ pub fn rt_fpu<M: Machine>(m: &mut M, code: i32, a: u32, b: u32, ip: u32, fop: u3
 pub fn cpuid_regs(leaf: u32, _sub: u32) -> (u32, u32, u32, u32) {
     match leaf {
         0 => (1, 0x756E_6547, 0x6C65_746E, 0x4965_6E69),
-        1 => (0x0001_06A5, 0x0001_0800, 0, 0x0780_8111),
+        // FPU, TSC, CX8, CMOV, FXSR, SSE, SSE2 (no MMX: mm registers are not lifted)
+        1 => (0x0001_06A5, 0x0001_0800, 0, 0x0700_8111),
         0x8000_0000 => (0x8000_0000, 0, 0, 0),
         _ => (0, 0, 0, 0),
     }
@@ -747,7 +748,11 @@ pub struct Started {
 pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let mut order = Vec::new();
     let mut seen = HashSet::new();
-    let read = |m: &M, name: &str| m.engine_ref().process().fs.read_all(name);
+    // Imported DLLs come from the game directory, else the system directory.
+    let read = |m: &M, name: &str| {
+        let fs = &m.engine_ref().process().fs;
+        fs.read_all(name).or_else(|| if name.contains('\\') { None } else { fs.read_all(&format!("{}\\{name}", crate::hle::kernel32::SYSTEM_DIR)) })
+    };
     {
         let r = |name: &str| read(m, name);
         collect_order(exe, &r, &mut seen, &mut order)?;
@@ -756,7 +761,8 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let (mut entry, mut image_base) = (0, 0);
     for name in order {
         let bytes = read(m, &name).ok_or_else(|| format!("reading {name}"))?;
-        let guest_path = format!("C:\\game\\{name}");
+        let in_game = m.engine_ref().process().fs.is_file(&name);
+        let guest_path = if in_game { format!("C:\\game\\{name}") } else { format!("C:\\Windows\\system32\\{name}") };
         let mut p = m.engine().p.take().ok_or("process not available")?;
         let loaded = {
             let req = crate::LoadRequest { name: &name, path: &guest_path, bytes };

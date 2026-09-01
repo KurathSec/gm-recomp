@@ -32,6 +32,11 @@ unsafe extern "C" {
     fn gpu_set_target(id: u32, w: u32, h: u32);
     fn gpu_clear(flags: u32, color: u32, z: f32, stencil: u32, x: i32, y: i32, w: i32, h: i32);
     fn gpu_draw(call: *const runtime::hle::gpu::DrawCall);
+    fn gpu_draw9(call: *const runtime::hle::gpu::DrawCall9);
+    fn gpu_shader_create(id: u32, vertex: u32, glsl: *const u8, len: usize);
+    fn gpu_shader_delete(id: u32);
+    fn gpu_blit(src: u32, sx: i32, sy: i32, sw: i32, sh: i32, dst: u32, dx: i32, dy: i32, dw: i32, dh: i32, linear: u32);
+    fn gpu_read_target(id: u32, w: u32, h: u32, dst: u32, pitch: u32);
     /// Shows the frame; may suspend the guest until it is time for the next one.
     fn gpu_present(clock_ms: f64, x: i32, y: i32, w: i32, h: i32, dst_w: u32, dst_h: u32);
 }
@@ -97,6 +102,21 @@ impl runtime::hle::gpu::Gpu for WebGpu {
     }
     fn texture_upload(&mut self, id: u32, level: u32, w: u32, h: u32, fmt: u32, pitch: u32, bits: u32) {
         unsafe { gpu_texture_upload(id, level, w, h, fmt, pitch, bits) }
+    }
+    fn draw9(&mut self, d: &runtime::hle::gpu::DrawCall9) {
+        unsafe { gpu_draw9(d) }
+    }
+    fn shader_create(&mut self, id: u32, vertex: bool, glsl: &str) {
+        unsafe { gpu_shader_create(id, vertex as u32, glsl.as_ptr(), glsl.len()) }
+    }
+    fn shader_delete(&mut self, id: u32) {
+        unsafe { gpu_shader_delete(id) }
+    }
+    fn blit(&mut self, src: u32, s: [i32; 4], dst: u32, d: [i32; 4], linear: bool) {
+        unsafe { gpu_blit(src, s[0], s[1], s[2], s[3], dst, d[0], d[1], d[2], d[3], linear as u32) }
+    }
+    fn read_target(&mut self, id: u32, w: u32, h: u32, dst: u32, pitch: u32) {
+        unsafe { gpu_read_target(id, w, h, dst, pitch) }
     }
     fn texture_delete(&mut self, id: u32) {
         unsafe { gpu_texture_delete(id) }

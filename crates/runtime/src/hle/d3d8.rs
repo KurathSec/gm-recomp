@@ -414,16 +414,23 @@ fn dev_present(c: &mut Ctx) -> ApiResult {
             _ => (src_rect[2], src_rect[3]),
         }
     };
+    present_frame(c, src_rect, dst_size.0.max(1) as u32, dst_size.1.max(1) as u32)?;
+    ret(c, D3D_OK)
+}
+
+/// The end of a frame for every Direct3D version: audio, saves, the host's present,
+/// the frame limit.
+pub(crate) fn present_frame(c: &mut Ctx, src_rect: [i32; 4], dst_w: u32, dst_h: u32) -> Result<(), super::ApiError> {
     super::dsound::flush_audio(c);
     if c.p.frames_presented % 25 == 0 {
         c.p.flush_saves();
     }
     let now = c.p.clock_us;
-    c.p.gpu.present(now, src_rect, dst_size.0.max(1) as u32, dst_size.1.max(1) as u32);
-    if n >= c.p.frame_limit {
+    c.p.gpu.present(now, src_rect, dst_w, dst_h);
+    if c.p.frames_presented >= c.p.frame_limit {
         return Err(super::ApiError(super::FRAME_LIMIT.into()));
     }
-    ret(c, D3D_OK)
+    Ok(())
 }
 
 fn new_surface(c: &mut Ctx, w: u32, h: u32, fmt: u32, usage: u32, pool: u32) -> u32 {

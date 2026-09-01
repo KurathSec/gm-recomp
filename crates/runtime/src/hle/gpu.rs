@@ -103,6 +103,47 @@ pub struct DrawCall {
     pub tss: [[u32; TSS_COUNT]; 2],
 }
 
+/// One Direct3D 9 draw through vertex and pixel shaders. `#[repr(C)]`: the browser
+/// reads it in place (web/src/gpu.mjs mirrors the field offsets).
+#[repr(C)]
+#[derive(Clone)]
+pub struct DrawCall9 {
+    /// D3DPRIMITIVETYPE.
+    pub prim: u32,
+    pub prim_count: u32,
+    /// Vertices the draw addresses: `min_index..min_index + vertex_count`.
+    pub vertex_count: u32,
+    pub min_index: u32,
+    /// Guest address of the first index (0: not indexed) and its size (2 or 4).
+    pub indices: u32,
+    pub index_size: u32,
+    /// Per stream: guest address of vertex 0 and stride.
+    pub streams: [[u32; 2]; 4],
+    /// Vertex elements: stream, offset, D3DDECLTYPE, usage | usage index << 8.
+    pub elements: [[u32; 4]; 16],
+    pub element_count: u32,
+    /// Shader objects (see `Gpu::shader_create`).
+    pub vs: u32,
+    pub ps: u32,
+    /// Per sampler: texture object (0: none), its D3DFORMAT, rows stored bottom-up.
+    pub textures: [[u32; 3]; 16],
+    /// D3DSAMPLERSTATETYPE values per sampler (index = state).
+    pub samplers: [[u32; 14]; 16],
+    pub target_w: u32,
+    pub target_h: u32,
+    /// x, y, width, height, min z, max z.
+    pub viewport: [f32; 6],
+    /// x, y, width, height (used when SCISSORTESTENABLE).
+    pub scissor: [i32; 4],
+    pub rs: [u32; 256],
+    pub vs_f: [[f32; 4]; 256],
+    pub ps_f: [[f32; 4]; 224],
+    pub vs_i: [[i32; 4]; 16],
+    pub ps_i: [[i32; 4]; 16],
+    pub vs_b: [u32; 16],
+    pub ps_b: [u32; 16],
+}
+
 /// The host renderer. Every method has a no-op default (the harness).
 pub trait Gpu {
     /// The back buffer (render target 0) was created or resized.
@@ -116,6 +157,15 @@ pub trait Gpu {
     /// D3DCLEAR flags over the rectangle (x, y, w, h).
     fn clear(&mut self, _flags: u32, _color: u32, _z: f32, _stencil: u32, _rect: [i32; 4]) {}
     fn draw(&mut self, _d: &DrawCall) {}
+    /// A Direct3D 9 shader translated to GLSL ES 3.00 (`id` is its D3D object).
+    fn shader_create(&mut self, _id: u32, _vertex: bool, _glsl: &str) {}
+    fn shader_delete(&mut self, _id: u32) {}
+    fn draw9(&mut self, _d: &DrawCall9) {}
+    /// Copies rectangle `src_rect` (x, y, w, h) of target/texture `src` (0: back buffer)
+    /// into `dst_rect` of `dst`, scaling with linear or point filtering.
+    fn blit(&mut self, _src: u32, _src_rect: [i32; 4], _dst: u32, _dst_rect: [i32; 4], _linear: bool) {}
+    /// Reads target/texture `id` (w x h, 32-bit pixels) into guest memory at `dst`.
+    fn read_target(&mut self, _id: u32, _w: u32, _h: u32, _dst: u32, _pitch: u32) {}
     /// End of a frame: rectangle `src` (x, y, w, h) of the back buffer is shown at
     /// `dst_w` x `dst_h`. `clock_us` is the guest's virtual time, which the host uses to
     /// pace frames against real time.

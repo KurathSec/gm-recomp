@@ -252,6 +252,9 @@ pub struct Process {
     pub d3d_objects: HashMap<u32, D3dObject>,
     /// Direct3D device state and the host renderer it drives.
     pub d3d: crate::hle::gpu::DeviceState,
+    /// Direct3D 9 device state, and the state blocks' snapshots.
+    pub d3d9: Box<crate::hle::d3d9::State9>,
+    pub d3d9_blocks: HashMap<u32, Box<crate::hle::d3d9::State9>>,
     pub gpu: Box<dyn crate::hle::gpu::Gpu>,
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
     /// The sound mix and where finished samples go.
@@ -365,6 +368,8 @@ impl Process {
             frame_limit: u64::MAX,
             d3d_objects: HashMap::new(),
             d3d: Default::default(),
+            d3d9: Default::default(),
+            d3d9_blocks: HashMap::new(),
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
             mixer: Default::default(),

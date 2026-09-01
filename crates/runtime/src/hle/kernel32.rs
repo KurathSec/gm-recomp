@@ -1227,6 +1227,73 @@ pub fn register(r: &mut Registry) {
     // ntdll pieces Delphi/MSVC runtimes import directly
     let n = "ntdll.dll";
     r.alias(n, "RtlUnwind", k, "RtlUnwind");
+    // What Wine's runtime DLLs (msvcr100.dll...) import from ntdll.
+    r.add(n, "__wine_dbg_get_channel_flags", |_c| Ok(Ret::cdecl(0)));
+    r.add(n, "__wine_dbg_header", |_c| Ok(Ret::cdecl(u32::MAX)));
+    r.add(n, "__wine_dbg_output", |c| {
+        let s = c.str_arg(0);
+        c.p.log(format!("wine: {}", s.trim_end()));
+        Ok(Ret::cdecl(s.len() as u32))
+    });
+    r.add(n, "__wine_dbg_strdup", |c| Ok(Ret::cdecl(c.arg(0))));
+    r.add(n, "NtQuerySystemTime", |c| {
+        let base: u64 = 0x01DC_5A6B_0000_0000 + c.p.clock_us * 10;
+        let _ = c.host.write_u64(c.arg(0), base);
+        ok(1, 0)
+    });
+    r.add(n, "RtlTimeToSecondsSince1970", |c| {
+        let t = c.host.read_u64(c.arg(0)).unwrap_or(0);
+        let secs = (t / 10_000_000).saturating_sub(11_644_473_600);
+        let _ = c.host.write_u32(c.arg(1), secs as u32);
+        ok(2, (secs <= u32::MAX as u64) as u32)
+    });
+    r.add(n, "NtQueryInformationFile", |_c| ok(5, 0xC000_0003)); // STATUS_INVALID_INFO_CLASS
+    // Bitmaps: RTL_BITMAP {SizeOfBitMap, Buffer}
+    r.add(n, "RtlInitializeBitMap", |c| {
+        let (bm, buf, size) = (c.arg(0), c.arg(1), c.arg(2));
+        let _ = c.host.write_u32(bm, size);
+        let _ = c.host.write_u32(bm + 4, buf);
+        ok(3, 0)
+    });
+    fn bits_range(c: &mut Ctx, set: Option<bool>) -> bool {
+        let (bm, start, count) = (c.arg(0), c.arg(1), c.arg(2));
+        let buf = c.host.read_u32(bm + 4).unwrap_or(0);
+        let mut all = true;
+        for i in start..start.saturating_add(count) {
+            let a = buf + i / 8;
+            let b = c.host.read_u8(a).unwrap_or(0);
+            match set {
+                Some(v) => {
+                    let nb = if v { b | (1 << (i % 8)) } else { b & !(1 << (i % 8)) };
+                    let _ = c.host.write_u8(a, nb);
+                }
+                None => all &= b & (1 << (i % 8)) != 0,
+            }
+        }
+        all
+    }
+    r.add(n, "RtlSetBits", |c| {
+        bits_range(c, Some(true));
+        ok(3, 0)
+    });
+    r.add(n, "RtlClearBits", |c| {
+        bits_range(c, Some(false));
+        ok(3, 0)
+    });
+    r.add(n, "RtlAreBitsSet", |c| {
+        let all = bits_range(c, None);
+        ok(3, all as u32)
+    });
+    r.add(n, "RtlAreBitsClear", |c| {
+        let (bm, start, count) = (c.arg(0), c.arg(1), c.arg(2));
+        let buf = c.host.read_u32(bm + 4).unwrap_or(0);
+        let clear = (start..start.saturating_add(count)).all(|i| c.host.read_u8(buf + i / 8).unwrap_or(0) & (1 << (i % 8)) == 0);
+        ok(3, clear as u32)
+    });
+    // One thread runs at a time: a wait on an address returns at once.
+    r.add(n, "RtlWaitOnAddress", |_c| ok(4, 0));
+    r.add(n, "RtlWakeAddressSingle", |_c| ok(1, 0));
+    r.add(n, "RtlWakeAddressAll", |_c| ok(1, 0));
     r.add(n, "RtlGetVersion", |c| {
         let p = c.arg(0);
         let _ = c.host.write_u32(p + 4, 5);
@@ -1265,9 +1332,12 @@ pub fn register(r: &mut Registry) {
 }
 
 /// DLLs the HLE layer always provides, even if a file of that name exists.
-const CORE_DLLS: &[&str] = &["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid"];
+/// Where DLLs the game does not ship come from (the importer copies them there).
+pub const SYSTEM_DIR: &str = "C\\Windows\\system32";
+
+pub const CORE_DLLS: &[&str] = &["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid"];
 /// Further HLE DLLs, used when the game does not ship its own copy.
-const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
+pub const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
 
 fn dll_stem(name: &str) -> String {
     let lower = name.to_lowercase();
@@ -1313,11 +1383,18 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
     // A DLL the game ships (or extracted at run time) is loaded and recompiled.
     let with_ext = if name.to_lowercase().ends_with(".dll") || name.contains('.') { name.to_string() } else { format!("{name}.dll") };
     let key = c.p.vpath(&with_ext);
+    let base_name = with_ext.rsplit(['\\', '/']).next().unwrap_or(&with_ext).to_string();
     if c.p.fs.is_file(&key) {
         if let Some(bytes) = c.p.fs.read_all(&key) {
-            let base_name = with_ext.rsplit(['\\', '/']).next().unwrap_or(&with_ext).to_string();
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
             return load_image(c, &base_name, &guest_path, bytes, true);
+        }
+    }
+    // Then the system directory (runtime DLLs the importer supplied).
+    let sys = format!("{SYSTEM_DIR}\\{base_name}");
+    if !with_ext.contains(['\\', '/']) && c.p.fs.is_file(&sys) {
+        if let Some(bytes) = c.p.fs.read_all(&sys) {
+            return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true);
         }
     }
     if HLE_DLLS.contains(&stem.as_str()) {
@@ -1331,6 +1408,19 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
 /// Maps a PE image, binds its imports, runs TLS callbacks and DllMain. Shared by
 /// LoadLibrary and the harness's static-import preloading.
 pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>, attach: bool) -> Result<u32, ApiError> {
+    // DLLs it imports that are files (the game's or the system directory's) load first.
+    if let Ok(pe) = pe::Pe::parse(&bytes) {
+        for d in pe.imports().unwrap_or_default() {
+            let stem = dll_stem(&d.dll);
+            if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.module_by_name(&d.dll).is_some() {
+                continue;
+            }
+            let file = format!("{stem}.dll");
+            if c.p.fs.is_file(&c.p.vpath(&file)) || c.p.fs.is_file(&format!("{SYSTEM_DIR}\\{file}")) {
+                load_library(c, &file)?;
+            }
+        }
+    }
     let req = crate::loader::LoadRequest { name: base_name, path: guest_path, bytes };
     let (base, entry, is_dll, tls) = {
         let p = &mut *c.p;
@@ -2337,8 +2427,21 @@ pub fn register_more(r: &mut Registry) {
         let _ = c.host.write_u32(psize, n);
         ok(2, (cap > 8) as u32)
     });
-    r.alias(k, "GetComputerNameExW", k, "GetComputerNameW");
-    r.alias(k, "GetComputerNameExA", k, "GetComputerNameA");
+    // (name type, buffer, size)
+    r.add(k, "GetComputerNameExW", |c| {
+        let (buf, psize) = (c.arg(1), c.arg(2));
+        let cap = c.host.read_u32(psize).unwrap_or(0);
+        let n = copy_wstr_out(c, buf, cap, "GMRECOMP");
+        let _ = c.host.write_u32(psize, n);
+        ok(3, (cap > 8) as u32)
+    });
+    r.add(k, "GetComputerNameExA", |c| {
+        let (buf, psize) = (c.arg(1), c.arg(2));
+        let cap = c.host.read_u32(psize).unwrap_or(0);
+        let n = copy_str_out(c, buf, cap, b"GMRECOMP");
+        let _ = c.host.write_u32(psize, n);
+        ok(3, (cap > 8) as u32)
+    });
     r.add(k, "GetVolumeInformationW", |c| {
         copy_wstr_out(c, c.arg(1), c.arg(2), "GMRECOMP");
         write_out(c, c.arg(3), 0x1234_5678);
@@ -2927,6 +3030,76 @@ pub fn register_extra(r: &mut Registry) {
         let _ = c.host.write(utc, &b);
         ok(3, 1)
     });
+    r.add(k, "IsBadStringPtrW", |_c| ok(2, 0));
+    r.add(k, "IsBadStringPtrA", |_c| ok(2, 0));
+    r.add(k, "GetTempPathW", |c| {
+        let n = copy_wstr_out(c, c.arg(1), c.arg(0), "C:\\Temp\\");
+        ok(2, n)
+    });
+    r.add(k, "CreateEventExW", |c| {
+        let flags = c.arg(2);
+        let h = c.p.new_handle(Handle::Event { manual: flags & 1 != 0, signaled: flags & 2 != 0 });
+        ok(4, h)
+    });
+    r.alias(k, "CreateEventExA", k, "CreateEventExW");
+    r.add(k, "CreateSemaphoreExW", |c| {
+        let h = c.p.new_handle(Handle::Semaphore);
+        ok(6, h)
+    });
+    r.add(k, "FlushProcessWriteBuffers", |_c| ok(0, 0));
+    r.add(k, "LockFile", |_c| ok(5, 1));
+    r.add(k, "UnlockFile", |_c| ok(5, 1));
+    r.add(k, "LockFileEx", |_c| ok(6, 1));
+    r.add(k, "UnlockFileEx", |_c| ok(5, 1));
+    r.add(k, "CreatePipe", |c| {
+        c.set_last_error(50); // ERROR_NOT_SUPPORTED
+        ok(4, 0)
+    });
+    for name in ["CreateHardLinkA", "CreateHardLinkW"] {
+        r.add(k, name, |c| {
+            c.set_last_error(50);
+            ok(3, 0)
+        });
+    }
+    for name in ["CreateSymbolicLinkA", "CreateSymbolicLinkW"] {
+        r.add(k, name, |c| {
+            c.set_last_error(50);
+            ok(3, 0)
+        });
+    }
+    r.add(k, "SetConsoleMode", |_c| ok(2, 1));
+    r.add(k, "VerifyConsoleIoHandle", |_c| ok(1, 0));
+    r.add(k, "ReadConsoleA", |c| {
+        write_out(c, c.arg(3), 0);
+        ok(5, 0)
+    });
+    r.add(k, "PeekConsoleInputA", |c| {
+        write_out(c, c.arg(3), 0);
+        ok(4, 0)
+    });
+    r.add(k, "ReadConsoleInputA", |c| {
+        write_out(c, c.arg(3), 0);
+        ok(4, 0)
+    });
+    r.alias(k, "ReadConsoleInputW", k, "ReadConsoleInputA");
+    // Thread pools are not available (no second thread runs callbacks).
+    for (name, n) in [("CreateThreadpoolWork", 3), ("CreateThreadpoolTimer", 3), ("CreateThreadpoolWait", 3)] {
+        r.add_n(k, name, n, |c| {
+            c.set_last_error(50);
+            ok(3, 0)
+        });
+    }
+    for (name, n) in [("CloseThreadpoolWork", 1), ("CloseThreadpoolTimer", 1), ("CloseThreadpoolWait", 1), ("SubmitThreadpoolWork", 1), ("FreeLibraryWhenCallbackReturns", 2)] {
+        r.add_n(k, name, n, |c| ok(c.nargs(), 0));
+    }
+    r.add(k, "SetThreadpoolTimer", |_c| ok(4, 0));
+    r.add(k, "SetThreadpoolWait", |_c| ok(3, 0));
+    r.add(k, "WaitForThreadpoolTimerCallbacks", |_c| ok(2, 0));
+    r.add(k, "ResolveDelayLoadedAPI", |c| {
+        c.p.log("ResolveDelayLoadedAPI: delay-loaded imports are not supported".into());
+        ok(6, 0)
+    });
+    r.add(k, "DelayLoadFailureHook", |_c| ok(2, 0));
     // Waitable timers: signaled once the virtual clock passes the due time.
     r.add(k, "CreateWaitableTimerW", |c| {
         let manual = c.arg(1) != 0;

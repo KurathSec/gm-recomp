@@ -49,6 +49,46 @@ enum Cmd {
     },
 }
 
+/// DLLs the game's modules import that it does not ship and the runtime does not
+/// emulate (the Visual C++ runtimes of extension DLLs, say) are copied from the system
+/// DLL folder (Wine's PE builds) to files/C/Windows/system32, where the runtime looks
+/// after the game directory, with the DLLs they need in turn.
+fn supply_system_dlls(files_dir: &Path, system: &Path) -> Result<Vec<String>> {
+    let emulated = |stem: &str| runtime::hle::kernel32::CORE_DLLS.contains(&stem) || runtime::hle::kernel32::HLE_DLLS.contains(&stem);
+    let mut all = Vec::new();
+    walk(files_dir, files_dir, &mut all)?;
+    let shipped: std::collections::HashSet<String> =
+        all.iter().filter(|f| !f.path.contains('/')).map(|f| f.path.to_lowercase()).collect();
+    let mut queue: Vec<PathBuf> = all
+        .iter()
+        .filter(|f| { let l = f.path.to_lowercase(); l.ends_with(".exe") || l.ends_with(".dll") })
+        .map(|f| files_dir.join(&f.path))
+        .collect();
+    let sysdir = files_dir.join("C").join("Windows").join("system32");
+    let mut supplied = Vec::new();
+    while let Some(path) = queue.pop() {
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(pe) = pe::Pe::parse(&bytes) else { continue };
+        for d in pe.imports().unwrap_or_default() {
+            let name = d.dll.to_lowercase();
+            let stem = name.trim_end_matches(".dll").to_string();
+            if emulated(&stem) || shipped.contains(&name) || supplied.contains(&name) {
+                continue;
+            }
+            let src = system.join(&name);
+            if !src.is_file() {
+                continue;
+            }
+            fs::create_dir_all(&sysdir)?;
+            let dst = sysdir.join(&name);
+            fs::copy(&src, &dst)?;
+            supplied.push(name);
+            queue.push(dst);
+        }
+    }
+    Ok(supplied)
+}
+
 /// <out>/index.json: [{slug, title, engine}] of every imported game, by title.
 fn write_index(out: &Path) -> Result<()> {
     let mut games = Vec::new();
@@ -174,6 +214,9 @@ fn import_one(input: &Path, out: &Path, sys: &inventory::SystemExports, force: b
     let staged = extract::stage(input, &files_dir)?;
     let iexpress = extract::unwrap_iexpress(&files_dir, &staging.join("scratch"))?;
     let _ = fs::remove_dir_all(staging.join("scratch"));
+    for dll in supply_system_dlls(&files_dir, &sys.dir)? {
+        println!("  supplying {dll} (imported, neither shipped nor emulated)");
+    }
 
     let mut slug = slugify(&staged.title);
     if slug.is_empty() {

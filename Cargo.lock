@@ -860,6 +860,7 @@ dependencies = [
  "clap",
  "encoding_rs",
  "pe",
+ "runtime",
  "serde",
  "serde_json",
  "sha2 0.11.1",

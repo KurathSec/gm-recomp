@@ -514,6 +514,69 @@ export class D3DGL {
     this.count = 0;
   }
 
+  /** The framebuffer of target `id` (0: back buffer), made for plain textures on demand. */
+  targetFbo(id) {
+    if (!id) return this.back?.fbo;
+    const t = this.textures.get(id);
+    if (!t) return null;
+    if (!t.fbo) Object.assign(t, this.framebuffer(t.w, t.h, t.tex));
+    return t.fbo;
+  }
+
+  /** StretchRect: both sides hold rows in D3D order, so no flip. */
+  blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) {
+    this.flush();
+    const gl = this.gl;
+    const s = this.targetFbo(src);
+    const d = this.targetFbo(dst);
+    if (!s || !d) return;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, s);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, d);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.colorMask(true, true, true, true);
+    gl.blitFramebuffer(sx, sy, sx + sw, sy + sh, dx, dy, dx + dw, dy + dh, gl.COLOR_BUFFER_BIT, linear ? gl.LINEAR : gl.NEAREST);
+    this.bindTarget(this.target, this.targetW, this.targetH);
+    this.key = '';
+  }
+
+  /** GetRenderTargetData: target pixels into guest memory as B, G, R, A bytes. */
+  readTarget(id, w, h, dst, pitch) {
+    this.flush();
+    const gl = this.gl;
+    const f = this.targetFbo(id);
+    if (!f) return;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, f);
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.bindTarget(this.target, this.targetW, this.targetH);
+    const out = new Uint8Array(this.guestBuffer());
+    for (let y = 0; y < h; y++) {
+      const o = dst + y * pitch;
+      for (let x = 0; x < w; x++) {
+        const i = 4 * (y * w + x);
+        out[o + 4 * x] = px[i + 2];
+        out[o + 4 * x + 1] = px[i + 1];
+        out[o + 4 * x + 2] = px[i];
+        out[o + 4 * x + 3] = px[i + 3];
+      }
+    }
+  }
+
+  shaderCreate(id, vertex, glsl) {
+    (this.shaders ??= new Map()).set(id, { vertex, glsl });
+  }
+
+  shaderDelete(id) {
+    this.shaders?.delete(id);
+  }
+
+  draw9(ptr) {
+    if (!this.warned9) {
+      this.warned9 = true;
+      console.warn('gmrecomp: shader draws are not rendered yet');
+    }
+  }
+
   /** The back buffer as a PNG (ArrayBuffer). */
   async snapshot() {
     this.flush();

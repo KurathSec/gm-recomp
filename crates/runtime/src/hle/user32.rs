@@ -2162,8 +2162,8 @@ pub fn register_more(r: &mut Registry) {
             ok(3, 0)
         }
     });
-    r.alias(u, "EnumDisplaySettingsExW", u, "EnumDisplaySettingsW");
-    r.alias(u, "EnumDisplaySettingsExA", u, "EnumDisplaySettingsA");
+    r.alias_n(u, "EnumDisplaySettingsExW", u, "EnumDisplaySettingsW", 4);
+    r.alias_n(u, "EnumDisplaySettingsExA", u, "EnumDisplaySettingsA", 4);
     r.add(u, "ChangeDisplaySettingsW", |c| {
         c.trace(format!("(devmode {:#x}, flags {:#x})", c.arg(0), c.arg(1)));
         ok(2, 0)
