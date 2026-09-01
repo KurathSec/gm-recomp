@@ -5,123 +5,348 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>gmrecomp</title>
     <style>
-      :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; }
-      @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #e8e8e4; --muted: #9a9a93; } }
-      body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
-      #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; color: var(--muted); max-height: 30vh; overflow: auto; }
-      #screen { display: block; margin: 8px 0; image-rendering: pixelated; background: #000; max-width: 100%; }
+      :root {
+        color-scheme: dark light;
+        --bg: #101012;
+        --panel: #1a1a1e;
+        --line: #2c2c33;
+        --fg: #ececf1;
+        --muted: #8d8d99;
+        --accent: #e8b44a;
+        --stage: #000;
+      }
+      @media (prefers-color-scheme: light) {
+        :root { --bg: #f4f3ef; --panel: #ffffff; --line: #dcdad3; --fg: #1d1c19; --muted: #6c6a62; --accent: #a8700f; }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+      a { color: inherit; }
+      button, label.button {
+        font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+        border-radius: 6px; padding: 5px 10px; cursor: pointer;
+      }
+      button:hover, label.button:hover { border-color: var(--muted); }
+      [hidden] { display: none !important; }
+
+      /* library */
+      #library { max-width: 960px; margin: 0 auto; padding: 40px 16px 64px; }
+      #library h1 { margin: 0; font: 600 26px/1.2 ui-monospace, monospace; letter-spacing: -0.02em; }
+      #library h1 span { color: var(--accent); }
+      #library .lede { margin: 6px 0 28px; color: var(--muted); }
+      #games { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+      #games a {
+        display: flex; flex-direction: column; gap: 10px; height: 100%; padding: 16px; text-decoration: none;
+        background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+      }
+      #games a:hover { border-color: var(--accent); }
+      #games .title { font-weight: 600; font-size: 16px; }
+      #games .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+      .badge { font: 12px/1 ui-monospace, monospace; padding: 4px 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); }
+      .badge.saved { color: var(--accent); border-color: currentColor; }
+      #games li.unsupported a { opacity: 0.55; }
+      #games li.unsupported a:hover { border-color: var(--line); }
+      #empty { color: var(--muted); }
+
+      /* player */
+      #player { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--stage); }
+      #bar {
+        display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg);
+        border-bottom: 1px solid var(--line); flex-wrap: wrap;
+      }
+      #bar .name { font-weight: 600; margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #bar a.back { text-decoration: none; color: var(--muted); font-size: 13px; }
+      #bar a.back:hover { color: var(--fg); }
+      #stage { position: relative; flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden; }
+      #screen { display: block; image-rendering: pixelated; background: #000; }
+      #status {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #b9b9c2;
+        font: 13px/1.4 ui-monospace, monospace; text-align: center; max-width: 90%;
+      }
+      #hint {
+        position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 6px 12px; border-radius: 6px;
+        background: rgba(20, 20, 24, 0.85); color: #d9d9e0; font-size: 13px; pointer-events: none;
+      }
+      #log {
+        position: absolute; right: 0; top: 0; bottom: 0; width: min(520px, 100%); margin: 0; padding: 10px; overflow: auto;
+        background: rgba(10, 10, 12, 0.92); color: #a9a9b3; font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap;
+      }
+      body.fullscreen #bar { display: none; }
     </style>
   </head>
   <body>
-    <div id="status">starting…</div>
-    <canvas id="screen" width="640" height="480"></canvas>
-    <div id="log"></div>
+    <main id="library" hidden>
+      <h1>gm<span>recomp</span></h1>
+      <p class="lede">GameMaker games, recompiled from their original executables to run in the browser.</p>
+      <ul id="games"></ul>
+      <p id="empty" hidden>No games yet. Import some with <code>importer import … --out web/public/games</code>.</p>
+    </main>
+
+    <div id="player" hidden>
+      <div id="bar">
+        <a class="back" href="./">← Games</a>
+        <span class="name" id="name"></span>
+        <button id="scale" title="Integer scaling keeps pixels square and sharp">Scale: integer</button>
+        <button id="export">Export saves</button>
+        <label class="button" title="Load saves exported earlier (restarts the game)">Import saves<input id="import" type="file" accept=".json,application/json" hidden /></label>
+        <button id="wipe">Delete saves</button>
+        <button id="logbtn">Log</button>
+        <button id="fs">Fullscreen</button>
+      </div>
+      <div id="stage">
+        <canvas id="screen" width="640" height="480"></canvas>
+        <div id="status">Loading…</div>
+        <div id="hint" hidden>Click or press a key to turn on sound</div>
+        <pre id="log" hidden></pre>
+      </div>
+    </div>
+
     <script type="module">
-      // ?game=<slug>&frames=N[&epoch=S][&report=1][&capture=30,60][&nopace=1][&script=100:Enter:1,105:Enter:0][&audio=1][&nosave=1]
+      import { deleteSaves, exportSaves, loadSaves, openSaves, parseSaves, storeSaves } from './src/saves.mjs';
+
+      // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
+      // &nopace=1 &script=100:Enter:1,105:Enter:0 (or f:mouse:x:y:b) &audio=1 &nosave=1
       const q = new URLSearchParams(location.search);
-      const game = q.get('game') ?? 'not-another-needle-game-1-12';
-      const frames = Number(q.get('frames') ?? 0);
-      const epoch = q.has('epoch') ? Number(q.get('epoch')) : Math.floor(Date.now() / 1000);
-      const report = q.has('report');
-      const capture = (q.get('capture') ?? '').split(',').filter(Boolean).map(Number);
-      const pace = !q.has('nopace');
-      // frame:Code:1|0 for keys, frame:mouse:x:y:buttons for the mouse
-      const script = (q.get('script') ?? '').split(',').filter(Boolean).map((s) => {
-        const p = s.split(':');
-        if (p[1] === 'mouse') return [Number(p[0]), 'mouse', Number(p[2]), Number(p[3]), Number(p[4])];
-        return [Number(p[0]), p[1], p[2] === '1'];
-      });
-      let gameW = 640, gameH = 480;
-      // Sound starts with the first user gesture (browser autoplay rules).
-      // audio=1 starts it without one (for tests, with autoplay allowed).
-      let audio = null;
-      let audioStarted = false;
-      let audioNode = null;
-      const startAudio = async () => {
-        if (audioStarted || !audio) return;
-        audioStarted = true;
-        try {
-          const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 'interactive' });
-          await ctx.audioWorklet.addModule('src/audio-worklet.js');
-          const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames } });
-          node.connect(ctx.destination);
-          audioNode = node;
-          // Skip what piled up before the user enabled sound.
-          const idx = new Int32Array(audio.sab, 0, 2);
-          Atomics.store(idx, 1, Atomics.load(idx, 0));
-        } catch (e) {
-          audioStarted = false;
-          send('/log', `audio failed: ${e}`);
+      const game = q.get('game');
+
+      const runnable = (e) => e && (e.kind === 'gm80' || e.kind === 'gm81');
+      function engineLabel(e) {
+        if (!e) return 'unknown engine';
+        if (e.kind === 'gm80') return 'GameMaker 8.0';
+        if (e.kind === 'gm81') return 'GameMaker 8.1';
+        if (e.kind === 'gms') {
+          const build = e.version && e.version[3] && e.version[3] !== 9999 ? `.${e.version[3]}` : '';
+          return `GameMaker: Studio 1.4${build}${e.yyc ? ' · YYC' : ''}`;
         }
-      };
-      for (const t of ['pointerdown', 'keydown']) window.addEventListener(t, startAudio);
-      const audioStats = () => !audioNode ? Promise.resolve(audioStarted ? 'audio: not running' : null) : new Promise((res) => {
-        audioNode.port.onmessage = ({ data: a }) => {
-          const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
-          const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
-          res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
+        return e.kind;
+      }
+
+      if (game) play(game);
+      else library();
+
+      async function library() {
+        document.getElementById('library').hidden = false;
+        let games = [];
+        try {
+          const r = await fetch('games/index.json');
+          if (r.ok) games = await r.json();
+        } catch {}
+        const list = document.getElementById('games');
+        document.getElementById('empty').hidden = games.length > 0;
+        const badges = new Map();
+        for (const g of games) {
+          const li = document.createElement('li');
+          const ok = runnable(g.engine);
+          li.className = ok ? '' : 'unsupported';
+          const a = document.createElement('a');
+          a.href = `?game=${encodeURIComponent(g.slug)}`;
+          const title = document.createElement('span');
+          title.className = 'title';
+          title.textContent = g.title || g.slug;
+          const meta = document.createElement('span');
+          meta.className = 'meta';
+          const badge = (text, cls = '') => {
+            const b = document.createElement('span');
+            b.className = `badge ${cls}`;
+            b.textContent = text;
+            meta.append(b);
+          };
+          badge(engineLabel(g.engine));
+          if (!ok) badge('not playable yet');
+          a.append(title, meta);
+          li.append(a);
+          list.append(li);
+          badges.set(g.slug, badge);
+        }
+        // Mark the games that have saves (after the list is up).
+        try {
+          const db = await openSaves();
+          for (const [slug, badge] of badges) {
+            loadSaves(db, slug).then((s) => s.some((e) => e.data) && badge('saved', 'saved')).catch(() => {});
+          }
+        } catch {}
+      }
+
+      async function play(game) {
+        const frames = Number(q.get('frames') ?? 0);
+        const epoch = q.has('epoch') ? Number(q.get('epoch')) : Math.floor(Date.now() / 1000);
+        const report = q.has('report');
+        const capture = (q.get('capture') ?? '').split(',').filter(Boolean).map(Number);
+        const pace = !q.has('nopace');
+        const persist = !q.has('nosave');
+        const script = (q.get('script') ?? '').split(',').filter(Boolean).map((s) => {
+          const p = s.split(':');
+          if (p[1] === 'mouse') return [Number(p[0]), 'mouse', Number(p[2]), Number(p[3]), Number(p[4])];
+          return [Number(p[0]), p[1], p[2] === '1'];
+        });
+
+        document.getElementById('player').hidden = false;
+        const screen = document.getElementById('screen');
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+        const hint = document.getElementById('hint');
+        const send = (path, body) => report && fetch(path, { method: 'POST', body }).catch(() => {});
+        send('/log', `userAgent: ${navigator.userAgent}\ncrossOriginIsolated: ${self.crossOriginIsolated}`);
+
+        let title = game;
+        fetch(`games/${encodeURIComponent(game)}/manifest.json`)
+          .then((r) => r.json())
+          .then((m) => {
+            title = m.title || game;
+            document.getElementById('name').textContent = title;
+            document.title = `${title} · gmrecomp`;
+          })
+          .catch(() => {});
+
+        // Scaling: the largest whole multiple that fits (or any fit), centered.
+        let gameW = 640, gameH = 480;
+        let integer = true;
+        const fit = () => {
+          const stage = document.getElementById('stage').getBoundingClientRect();
+          let s = Math.min(stage.width / gameW, stage.height / gameH);
+          if (integer && s >= 1) s = Math.floor(s);
+          screen.style.width = `${Math.max(1, Math.round(gameW * s))}px`;
+          screen.style.height = `${Math.max(1, Math.round(gameH * s))}px`;
         };
-        audioNode.port.postMessage(0);
-      });
-      const logEl = document.getElementById('log');
-      const screen = document.getElementById('screen');
-      const statusEl = document.getElementById('status');
-      const send = (path, body) => report && fetch(path, { method: 'POST', body }).catch(() => {});
-      send('/log', `userAgent: ${navigator.userAgent}\ncrossOriginIsolated: ${self.crossOriginIsolated}`);
-      const w = new Worker('src/worker.mjs', { type: 'module' });
-      w.onmessage = ({ data }) => {
-        if (data.type === 'log') {
-          logEl.textContent += data.line + '\n';
-          send('/log', data.line);
-        } else if (data.type === 'audio') {
-          audio = data;
-          if (q.has('audio')) startAudio();
-        } else if (data.type === 'size') {
-          [gameW, gameH] = [data.w, data.h];
-          screen.style.width = `${data.w}px`;
-        } else if (data.type === 'capture') {
-          if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
-        } else if (data.type === 'done') {
-          statusEl.textContent = `finished (status ${data.status})`;
-          audioStats().then((a) => {
-            if (a) send('/log', a);
-            send('/done', `status ${data.status}`);
+        window.addEventListener('resize', fit);
+        document.getElementById('scale').onclick = (e) => {
+          integer = !integer;
+          e.target.textContent = `Scale: ${integer ? 'integer' : 'fit'}`;
+          fit();
+        };
+        document.getElementById('fs').onclick = () => document.getElementById('player').requestFullscreen?.();
+        document.addEventListener('fullscreenchange', () => {
+          document.body.classList.toggle('fullscreen', !!document.fullscreenElement);
+          requestAnimationFrame(fit);
+        });
+        document.getElementById('logbtn').onclick = () => (logEl.hidden = !logEl.hidden);
+        if (q.has('log')) logEl.hidden = false;
+        fit();
+
+        // Saves.
+        const saveDb = persist ? openSaves().catch(() => null) : Promise.resolve(null);
+        document.getElementById('export').onclick = async () => {
+          const db = await saveDb;
+          const saves = db ? await loadSaves(db, game) : [];
+          if (!saves.length) return alert('This game has no saves yet.');
+          const url = URL.createObjectURL(new Blob([exportSaves(game, saves)], { type: 'application/json' }));
+          const a = Object.assign(document.createElement('a'), { href: url, download: `${game}-saves.json` });
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        };
+        document.getElementById('import').onchange = async (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          try {
+            const entries = parseSaves(await file.text(), game);
+            const db = await saveDb;
+            if (!db) throw new Error('saves are not available in this browser');
+            if (!confirm(`Replace this game's saves with ${file.name} and restart?`)) return;
+            await deleteSaves(db, game);
+            await storeSaves(db, game, entries);
+            location.reload();
+          } catch (err) {
+            alert(`Could not import: ${err.message}`);
+          }
+        };
+        document.getElementById('wipe').onclick = async () => {
+          const db = await saveDb;
+          if (!db || !confirm(`Delete every save of ${title} and restart?`)) return;
+          await deleteSaves(db, game);
+          location.reload();
+        };
+
+        // Sound starts with the first user gesture (browser autoplay rules); audio=1
+        // starts it without one (tests, with autoplay allowed).
+        let audio = null;
+        let audioStarted = false;
+        let audioNode = null;
+        const startAudio = async () => {
+          if (audioStarted || !audio) return;
+          audioStarted = true;
+          try {
+            const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 'interactive' });
+            await ctx.audioWorklet.addModule('src/audio-worklet.js');
+            const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames } });
+            node.connect(ctx.destination);
+            audioNode = node;
+            // Skip what piled up before the user enabled sound.
+            const idx = new Int32Array(audio.sab, 0, 2);
+            Atomics.store(idx, 1, Atomics.load(idx, 0));
+            hint.hidden = true;
+          } catch (e) {
+            audioStarted = false;
+            send('/log', `audio failed: ${e}`);
+          }
+        };
+        for (const t of ['pointerdown', 'keydown']) window.addEventListener(t, startAudio);
+        const audioStats = () => !audioNode ? Promise.resolve(audioStarted ? 'audio: not running' : null) : new Promise((res) => {
+          audioNode.port.onmessage = ({ data: a }) => {
+            const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
+            const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
+            res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
+          };
+          audioNode.port.postMessage(0);
+        });
+
+        const w = new Worker('src/worker.mjs', { type: 'module' });
+        w.onmessage = ({ data }) => {
+          if (data.type === 'log') {
+            logEl.textContent += data.line + '\n';
+            send('/log', data.line);
+            if (data.line.startsWith('downloaded')) statusEl.textContent = 'Starting…';
+          } else if (data.type === 'audio') {
+            audio = data;
+            if (q.has('audio')) startAudio();
+            else if (!audioStarted) hint.hidden = false;
+          } else if (data.type === 'size') {
+            [gameW, gameH] = [data.w, data.h];
+            statusEl.hidden = true;
+            fit();
+          } else if (data.type === 'capture') {
+            if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
+          } else if (data.type === 'done') {
+            statusEl.hidden = false;
+            statusEl.textContent = data.status === 0 ? 'The game has ended.' : `The game stopped (status ${data.status}). See the log for details.`;
+            audioStats().then((a) => {
+              if (a) send('/log', a);
+              send('/done', `status ${data.status}`);
+            });
+          }
+        };
+        w.onerror = (e) => {
+          statusEl.hidden = false;
+          statusEl.textContent = `worker error: ${e.message}`;
+          send('/done', `worker error: ${e.message}`);
+        };
+        statusEl.textContent = 'Downloading…';
+        const offscreen = screen.transferControlToOffscreen();
+        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, script, persist }, [offscreen]);
+
+        // Input goes to the worker as it happens; the runtime applies it at the guest's
+        // next message poll.
+        const gameKeys = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|Digit|Escape|Numpad|Page|Home|End|Insert|Delete)/;
+        for (const type of ['keydown', 'keyup']) {
+          window.addEventListener(type, (e) => {
+            if (e.target instanceof HTMLInputElement) return;
+            if (gameKeys.test(e.code) && !e.metaKey && e.code !== 'F11') e.preventDefault();
+            if (e.repeat) return;
+            w.postMessage({ type: 'key', code: e.code, down: type === 'keydown' });
           });
         }
-      };
-      w.onerror = (e) => {
-        statusEl.textContent = `worker error: ${e.message}`;
-        send('/done', `worker error: ${e.message}`);
-      };
-      statusEl.textContent = `running ${game}…`;
-      const offscreen = screen.transferControlToOffscreen();
-      w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, script, persist: !q.has('nosave') }, [offscreen]);
-
-      // Input goes to the worker as it happens; the runtime applies it at the guest's
-      // next message poll.
-      const gameKeys = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|Digit|Escape|Numpad|Page|Home|End|Insert|Delete)/;
-      for (const type of ['keydown', 'keyup']) {
-        window.addEventListener(type, (e) => {
-          if (gameKeys.test(e.code) && !e.metaKey) e.preventDefault();
-          if (e.repeat) return;
-          w.postMessage({ type: 'key', code: e.code, down: type === 'keydown' });
+        window.addEventListener('blur', () => {
+          // Releasing everything avoids keys stuck down after switching away.
+          for (const code of ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space', 'KeyZ', 'KeyX', 'KeyR', 'KeyS'])
+            w.postMessage({ type: 'key', code, down: false });
         });
+        const mouse = (e) => {
+          const r = screen.getBoundingClientRect();
+          const buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
+          w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons });
+        };
+        for (const t of ['mousemove', 'mousedown', 'mouseup']) screen.addEventListener(t, mouse);
+        screen.addEventListener('contextmenu', (e) => e.preventDefault());
       }
-      window.addEventListener('blur', () => {
-        // Releasing everything avoids keys stuck down after switching away.
-        for (const code of ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space', 'KeyZ', 'KeyX', 'KeyR', 'KeyS'])
-          w.postMessage({ type: 'key', code, down: false });
-      });
-      let buttons = 0;
-      const mouse = (e) => {
-        const r = screen.getBoundingClientRect();
-        const sx = gameW / r.width;
-        const sy = gameH / r.height;
-        buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
-        w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy, buttons });
-      };
-      for (const t of ['mousemove', 'mousedown', 'mouseup']) screen.addEventListener(t, mouse);
-      screen.addEventListener('contextmenu', (e) => e.preventDefault());
     </script>
   </body>
 </html>

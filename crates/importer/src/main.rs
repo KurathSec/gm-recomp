@@ -32,6 +32,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Write <out>/index.json, the game list the launcher page shows.
+    Index { out: PathBuf },
     /// Summarize every manifest under <out> into a Markdown API/module inventory.
     Report {
         out: PathBuf,
@@ -45,6 +47,19 @@ enum Cmd {
         #[arg(long)]
         only: Option<String>,
     },
+}
+
+/// <out>/index.json: [{slug, title, engine}] of every imported game, by title.
+fn write_index(out: &Path) -> Result<()> {
+    let mut games = Vec::new();
+    for e in fs::read_dir(out)?.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join("manifest.json")) else { continue };
+        let m: serde_json::Value = serde_json::from_str(&text)?;
+        games.push(serde_json::json!({ "slug": m["slug"], "title": m["title"], "engine": m["engine"] }));
+    }
+    games.sort_by_key(|g| g["title"].as_str().unwrap_or_default().to_lowercase());
+    fs::write(out.join("index.json"), serde_json::to_string_pretty(&games)?)?;
+    Ok(())
 }
 
 fn discover_all(out: &Path, only: Option<&str>) -> Result<()> {
@@ -235,11 +250,13 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            write_index(&out)?;
             if failed > 0 {
                 bail!("{failed} of {} imports failed", inputs.len());
             }
             Ok(())
         }
+        Cmd::Index { out } => write_index(&out),
         Cmd::Report { out, md } => report::write(&out, &md),
         Cmd::Discover { out, only } => discover_all(&out, only.as_deref()),
     }

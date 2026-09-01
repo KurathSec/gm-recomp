@@ -2,51 +2,10 @@
 // Messages to the page: {type: 'log', line} and {type: 'done', status}.
 import { runGame } from './host.mjs';
 import { KEYS } from './keys.mjs';
+import { applySaves, loadSaves, openSaves, storeSaves } from './saves.mjs';
 
 let input = null;
 const early = [];
-
-// Saves: every file a game writes outside the temp directory, per game, in IndexedDB
-// (key "<game>\0<lowercase path>", value {path, data | null for removed, mtime}).
-function openSaves() {
-  return new Promise((resolve, reject) => {
-    const r = indexedDB.open('gmrecomp', 1);
-    r.onupgradeneeded = () => r.result.createObjectStore('saves');
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
-}
-
-function loadSaves(db, game) {
-  return new Promise((resolve, reject) => {
-    const range = IDBKeyRange.bound(`${game}\0`, `${game}\0\uffff`);
-    const r = db.transaction('saves').objectStore('saves').getAll(range);
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
-}
-
-function storeSaves(db, game, changes) {
-  // strict: on disk before the transaction completes (saves are small and rare)
-  const tx = db.transaction('saves', 'readwrite', { durability: 'strict' });
-  const store = tx.objectStore('saves');
-  for (const c of changes) store.put(c, `${game}\0${c.path.toLowerCase()}`);
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-/** The game's files with its saves applied: written files replace or add, removed ones go. */
-function applySaves(files, saves) {
-  const key = (p) => p.replaceAll('/', '\\').toLowerCase();
-  const byPath = new Map(files.map((f) => [key(f[0]), f]));
-  for (const s of saves) {
-    if (s.data) byPath.set(key(s.path), [s.path, s.data, s.mtime]);
-    else byPath.delete(key(s.path));
-  }
-  return [...byPath.values()];
-}
 
 function handleInput(data) {
   if (!input) return early.push(data);
