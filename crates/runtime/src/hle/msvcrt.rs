@@ -876,3 +876,712 @@ impl Registry {
 fn handle_is_file(c: &Ctx, h: u32) -> bool {
     matches!(c.p.handles.get(&h), Some(Handle::File(_)))
 }
+
+// ---- the rest of what game DLLs (d3dx9_43.dll) import --------------------------------
+
+/// strtod over guest memory: the longest prefix that parses (decimal, hex floats,
+/// inf/nan); returns the value and the number of bytes consumed (0: no number).
+fn parse_double(c: &Ctx, p: u32) -> (f64, u32) {
+    let s = c.host.read_cstr(p).unwrap_or_default();
+    let mut i = 0;
+    while i < s.len() && (s[i] == b' ' || (9..=13).contains(&s[i])) {
+        i += 1;
+    }
+    let start = i;
+    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+        i += 1;
+    }
+    let lower: Vec<u8> = s[i..].iter().map(|b| b.to_ascii_lowercase()).collect();
+    let neg = start < s.len() && s[start] == b'-';
+    let sign = if neg { -1.0 } else { 1.0 };
+    for (word, v) in [(&b"infinity"[..], f64::INFINITY), (b"inf", f64::INFINITY), (b"nan", f64::NAN)] {
+        if lower.starts_with(word) {
+            return (sign * v, (i + word.len()) as u32);
+        }
+    }
+    let digits_start = i;
+    let mut saw_digit = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+        saw_digit = true;
+    }
+    if i < s.len() && s[i] == b'.' {
+        i += 1;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+            saw_digit = true;
+        }
+    }
+    if !saw_digit {
+        return (0.0, 0);
+    }
+    if i < s.len() && (s[i] == b'e' || s[i] == b'E') {
+        let mut j = i + 1;
+        if j < s.len() && (s[j] == b'+' || s[j] == b'-') {
+            j += 1;
+        }
+        if j < s.len() && s[j].is_ascii_digit() {
+            while j < s.len() && s[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    let text = std::str::from_utf8(&s[digits_start..i]).unwrap_or("0");
+    (sign * text.parse::<f64>().unwrap_or(0.0), i as u32)
+}
+
+/// strtol-style integer prefix: (value, bytes consumed).
+fn parse_long(s: &[u8], base: u32) -> (i64, usize) {
+    let mut i = 0;
+    while i < s.len() && (s[i] == b' ' || (9..=13).contains(&s[i])) {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+        neg = s[i] == b'-';
+        i += 1;
+    }
+    let mut base = base;
+    if (base == 0 || base == 16) && i + 1 < s.len() && s[i] == b'0' && (s[i + 1] | 0x20) == b'x' {
+        i += 2;
+        base = 16;
+    } else if base == 0 && i < s.len() && s[i] == b'0' {
+        base = 8;
+    } else if base == 0 {
+        base = 10;
+    }
+    let digits = i;
+    let mut v: i64 = 0;
+    while i < s.len() {
+        let d = match s[i] {
+            b'0'..=b'9' => (s[i] - b'0') as u32,
+            b'a'..=b'z' => (s[i] - b'a') as u32 + 10,
+            b'A'..=b'Z' => (s[i] - b'A') as u32 + 10,
+            _ => break,
+        };
+        if d >= base {
+            break;
+        }
+        v = v.wrapping_mul(base as i64).wrapping_add(d as i64);
+        i += 1;
+    }
+    if i == digits {
+        return (0, 0);
+    }
+    (if neg { v.wrapping_neg() } else { v }, i)
+}
+
+/// sscanf over guest memory with the conversions C code commonly uses.
+fn scan(c: &mut Ctx, input: &[u8], fmt: &[u8], va: &mut VaList) -> i32 {
+    let (mut si, mut fi, mut assigned) = (0usize, 0usize, 0i32);
+    let ws = |b: u8| b == b' ' || (9..=13).contains(&b);
+    while fi < fmt.len() {
+        let f = fmt[fi];
+        if ws(f) {
+            while si < input.len() && ws(input[si]) {
+                si += 1;
+            }
+            fi += 1;
+            continue;
+        }
+        if f != b'%' {
+            if si >= input.len() || input[si] != f {
+                break;
+            }
+            si += 1;
+            fi += 1;
+            continue;
+        }
+        fi += 1;
+        if fi < fmt.len() && fmt[fi] == b'%' {
+            if si >= input.len() || input[si] != b'%' {
+                break;
+            }
+            si += 1;
+            fi += 1;
+            continue;
+        }
+        let suppress = fi < fmt.len() && fmt[fi] == b'*';
+        if suppress {
+            fi += 1;
+        }
+        let mut width = 0usize;
+        while fi < fmt.len() && fmt[fi].is_ascii_digit() {
+            width = width * 10 + (fmt[fi] - b'0') as usize;
+            fi += 1;
+        }
+        let mut size = 0; // 1 = h, 2 = l, 3 = ll/I64
+        while fi < fmt.len() && matches!(fmt[fi], b'h' | b'l' | b'L' | b'I' | b'6' | b'4') {
+            size = match fmt[fi] {
+                b'h' => 1,
+                b'l' if size == 2 => 3,
+                b'l' | b'L' => 2,
+                b'4' => 3,
+                _ => size,
+            };
+            fi += 1;
+        }
+        let Some(&conv) = fmt.get(fi) else { break };
+        fi += 1;
+        if !matches!(conv, b'c' | b'[' | b'n') {
+            while si < input.len() && ws(input[si]) {
+                si += 1;
+            }
+        }
+        let limit = |si: usize| if width > 0 { (si + width).min(input.len()) } else { input.len() };
+        match conv {
+            b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
+                let base = match conv {
+                    b'd' | b'u' => 10,
+                    b'x' | b'X' => 16,
+                    b'o' => 8,
+                    _ => 0,
+                };
+                let (v, n) = parse_long(&input[si..limit(si)], base);
+                if n == 0 {
+                    break;
+                }
+                si += n;
+                if !suppress {
+                    let p = va.u32(c);
+                    let _ = match size {
+                        1 => c.host.write_u16(p, v as u16),
+                        3 => c.host.write_u64(p, v as u64),
+                        _ => c.host.write_u32(p, v as u32),
+                    };
+                    assigned += 1;
+                }
+            }
+            b'f' | b'e' | b'g' | b'E' | b'G' => {
+                let end = limit(si);
+                let text = String::from_utf8_lossy(&input[si..end]).into_owned();
+                // the longest prefix that is a number
+                let mut best = None;
+                for k in (1..=text.len()).rev() {
+                    let t = &text[..k];
+                    if t.ends_with(['e', 'E', '+', '-']) {
+                        continue;
+                    }
+                    if let Ok(v) = t.parse::<f64>() {
+                        best = Some((v, k));
+                        break;
+                    }
+                }
+                let Some((v, n)) = best else { break };
+                si += n;
+                if !suppress {
+                    let p = va.u32(c);
+                    let _ = if size >= 2 { c.host.write_u64(p, v.to_bits()) } else { c.host.write_u32(p, (v as f32).to_bits()) };
+                    assigned += 1;
+                }
+            }
+            b's' => {
+                let start = si;
+                let end = limit(si);
+                while si < end && !ws(input[si]) {
+                    si += 1;
+                }
+                if si == start {
+                    break;
+                }
+                if !suppress {
+                    let p = va.u32(c);
+                    let mut b = input[start..si].to_vec();
+                    b.push(0);
+                    let _ = c.host.write(p, &b);
+                    assigned += 1;
+                }
+            }
+            b'c' => {
+                let n = width.max(1);
+                if si + n > input.len() {
+                    break;
+                }
+                if !suppress {
+                    let p = va.u32(c);
+                    let _ = c.host.write(p, &input[si..si + n]);
+                    assigned += 1;
+                }
+                si += n;
+            }
+            b'[' => {
+                let negate = fi < fmt.len() && fmt[fi] == b'^';
+                if negate {
+                    fi += 1;
+                }
+                let set_start = fi;
+                if fi < fmt.len() && fmt[fi] == b']' {
+                    fi += 1;
+                }
+                while fi < fmt.len() && fmt[fi] != b']' {
+                    fi += 1;
+                }
+                let set = &fmt[set_start..fi];
+                fi += 1;
+                let in_set = |b: u8| {
+                    let mut k = 0;
+                    let mut hit = false;
+                    while k < set.len() {
+                        if k + 2 < set.len() && set[k + 1] == b'-' {
+                            hit |= (set[k]..=set[k + 2]).contains(&b);
+                            k += 3;
+                        } else {
+                            hit |= set[k] == b;
+                            k += 1;
+                        }
+                    }
+                    hit != negate
+                };
+                let start = si;
+                let end = limit(si);
+                while si < end && in_set(input[si]) {
+                    si += 1;
+                }
+                if si == start {
+                    break;
+                }
+                if !suppress {
+                    let p = va.u32(c);
+                    let mut b = input[start..si].to_vec();
+                    b.push(0);
+                    let _ = c.host.write(p, &b);
+                    assigned += 1;
+                }
+            }
+            b'n' => {
+                if !suppress {
+                    let p = va.u32(c);
+                    let _ = c.host.write_u32(p, si as u32);
+                }
+            }
+            _ => break,
+        }
+    }
+    if assigned == 0 && si >= input.len() && !input.is_empty() { assigned } else if input.is_empty() { -1 } else { assigned }
+}
+
+/// x87 status word bits as the CRT reports them (_SW_*).
+fn sw_to_crt(sw: u16) -> u32 {
+    let mut r = 0;
+    for (x, crt) in [(0x20, 0x1), (0x10, 0x2), (0x08, 0x4), (0x04, 0x8), (0x01, 0x10), (0x02, 0x80000)] {
+        if sw & x != 0 {
+            r |= crt;
+        }
+    }
+    r
+}
+
+/// x87 control word <-> the CRT's abstract control word (_EM_*, _RC_*, _PC_*).
+fn cw_to_crt(cw: u16) -> u32 {
+    let mut r = sw_to_crt(cw & 0x3f);
+    r |= match (cw >> 10) & 3 {
+        1 => 0x100,
+        2 => 0x200,
+        3 => 0x300,
+        _ => 0,
+    };
+    r |= match (cw >> 8) & 3 {
+        0 => 0x20000,
+        2 => 0x10000,
+        _ => 0,
+    };
+    if cw & 0x1000 != 0 {
+        r |= 0x40000;
+    }
+    r
+}
+
+fn crt_to_cw(v: u32, old: u16) -> u16 {
+    let mut cw = old & !0x1f3f;
+    for (x, crt) in [(0x20, 0x1), (0x10, 0x2), (0x08, 0x4), (0x04, 0x8), (0x01, 0x10), (0x02, 0x80000)] {
+        if v & crt != 0 {
+            cw |= x;
+        }
+    }
+    cw |= match v & 0x300 {
+        0x100 => 1 << 10,
+        0x200 => 2 << 10,
+        0x300 => 3 << 10,
+        _ => 0,
+    };
+    cw |= match v & 0x30000 {
+        0x20000 => 0,
+        0x10000 => 2 << 8,
+        _ => 3 << 8,
+    };
+    if v & 0x40000 != 0 {
+        cw |= 0x1000;
+    }
+    cw
+}
+
+fn itoa(v: u64, neg: bool, radix: u32) -> Vec<u8> {
+    let radix = radix.clamp(2, 36) as u64;
+    let mut digits = Vec::new();
+    let mut n = v;
+    loop {
+        let d = (n % radix) as u8;
+        digits.push(if d < 10 { b'0' + d } else { b'a' + d - 10 });
+        n /= radix;
+        if n == 0 {
+            break;
+        }
+    }
+    if neg {
+        digits.push(b'-');
+    }
+    digits.reverse();
+    digits
+}
+
+fn write_cstr(c: &mut Ctx, p: u32, s: &[u8]) {
+    let mut b = s.to_vec();
+    b.push(0);
+    let _ = c.host.write(p, &b);
+}
+
+fn strdup(c: &mut Ctx, s: &[u8]) -> u32 {
+    let p = alloc(c, s.len() as u32 + 1, false);
+    write_cstr(c, p, s);
+    p
+}
+
+/// FILE structs for stdin/stdout/stderr and the rest of the table (32 bytes each).
+fn iob_init(_base: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 20 * 32];
+    for (i, flag) in [(0usize, 1u32), (1, 2), (2, 2)] {
+        v[i * 32 + 12..i * 32 + 16].copy_from_slice(&flag.to_le_bytes());
+        v[i * 32 + 16..i * 32 + 20].copy_from_slice(&(i as u32).to_le_bytes());
+    }
+    v
+}
+
+/// __pioinfo: 64 pointers to blocks of 32 low-level file entries (none open).
+fn pioinfo_init(base: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 256 + 32 * 64];
+    for i in 0..64 {
+        v[4 * i..4 * i + 4].copy_from_slice(&(base + 256).to_le_bytes());
+    }
+    for k in 0..32 {
+        v[256 + 64 * k..256 + 64 * k + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    }
+    v
+}
+
+/// __badioinfo: an entry with no OS handle.
+fn badioinfo_init(_base: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 64];
+    v[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    v
+}
+
+pub fn register_more(r: &mut Registry) {
+    let m = "msvcrt.dll";
+    r.add_data(m, "_iob", 20 * 32, iob_init);
+    r.add_data(m, "__pioinfo", 256 + 32 * 64, pioinfo_init);
+    r.add_data(m, "__badioinfo", 64, badioinfo_init);
+
+    // ---- startup and shutdown of DLLs that link the CRT -----------------------------
+    r.add(m, "_initterm", |c| {
+        let (mut p, end) = (c.arg(0), c.arg(1));
+        while p < end {
+            let f = c.host.read_u32(p).unwrap_or(0);
+            if f != 0 {
+                c.call_guest(f, &[])?;
+            }
+            p += 4;
+        }
+        ok(0)
+    });
+    r.add(m, "_initterm_e", |c| {
+        let (mut p, end) = (c.arg(0), c.arg(1));
+        while p < end {
+            let f = c.host.read_u32(p).unwrap_or(0);
+            if f != 0 {
+                let r = c.call_guest(f, &[])?;
+                if r != 0 {
+                    return ok(r);
+                }
+            }
+            p += 4;
+        }
+        ok(0)
+    });
+    // Termination tables are never run: processes end with the page.
+    r.add(m, "_onexit", |c| ok(c.arg(0)));
+    r.add(m, "__dllonexit", |c| ok(c.arg(0)));
+    r.add(m, "atexit", |_c| ok(0));
+    r.add(m, "_XcptFilter", |_c| ok(0));
+    r.add(m, "_lock", |_c| ok(0));
+    r.add(m, "_unlock", |_c| ok(0));
+    r.add(m, "_amsg_exit", |c| Err(ApiError(format!("msvcrt runtime error R60{:02}", c.arg(0)))));
+    r.add(m, "_purecall", |c| Err(ApiError(format!("pure virtual function call from {:#x}", c.host.read_u32(c.regs.esp).unwrap_or(0)))));
+    r.add(m, "?terminate@@YAXXZ", |c| Err(ApiError(format!("terminate() called from {:#x}", c.host.read_u32(c.regs.esp).unwrap_or(0)))));
+
+    // ---- floating-point environment ---------------------------------------------------
+    r.add(m, "_controlfp", |c| {
+        let (new, mask) = (c.arg(0), c.arg(1));
+        let mut f = c.host.fpu_state();
+        let cur = cw_to_crt(f.control_word());
+        if mask != 0 {
+            let v = (cur & !mask) | (new & mask);
+            f.set_control_word(crt_to_cw(v, f.control_word()));
+            c.host.set_fpu_state(&f);
+            // SSE follows the exception masks and rounding mode
+            let mx = c.host.mxcsr();
+            let em = ((f.control_word() & 0x3f) as u32) << 7;
+            let rc = (((f.control_word() >> 10) & 3) as u32) << 13;
+            c.host.set_mxcsr((mx & !(0x3f << 7) & !(3 << 13)) | em | rc);
+        }
+        ok(cw_to_crt(f.control_word()))
+    });
+    r.alias(m, "_control87", m, "_controlfp");
+    r.add(m, "_clearfp", |c| {
+        let mut f = c.host.fpu_state();
+        let old = sw_to_crt(f.status_word());
+        f.set_status_word(f.status_word() & !0x80ff);
+        c.host.set_fpu_state(&f);
+        let mx = c.host.mxcsr();
+        c.host.set_mxcsr(mx & !0x3f);
+        ok(old)
+    });
+    r.add(m, "_statusfp", |c| {
+        let f = c.host.fpu_state();
+        ok(sw_to_crt(f.status_word()))
+    });
+    r.add(m, "_fpreset", |c| {
+        let mut f = c.host.fpu_state();
+        f.set_control_word(0x027f);
+        f.set_status_word(0);
+        c.host.set_fpu_state(&f);
+        ok(0)
+    });
+    r.add(m, "_finite", |c| {
+        let v = arg_f64(c, 0);
+        ok(v.is_finite() as u32)
+    });
+    r.add(m, "_isnan", |c| {
+        let v = arg_f64(c, 0);
+        ok(v.is_nan() as u32)
+    });
+
+    // ---- numbers and strings ----------------------------------------------------------
+    r.add(m, "atof", |c| {
+        let (v, _) = parse_double(c, c.arg(0));
+        ret_f64(c, v)
+    });
+    r.add(m, "strtod", |c| {
+        let (s, end) = (c.arg(0), c.arg(1));
+        let (v, n) = parse_double(c, s);
+        if end != 0 {
+            let _ = c.host.write_u32(end, s + n);
+        }
+        ret_f64(c, v)
+    });
+    r.add(m, "atol", |c| {
+        let s = c.host.read_cstr(c.arg(0)).unwrap_or_default();
+        ok(parse_long(&s, 10).0 as i32 as u32)
+    });
+    r.add(m, "strtol", |c| {
+        let (p, end, base) = (c.arg(0), c.arg(1), c.arg(2));
+        let s = c.host.read_cstr(p).unwrap_or_default();
+        let (v, n) = parse_long(&s, base);
+        if end != 0 {
+            let _ = c.host.write_u32(end, p + n as u32);
+        }
+        ok(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32)
+    });
+    r.add(m, "strtoul", |c| {
+        let (p, end, base) = (c.arg(0), c.arg(1), c.arg(2));
+        let s = c.host.read_cstr(p).unwrap_or_default();
+        let (v, n) = parse_long(&s, base);
+        if end != 0 {
+            let _ = c.host.write_u32(end, p + n as u32);
+        }
+        ok(v as u32)
+    });
+    r.add(m, "_itoa", |c| {
+        let (v, buf, radix) = (c.arg_i32(0), c.arg(1), c.arg(2));
+        let s = if radix == 10 { itoa(v.unsigned_abs() as u64, v < 0, 10) } else { itoa(v as u32 as u64, false, radix) };
+        write_cstr(c, buf, &s);
+        ok(buf)
+    });
+    r.add(m, "_ultoa", |c| {
+        let (v, buf, radix) = (c.arg(0), c.arg(1), c.arg(2));
+        let s = itoa(v as u64, false, radix);
+        write_cstr(c, buf, &s);
+        ok(buf)
+    });
+    r.add(m, "_strdup", |c| {
+        let p = c.arg(0);
+        if p == 0 {
+            return ok(0);
+        }
+        let s = c.host.read_cstr(p).unwrap_or_default();
+        let d = strdup(c, &s);
+        ok(d)
+    });
+    r.add(m, "_strdate", |c| {
+        let buf = c.arg(0);
+        let t = super::kernel32::host_systemtime(c);
+        let s = format!("{:02}/{:02}/{:02}", t[1], t[3], t[0] % 100);
+        write_cstr(c, buf, s.as_bytes());
+        ok(buf)
+    });
+    r.add(m, "_strtime", |c| {
+        let buf = c.arg(0);
+        let t = super::kernel32::host_systemtime(c);
+        let s = format!("{:02}:{:02}:{:02}", t[4], t[5], t[6]);
+        write_cstr(c, buf, s.as_bytes());
+        ok(buf)
+    });
+    r.add(m, "_tempnam", |c| {
+        let prefix = if c.arg(1) != 0 { c.host.read_cstr_lossy(c.arg(1)) } else { String::new() };
+        c.p.crt_rand = c.p.crt_rand.wrapping_add(1);
+        let name = format!("C:\\Temp\\{prefix}{:x}", c.p.crt_rand);
+        let p = strdup(c, name.as_bytes());
+        ok(p)
+    });
+    r.add(m, "_vsnprintf", |c| {
+        let (buf, cap, fmt, va) = (c.arg(0), c.arg(1), c.host.read_cstr(c.arg(2)).unwrap_or_default(), c.arg(3));
+        let mut va = VaList { p: va };
+        let out = format(c, &fmt, &mut va, false);
+        let n = out.len().min(cap as usize);
+        let _ = c.host.write(buf, &out[..n]);
+        if out.len() < cap as usize {
+            let _ = c.host.write_u8(buf + out.len() as u32, 0);
+            ok(out.len() as u32)
+        } else {
+            ok(0xFFFF_FFFF)
+        }
+    });
+    r.add(m, "_vsnwprintf", |c| {
+        let (buf, cap, fmt, va) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        let f = c.host.read_wstr(fmt).unwrap_or_default();
+        let mut va = VaList { p: va };
+        // narrow formatting of the wide format string: %s takes wide strings here
+        let out = format(c, f.as_bytes(), &mut va, true);
+        let text: Vec<u16> = String::from_utf8_lossy(&out).encode_utf16().collect();
+        let n = text.len().min(cap as usize);
+        for (i, u) in text[..n].iter().enumerate() {
+            let _ = c.host.write_u16(buf + 2 * i as u32, *u);
+        }
+        if text.len() < cap as usize {
+            let _ = c.host.write_u16(buf + 2 * text.len() as u32, 0);
+            ok(text.len() as u32)
+        } else {
+            ok(0xFFFF_FFFF)
+        }
+    });
+    r.add(m, "sscanf", |c| {
+        let input = c.host.read_cstr(c.arg(0)).unwrap_or_default();
+        let fmt = c.host.read_cstr(c.arg(1)).unwrap_or_default();
+        let mut va = VaList { p: c.regs.esp + 12 };
+        let n = scan(c, &input, &fmt, &mut va);
+        ok(n as u32)
+    });
+    r.add(m, "setlocale", |c| {
+        let want = if c.arg(1) != 0 { c.host.read_cstr_lossy(c.arg(1)) } else { "C".into() };
+        if !(want.is_empty() || want == "C") {
+            return ok(0);
+        }
+        if c.p.crt_locale == 0 {
+            c.p.crt_locale = strdup(c, b"C");
+        }
+        ok(c.p.crt_locale)
+    });
+    r.add(m, "wcstombs", |c| {
+        let (dst, src, n) = (c.arg(0), c.arg(1), c.arg(2));
+        let s = c.host.read_wstr(src).unwrap_or_default();
+        let bytes = super::kernel32::encode_cp(1252, &s);
+        if dst == 0 {
+            return ok(bytes.len() as u32);
+        }
+        let k = bytes.len().min(n as usize);
+        let _ = c.host.write(dst, &bytes[..k]);
+        if k < n as usize {
+            let _ = c.host.write_u8(dst + k as u32, 0);
+        }
+        ok(k as u32)
+    });
+    r.add(m, "wctomb", |c| {
+        let (dst, wc) = (c.arg(0), c.arg(1) & 0xFFFF);
+        if dst == 0 {
+            return ok(0);
+        }
+        let s: String = char::from_u32(wc).map(String::from).unwrap_or_default();
+        let b = super::kernel32::encode_cp(1252, &s);
+        let _ = c.host.write(dst, &b);
+        ok(b.len() as u32)
+    });
+
+    // ---- character classes ("C" locale; wide ones by Unicode) -------------------------
+    r.add(m, "isalpha", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_alphabetic()) as u32 * 0x103));
+    r.add(m, "isdigit", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_digit()) as u32 * 0x4));
+    r.add(m, "isalnum", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_alphanumeric()) as u32 * 0x107));
+    r.add(m, "isspace", |c| ok((c.arg(0) < 0x80 && ((c.arg(0) as u8) == b' ' || (9..=13).contains(&(c.arg(0) as u8)))) as u32 * 0x8));
+    r.add(m, "isxdigit", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_hexdigit()) as u32 * 0x80));
+    r.add(m, "isupper", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_uppercase()) as u32 * 0x1));
+    r.add(m, "islower", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_lowercase()) as u32 * 0x2));
+    r.add(m, "isprint", |c| ok((c.arg(0) < 0x80 && (0x20..0x7f).contains(&c.arg(0))) as u32 * 0x157));
+    r.add(m, "ispunct", |c| ok((c.arg(0) < 0x80 && (c.arg(0) as u8).is_ascii_punctuation()) as u32 * 0x10));
+    r.add(m, "iscntrl", |c| ok((c.arg(0) < 0x20 || c.arg(0) == 0x7f) as u32 * 0x20));
+    r.add(m, "isleadbyte", |_c| ok(0));
+    r.add(m, "iswalpha", |c| ok(char::from_u32(c.arg(0) & 0xFFFF).is_some_and(|ch| ch.is_alphabetic()) as u32 * 0x103));
+    r.add(m, "iswdigit", |c| ok(char::from_u32(c.arg(0) & 0xFFFF).is_some_and(|ch| ch.is_ascii_digit()) as u32 * 0x4));
+    r.add(m, "iswspace", |c| ok(char::from_u32(c.arg(0) & 0xFFFF).is_some_and(|ch| ch.is_whitespace()) as u32 * 0x8));
+    r.add(m, "iswpunct", |c| ok(char::from_u32(c.arg(0) & 0xFFFF).is_some_and(|ch| ch.is_ascii_punctuation() || (!ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control() && ch as u32 > 0x7f)) as u32 * 0x10));
+
+    // ---- low-level I/O (only the console handles exist) --------------------------------
+    r.add(m, "_fileno", |c| {
+        let f = c.arg(0);
+        ok(c.host.read_u32(f + 16).unwrap_or(u32::MAX))
+    });
+    r.add(m, "_isatty", |_c| ok(0));
+    r.add(m, "_write", |c| {
+        let (fd, buf, n) = (c.arg(0), c.arg(1), c.arg(2));
+        if fd == 1 || fd == 2 {
+            let b = read_bytes(c, buf, n);
+            c.p.log(format!("msvcrt write({fd}): {}", String::from_utf8_lossy(&b).trim_end()));
+            return ok(n);
+        }
+        set_errno(c, 9); // EBADF
+        ok(u32::MAX)
+    });
+    r.add(m, "_lseeki64", |c| {
+        set_errno(c, 9);
+        Ok(Ret { edx: Some(u32::MAX), ..Ret::cdecl(u32::MAX) })
+    });
+    r.add(m, "fflush", |_c| ok(0));
+
+    // ---- setjmp / longjmp ---------------------------------------------------------------
+    // _JUMP_BUFFER: ebp, ebx, edi, esi, esp, eip, registration, trylevel, cookie,
+    // unwind func, unwind data[6]
+    r.add(m, "_setjmp3", |c| {
+        let buf = c.arg(0);
+        let ret_addr = c.host.read_u32(c.regs.esp).unwrap_or(0);
+        let fs0 = c.host.read_u32(c.regs.fs_base).unwrap_or(u32::MAX);
+        let vals = [c.regs.ebp, c.regs.ebx, c.regs.edi, c.regs.esi, c.regs.esp + 4, ret_addr, fs0, u32::MAX, 0x5633_3256, 0];
+        for (i, v) in vals.iter().enumerate() {
+            let _ = c.host.write_u32(buf + 4 * i as u32, *v);
+        }
+        ok(0)
+    });
+    r.alias(m, "_setjmp", m, "_setjmp3");
+    r.add(m, "longjmp", |c| {
+        let (buf, val) = (c.arg(0), c.arg(1));
+        let rd = |c: &Ctx, i: u32| c.host.read_u32(buf + 4 * i).unwrap_or(0);
+        let (ebp, ebx, edi, esi, esp, eip, reg) = (rd(c, 0), rd(c, 1), rd(c, 2), rd(c, 3), rd(c, 4), rd(c, 5), rd(c, 6));
+        // Exception handlers registered after setjmp are abandoned.
+        let _ = c.host.write_u32(c.regs.fs_base, reg);
+        c.regs.ebp = ebp;
+        c.regs.ebx = ebx;
+        c.regs.edi = edi;
+        c.regs.esi = esi;
+        c.regs.esp = esp;
+        c.regs.eip = eip;
+        c.regs.eax = if val == 0 { 1 } else { val };
+        Ok(Ret::resume())
+    });
+}

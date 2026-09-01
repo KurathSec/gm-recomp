@@ -279,6 +279,10 @@ pub struct Process {
     pub crt_errno: u32,
     pub crt_files: HashMap<u32, u32>,
     pub crt_rand: u32,
+    /// setlocale's "C" string.
+    pub crt_locale: u32,
+    /// Waitable timers: (handle, virtual time they become signaled).
+    pub timers_due: Vec<(u32, u64)>,
     pub textures_created: u64,
     pub next_d3d_handle: u32,
     pub trace: bool,
@@ -305,6 +309,7 @@ impl Process {
     pub fn with_registry(registry: Registry, fs: Box<dyn crate::vfs::Vfs>, exe_path: &str, cmdline: &str) -> Self {
         let mut vm = Vm::new();
         vm.alloc(STUB_BASE, 0x0010_0000, true, PAGE_READWRITE, false, "hle stubs");
+        vm.alloc(crate::hle::DATA_EXPORTS, crate::hle::DATA_EXPORTS_SIZE, true, PAGE_READWRITE, false, "exported variables");
         vm.alloc(RET_TO_HOST, 0x1000, true, PAGE_READWRITE, false, "host return");
         // The page below each TEB holds the thread's x87 state (fpu::block).
         vm.alloc(TEB_BASE - 0x1000, 0x1000, true, PAGE_READWRITE, false, "thread state");
@@ -379,6 +384,8 @@ impl Process {
             crt_errno: 0,
             crt_files: HashMap::new(),
             crt_rand: 1,
+            crt_locale: 0,
+            timers_due: Vec::new(),
             textures_created: 0,
             next_d3d_handle: 0x1000,
             trace: false,

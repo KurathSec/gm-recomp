@@ -272,6 +272,22 @@ impl<M: Machine> Host for M {
         fpu_store(self, &f);
     }
 
+    fn fpu_state(&mut self) -> fpu::Fpu {
+        fpu_load(self)
+    }
+
+    fn set_fpu_state(&mut self, f: &fpu::Fpu) {
+        fpu_store(self, f)
+    }
+
+    fn mxcsr(&mut self) -> u32 {
+        self.global(Global::Mxcsr)
+    }
+
+    fn set_mxcsr(&mut self, v: u32) {
+        self.set_global(Global::Mxcsr, v)
+    }
+
     fn poll_input(&mut self, frame: u64) -> Vec<crate::hle::InputEvent> {
         self.take_input(frame)
     }
@@ -316,14 +332,14 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
         let e = m.engine_ref();
         (e.trace, e.depth, e.max_api_calls)
     };
-    let (name, func, nargs, calls) = {
+    let (name, func, nargs, pop, calls) = {
         let Some(p) = m.engine().p.as_mut() else { return stop(m, "process not available".into()) };
         p.api_calls += 1;
         if !p.registry.idle_ok.contains(&id.0) {
             p.idle_streak = 0;
         }
         let e = &p.registry.entries[id.0 as usize];
-        (format!("{}!{}", e.dll, e.name), e.func, e.nargs, p.api_calls)
+        (format!("{}!{}", e.dll, e.name), e.func, e.nargs, e.pop, p.api_calls)
     };
     if calls > max_calls {
         return stop(m, format!("API call budget exhausted ({max_calls})"));
@@ -356,7 +372,7 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
                 if let Some(edx) = ret.edx {
                     regs.edx = edx;
                 }
-                regs.esp += 4 + ret.pop;
+                regs.esp += 4 + pop.unwrap_or(ret.pop);
                 regs.eip = ra;
                 if trace {
                     let line = format!("{:w$}  = {:#x}", "", ret.eax, w = (depth * 2) as usize);
@@ -745,7 +761,9 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         let loaded = {
             let req = crate::LoadRequest { name: &name, path: &guest_path, bytes };
             let mut resolver = crate::StubResolver { registry: &mut p.registry, modules: &p.modules };
-            crate::loader::load(req, &mut p.vm, m, &mut resolver)
+            let r = crate::loader::load(req, &mut p.vm, m, &mut resolver);
+            p.registry.flush_data(m);
+            r
         };
         let md = match loaded {
             Ok(md) => md,

@@ -2211,3 +2211,43 @@ pub fn register_more(r: &mut Registry) {
         ok(5, count)
     });
 }
+
+/// Wide variants and newer entry points (GameMaker: Studio runners).
+pub fn register_extra(r: &mut Registry) {
+    let u = "user32.dll";
+    r.alias(u, "LoadImageW", u, "LoadImageA");
+    r.alias(u, "PostThreadMessageW", u, "PostThreadMessageA");
+    r.add(u, "DialogBoxParamW", |_c| ok(5, 0xFFFF_FFFF));
+    r.add(u, "CreateDialogParamW", |_c| ok(5, 0));
+    r.add(u, "GetDlgItemTextW", |c| {
+        let (buf, cap) = (c.arg(2), c.arg(3));
+        if cap > 0 {
+            let _ = c.host.write_u16(buf, 0);
+        }
+        ok(4, 0)
+    });
+    r.add(u, "SetDlgItemTextA", |_c| ok(3, 1));
+    r.add(u, "SetDlgItemTextW", |_c| ok(3, 1));
+    r.add(u, "wsprintfW", |c| {
+        // cdecl: (buf, fmt, ...); the narrow formatter over the wide format string
+        let (buf, fmt) = (c.arg(0), c.host.read_wstr(c.arg(1)).unwrap_or_default());
+        let s = format_wsprintf(c, &fmt, c.regs.esp + 12);
+        let units: Vec<u16> = s.encode_utf16().chain([0]).collect();
+        for (i, w) in units.iter().enumerate() {
+            let _ = c.host.write_u16(buf + 2 * i as u32, *w);
+        }
+        Ok(Ret::cdecl(units.len() as u32 - 1))
+    });
+    // Raw input: no devices beyond the keyboard and mouse messages.
+    r.add(u, "GetRawInputDeviceList", |c| {
+        let (list, count) = (c.arg(0), c.arg(1));
+        if list == 0 {
+            let _ = c.host.write_u32(count, 0);
+        }
+        ok(3, 0)
+    });
+    r.add(u, "GetRawInputDeviceInfoA", |_c| ok(4, 0xFFFF_FFFF));
+    r.add(u, "GetRawInputDeviceInfoW", |_c| ok(4, 0xFFFF_FFFF));
+    r.add(u, "RegisterRawInputDevices", |_c| ok(3, 1));
+    r.add(u, "GetRawInputData", |_c| ok(5, 0xFFFF_FFFF));
+}

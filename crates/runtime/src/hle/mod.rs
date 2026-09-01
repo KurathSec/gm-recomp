@@ -78,6 +78,12 @@ pub trait Host: Guest {
     fn fpu_push(&mut self, v: f64);
     /// Pops ST(0) (FSTP m64 semantics).
     fn fpu_pop(&mut self) -> f64;
+    /// The calling thread's x87 state, and writing it back (control/status words).
+    fn fpu_state(&mut self) -> fpu::Fpu;
+    fn set_fpu_state(&mut self, f: &fpu::Fpu);
+    /// SSE control/status register.
+    fn mxcsr(&mut self) -> u32;
+    fn set_mxcsr(&mut self, v: u32);
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far.
     fn poll_input(&mut self, _frame: u64) -> Vec<InputEvent> {
@@ -161,6 +167,9 @@ pub struct ApiEntry {
     pub func: Option<ApiFn>,
     /// Stdcall argument count when known (0 otherwise).
     pub nargs: u32,
+    /// Bytes of arguments to pop instead of what the implementation reports (an alias
+    /// with a longer argument list).
+    pub pop: Option<u32>,
 }
 
 /// Writes a C string into a sized guest buffer (shared by every module).
@@ -177,7 +186,18 @@ pub struct Registry {
     pub math_fns: HashMap<u32, fn(f64) -> f64>,
     /// APIs that do not end a clock spin-wait (clock reads, empty message polls).
     pub idle_ok: std::collections::HashSet<u32>,
+    /// Exported variables (msvcrt's `_iob`...): their initial contents, built from
+    /// the address they get (so they can point into themselves).
+    pub data: HashMap<(String, String), (u32, fn(u32) -> Vec<u8>)>,
+    /// Addresses handed out so far, and contents not yet written to guest memory.
+    pub data_addr: HashMap<(String, String), u32>,
+    pub data_next: u32,
+    pub data_pending: Vec<(u32, Vec<u8>)>,
 }
+
+/// Exported variables live here, after the stubs.
+pub const DATA_EXPORTS: u32 = crate::process::STUB_BASE + 0x0010_0000;
+pub const DATA_EXPORTS_SIZE: u32 = 0x1_0000;
 
 impl Registry {
     pub fn new() -> Self {
@@ -190,9 +210,11 @@ impl Registry {
         com::register(&mut r);
         dmusic::register(&mut r);
         msvcrt::register(&mut r);
+        msvcrt::register_more(&mut r);
         dsound::register(&mut r);
         kernel32::register_more(&mut r);
         kernel32::register_paths(&mut r);
+        kernel32::register_extra(&mut r);
         for (dll, name) in [
             ("kernel32.dll", "QueryPerformanceCounter"),
             ("kernel32.dll", "QueryPerformanceFrequency"),
@@ -211,6 +233,7 @@ impl Registry {
             }
         }
         user32::register_more(&mut r);
+        user32::register_extra(&mut r);
         r
     }
 
@@ -226,9 +249,20 @@ impl Registry {
             return id;
         }
         let id = ApiId(self.entries.len() as u32);
-        self.entries.push(ApiEntry { dll: key.0.clone(), name: key.1.clone(), func: Some(f), nargs });
+        self.entries.push(ApiEntry { dll: key.0.clone(), name: key.1.clone(), func: Some(f), nargs, pop: None });
         self.by_name.insert(key, id);
         id
+    }
+
+    /// Alias with its own stdcall argument count: the implementation reads the leading
+    /// arguments it knows, and `nargs` are popped (e.g. CompareStringEx -> CompareStringW).
+    pub fn alias_n(&mut self, dll: &str, name: &str, to_dll: &str, to_name: &str, nargs: u32) {
+        if let Some(&id) = self.by_name.get(&(to_dll.to_lowercase(), to_name.to_string())) {
+            if let Some(f) = self.entries[id.0 as usize].func {
+                let new = self.add_n(dll, name, nargs, f);
+                self.entries[new.0 as usize].pop = Some(nargs * 4);
+            }
+        }
     }
 
     /// Alias: another DLL/name mapped to an existing implementation.
@@ -241,6 +275,36 @@ impl Registry {
     }
 
     /// Looks up or creates an entry (possibly unimplemented) for an import.
+    /// Registers an exported variable of `size` bytes.
+    pub fn add_data(&mut self, dll: &str, name: &str, size: u32, init: fn(u32) -> Vec<u8>) {
+        self.data.insert((dll.to_lowercase(), name.to_string()), (size, init));
+    }
+
+    /// The address of an exported variable, allocating it on first use.
+    pub fn data_export(&mut self, dll: &str, name: &str) -> Option<u32> {
+        let dll = dll.to_lowercase();
+        let dll = if dll.ends_with(".dll") { dll } else { format!("{dll}.dll") };
+        let key = (dll, name.to_string());
+        if let Some(&a) = self.data_addr.get(&key) {
+            return Some(a);
+        }
+        let &(size, init) = self.data.get(&key)?;
+        let addr = DATA_EXPORTS + self.data_next;
+        self.data_next = (self.data_next + size + 15) & !15;
+        assert!(self.data_next <= DATA_EXPORTS_SIZE, "exported variables overflow their region");
+        self.data_addr.insert(key, addr);
+        self.data_pending.push((addr, init(addr)));
+        Some(addr)
+    }
+
+    /// Writes the contents of variables bound since the last call.
+    pub fn flush_data(&mut self, mem: &mut dyn Guest) {
+        for (a, bytes) in self.data_pending.drain(..) {
+            let _ = mem.ensure_mapped(DATA_EXPORTS, DATA_EXPORTS_SIZE);
+            let _ = mem.write(a, &bytes);
+        }
+    }
+
     pub fn intern(&mut self, dll: &str, name: &str) -> ApiId {
         let dll = dll.to_lowercase();
         let dll = if dll.ends_with(".dll") || dll.ends_with(".drv") { dll } else { format!("{dll}.dll") };
@@ -249,7 +313,7 @@ impl Registry {
             return id;
         }
         let id = ApiId(self.entries.len() as u32);
-        self.entries.push(ApiEntry { dll, name: name.to_string(), func: None, nargs: 0 });
+        self.entries.push(ApiEntry { dll, name: name.to_string(), func: None, nargs: 0, pop: None });
         self.by_name.insert(key, id);
         id
     }

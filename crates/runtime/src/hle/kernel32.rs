@@ -775,6 +775,23 @@ pub fn register(r: &mut Registry) {
     r.add(k, "WaitForSingleObject", |c| {
         let (h, timeout) = (c.arg(0), c.arg(1));
         // Events: wait until signaled; other objects are always signaled (single thread).
+        // A waitable timer becomes signaled at its due time.
+        if let Some(i) = c.p.timers_due.iter().position(|&(t, _)| t == h) {
+            let at = c.p.timers_due[i].1;
+            let now = c.p.clock_us;
+            if at > now {
+                if timeout != 0xFFFF_FFFF && (timeout as u64) * 1000 < at - now {
+                    c.advance_clock(timeout as u64 * 1000);
+                    return ok(2, 0x102);
+                }
+                c.advance_clock(at - now);
+            }
+            c.p.timers_due.remove(i);
+            if let Some(Handle::Event { signaled, manual }) = c.p.handles.get_mut(&h) {
+                *signaled = *manual;
+            }
+            return ok(2, 0);
+        }
         let signaled = match c.p.handles.get_mut(&h) {
             Some(Handle::Event { signaled, manual }) => {
                 let s = *signaled;
@@ -1320,6 +1337,7 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
         let mut resolver = crate::StubResolver { registry: &mut p.registry, modules: &p.modules };
         let g: &mut dyn Guest = &mut *c.host;
         let m = crate::loader::load(req, &mut p.vm, g, &mut resolver).map_err(ApiError)?;
+        p.registry.flush_data(g);
         let r = (m.base, m.entry, m.is_dll, m.tls_callbacks.clone());
         p.modules.push(m);
         r
@@ -1508,7 +1526,7 @@ fn decode_cp(cp: u32, bytes: &[u8]) -> String {
     }
 }
 
-fn encode_cp(cp: u32, s: &str) -> Vec<u8> {
+pub(crate) fn encode_cp(cp: u32, s: &str) -> Vec<u8> {
     match cp {
         65001 => s.as_bytes().to_vec(),
         932 => encoding_rs::SHIFT_JIS.encode(s).0.into_owned(),
@@ -2784,4 +2802,172 @@ pub fn register_paths(r: &mut Registry) {
         ok(3, s.len() as u32)
     });
     r.alias(k, "GetShortPathNameA", k, "GetLongPathNameA");
+}
+
+/// Newer and rarer kernel32 entry points (GameMaker: Studio runners, their CRTs).
+pub fn register_extra(r: &mut Registry) {
+    let k = "kernel32.dll";
+    r.add(k, "DisableThreadLibraryCalls", |_c| ok(1, 1));
+    // Not a packaged (Store) app.
+    r.add(k, "GetCurrentPackageId", |_c| ok(2, 15700));
+    r.add(k, "GetCurrentPackageFullName", |_c| ok(2, 15700));
+    r.add(k, "GetConsoleWindow", |_c| ok(0, 0));
+    r.add(k, "IsDBCSLeadByte", |_c| ok(1, 0));
+    r.add(k, "IsDBCSLeadByteEx", |_c| ok(2, 0));
+    r.add(k, "AreFileApisANSI", |_c| ok(0, 1));
+    r.add(k, "PeekNamedPipe", |c| {
+        c.set_last_error(6); // ERROR_INVALID_HANDLE
+        ok(6, 0)
+    });
+    r.add(k, "RtlCaptureStackBackTrace", |_c| ok(4, 0));
+    r.add(k, "SetEnvironmentVariableW", |c| {
+        let (n, v) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)));
+        c.p.env.retain(|(k2, _)| !k2.eq_ignore_ascii_case(&n));
+        if c.arg(1) != 0 {
+            c.p.env.push((n, v));
+        }
+        ok(2, 1)
+    });
+    r.add(k, "WriteConsoleW", |c| {
+        let (buf, n, written) = (c.arg(1), c.arg(2), c.arg(3));
+        let mut units = vec![0u16; n as usize];
+        for (i, u) in units.iter_mut().enumerate() {
+            *u = c.host.read_u16(buf + 2 * i as u32).unwrap_or(0);
+        }
+        c.p.log(format!("console: {}", String::from_utf16_lossy(&units).trim_end()));
+        write_out(c, written, n);
+        ok(5, 1)
+    });
+    r.add(k, "WriteConsoleA", |c| {
+        let (buf, n, written) = (c.arg(1), c.arg(2), c.arg(3));
+        let mut b = vec![0u8; n as usize];
+        let _ = c.host.read(buf, &mut b);
+        c.p.log(format!("console: {}", String::from_utf8_lossy(&b).trim_end()));
+        write_out(c, written, n);
+        ok(5, 1)
+    });
+    r.add(k, "ReadConsoleW", |c| {
+        write_out(c, c.arg(3), 0);
+        ok(5, 0)
+    });
+    r.add(k, "FatalAppExitA", |c| {
+        let msg = c.str_arg(1);
+        Err(ApiError(format!("FatalAppExit: {msg}")))
+    });
+    r.add(k, "FatalAppExitW", |c| {
+        let msg = wstr(c, c.arg(1));
+        Err(ApiError(format!("FatalAppExit: {msg}")))
+    });
+    r.add(k, "GetTempFileNameA", |c| {
+        let (dir, prefix, unique, out) = (c.str_arg(0), c.str_arg(1), c.arg(2), c.arg(3));
+        let (name, n) = temp_file_name(c, &dir, &prefix, unique);
+        copy_str_out(c, out, 260, name.as_bytes());
+        ok(4, n)
+    });
+    r.add(k, "GetTempFileNameW", |c| {
+        let (dir, prefix, unique, out) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)), c.arg(2), c.arg(3));
+        let (name, n) = temp_file_name(c, &dir, &prefix, unique);
+        copy_wstr_out(c, out, 260, &name);
+        ok(4, n)
+    });
+    r.add(k, "EnumSystemLocalesA", |_c| ok(2, 1));
+    r.add(k, "EnumSystemLocalesW", |_c| ok(2, 1));
+    r.add(k, "EnumSystemLocalesEx", |_c| ok(4, 1));
+    r.add(k, "IsValidLocaleName", |_c| ok(1, 1));
+    r.add(k, "GetUserDefaultLocaleName", |c| {
+        let n = copy_wstr_out(c, c.arg(0), c.arg(1), "en-US");
+        ok(2, n + 1)
+    });
+    r.add(k, "GetSystemDefaultLocaleName", |c| {
+        let n = copy_wstr_out(c, c.arg(0), c.arg(1), "en-US");
+        ok(2, n + 1)
+    });
+    r.add(k, "LocaleNameToLCID", |_c| ok(2, 0x409));
+    r.add(k, "LCIDToLocaleName", |c| {
+        let n = copy_wstr_out(c, c.arg(1), c.arg(2), "en-US");
+        ok(4, n + 1)
+    });
+    // The ...Ex forms take a locale name where the old ones take an LCID.
+    r.alias_n(k, "CompareStringEx", k, "CompareStringW", 9);
+    r.alias_n(k, "LCMapStringEx", k, "LCMapStringW", 9);
+    r.alias_n(k, "GetLocaleInfoEx", k, "GetLocaleInfoW", 4);
+    r.add(k, "FindFirstFileExA", |c| {
+        let pattern = c.str_arg(0);
+        let out = c.arg(2);
+        let h = find_first(c, &pattern);
+        if h == INVALID_HANDLE_VALUE || !find_next(c, h, out) {
+            c.p.handles.remove(&h);
+            c.set_last_error(ERROR_FILE_NOT_FOUND);
+            return ok(6, INVALID_HANDLE_VALUE);
+        }
+        ok(6, h)
+    });
+    r.add(k, "InitOnceExecuteOnce", |c| {
+        let (once, f, param, ctx) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        if c.host.read_u32(once).unwrap_or(0) & 2 == 0 {
+            let r = c.call_guest(f, &[once, param, ctx])?;
+            if r == 0 {
+                return ok(4, 0);
+            }
+            let _ = c.host.write_u32(once, 2);
+        }
+        ok(4, 1)
+    });
+    r.add(k, "SystemTimeToTzSpecificLocalTime", |c| {
+        let (utc, local) = (c.arg(1), c.arg(2));
+        let mut b = [0u8; 16];
+        let _ = c.host.read(utc, &mut b);
+        let _ = c.host.write(local, &b);
+        ok(3, 1)
+    });
+    r.add(k, "TzSpecificLocalTimeToSystemTime", |c| {
+        let (local, utc) = (c.arg(1), c.arg(2));
+        let mut b = [0u8; 16];
+        let _ = c.host.read(local, &mut b);
+        let _ = c.host.write(utc, &b);
+        ok(3, 1)
+    });
+    // Waitable timers: signaled once the virtual clock passes the due time.
+    r.add(k, "CreateWaitableTimerW", |c| {
+        let manual = c.arg(1) != 0;
+        let h = c.p.new_handle(Handle::Event { manual, signaled: false });
+        ok(3, h)
+    });
+    r.alias(k, "CreateWaitableTimerA", k, "CreateWaitableTimerW");
+    r.add(k, "SetWaitableTimer", |c| {
+        let (h, due_p) = (c.arg(0), c.arg(1));
+        let due = c.host.read_u64(due_p).unwrap_or(0) as i64;
+        // negative: relative, in 100 ns units; positive: absolute FILETIME (taken as now)
+        let delay_us = if due < 0 { (-due) as u64 / 10 } else { 0 };
+        let at = c.p.clock_us + delay_us;
+        c.p.timers_due.push((h, at));
+        if let Some(Handle::Event { signaled, .. }) = c.p.handles.get_mut(&h) {
+            *signaled = delay_us == 0;
+        }
+        ok(6, 1)
+    });
+    r.add(k, "CancelWaitableTimer", |c| {
+        let h = c.arg(0);
+        c.p.timers_due.retain(|&(t, _)| t != h);
+        ok(1, 1)
+    });
+}
+
+/// GetTempFileName: `dir\pre<hex>.tmp`; with unique = 0, a new number whose file is created.
+fn temp_file_name(c: &mut Ctx, dir: &str, prefix: &str, unique: u32) -> (String, u32) {
+    let pre: String = prefix.chars().take(3).collect();
+    let dir = dir.trim_end_matches('\\');
+    if unique != 0 {
+        return (format!("{dir}\\{pre}{:X}.tmp", unique & 0xFFFF), unique & 0xFFFF);
+    }
+    let mut n = (c.p.clock_us as u32 & 0xFFFF).max(1);
+    loop {
+        let name = format!("{dir}\\{pre}{n:X}.tmp");
+        let key = c.p.vpath(&name);
+        if !c.p.fs.exists(&key) {
+            c.p.fs.create(&key);
+            return (name, n);
+        }
+        n = (n % 0xFFFF) + 1;
+    }
 }
