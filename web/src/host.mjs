@@ -4,7 +4,7 @@
 
 import { D3DGL } from './gpu.mjs';
 
-const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow'];
+const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset'];
 const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 
 /**

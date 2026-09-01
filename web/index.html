@@ -109,7 +109,7 @@
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
 
-      const runnable = (e) => e && (e.kind === 'gm80' || e.kind === 'gm81');
+      const runnable = (e) => e && (e.kind === 'gm80' || e.kind === 'gm81' || e.kind === 'gms');
       function engineLabel(e) {
         if (!e) return 'unknown engine';
         if (e.kind === 'gm80') return 'GameMaker 8.0';

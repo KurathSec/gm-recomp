@@ -11,7 +11,7 @@
 
 use crate::hle::{ApiError, ApiId, Ctx, Host, Regs};
 use crate::mem::Guest;
-use crate::process::{Process, RET_TO_HOST};
+use crate::process::{ThreadCtx, Process, RET_TO_HOST};
 use recomp::abi::{trap, Global};
 use recomp::cfg::FuncInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,7 +27,12 @@ pub enum Ctl {
     /// A fault at `ip` to raise through the guest's SEH chain.
     Fault { code: u32, ip: u32 },
     Stop(String),
+    /// The running secondary thread blocked: back to the scheduler.
+    Yield,
 }
+
+/// Dispatches a secondary thread may run before it is preempted (busy waits).
+const SLICE_BUDGET: u64 = 200_000;
 
 pub struct ModInfo {
     pub name: String,
@@ -109,6 +114,9 @@ pub trait Machine: Guest {
     fn engine_ref(&self) -> &Engine;
     fn global(&mut self, g: Global) -> u32;
     fn set_global(&mut self, g: Global, v: u32);
+    /// XMM register `i` (thread switches save and restore them).
+    fn xmm(&mut self, i: u32) -> u128;
+    fn set_xmm(&mut self, i: u32, v: u128);
     /// Runs the translated function in table slot `idx`. Err only when the host
     /// interrupted it (watchdog, wasm trap).
     fn call_index(&mut self, idx: u32) -> Result<(), String>;
@@ -236,6 +244,7 @@ impl<M: Machine> Host for M {
         callee.eip = addr;
         write_regs(self, &callee);
         // Lend the process to the nested dispatcher.
+        p.nest += 1;
         let owned = std::mem::replace(p, Process::empty());
         self.engine().p = Some(owned);
         let r = run_until(self, addr, marker, Some(frame_top));
@@ -246,6 +255,7 @@ impl<M: Machine> Host for M {
                 *p = back;
             }
         }
+        p.nest -= 1;
         r?;
         let after = read_regs(self);
         // Registers come back as the callee left them; the API's own stack pointer
@@ -274,6 +284,14 @@ impl<M: Machine> Host for M {
 
     fn fpu_state(&mut self) -> fpu::Fpu {
         fpu_load(self)
+    }
+
+    fn yield_thread(&mut self) {
+        request(self, Ctl::Yield);
+    }
+
+    fn run_threads(&mut self, p: &mut Process) {
+        run_threads(self, p);
     }
 
     fn set_fpu_state(&mut self, f: &fpu::Fpu) {
@@ -702,7 +720,7 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
                     return Err(msg);
                 }
                 Some(Ctl::Fault { code, ip }) => raise_fault(m, code, ip)?,
-                Some(Ctl::Resume) | None => {}
+                Some(Ctl::Resume) | Some(Ctl::Yield) | None => {}
             }
             if let Some(top) = frame_top {
                 if m.global(Global::Esp) > top {
@@ -715,6 +733,121 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
             return Ok(());
         }
     }
+}
+
+// ---- guest threads ----------------------------------------------------------------------
+
+fn save_ctx<M: Machine + ?Sized>(m: &mut M) -> ThreadCtx {
+    let flags = [Global::Cf, Global::Pf, Global::Af, Global::Zf, Global::Sf, Global::Of, Global::Df].map(|g| m.global(g));
+    let mut xmm = [0u128; 8];
+    for (i, x) in xmm.iter_mut().enumerate() {
+        *x = m.xmm(i as u32);
+    }
+    ThreadCtx { regs: read_regs(m), flags, xmm, mxcsr: m.global(Global::Mxcsr) }
+}
+
+fn restore_ctx<M: Machine + ?Sized>(m: &mut M, c: &ThreadCtx) {
+    write_regs(m, &c.regs);
+    for (g, v) in [Global::Cf, Global::Pf, Global::Af, Global::Zf, Global::Sf, Global::Of, Global::Df].into_iter().zip(c.flags) {
+        m.set_global(g, v);
+    }
+    for (i, x) in c.xmm.iter().enumerate() {
+        m.set_xmm(i as u32, *x);
+    }
+    m.set_global(Global::Mxcsr, c.mxcsr);
+}
+
+enum SliceEnd {
+    Yielded,
+    Preempted,
+    Exited(u32),
+}
+
+/// Runs the thread whose registers are in the globals until it blocks, ends or
+/// uses up its budget.
+fn run_slice<M: Machine>(m: &mut M) -> Result<SliceEnd, String> {
+    let start = m.engine_ref().dispatches;
+    let mut eip = m.global(Global::Eip);
+    loop {
+        if eip == crate::process::THREAD_EXIT {
+            return Ok(SliceEnd::Exited(m.global(Global::Eax)));
+        }
+        if m.engine_ref().dispatches - start > SLICE_BUDGET {
+            return Ok(SliceEnd::Preempted);
+        }
+        m.engine().dispatches += 1;
+        let idx = resolve_addr(m, eip)?;
+        m.call_index(idx)?;
+        if m.global(Global::Ctl) != 0 {
+            m.set_global(Global::Ctl, 0);
+            match m.engine().ctl.take() {
+                Some(Ctl::Stop(msg)) => {
+                    m.engine().ctl = Some(Ctl::Stop(msg.clone()));
+                    return Err(msg);
+                }
+                Some(Ctl::Fault { code, ip }) => raise_fault(m, code, ip)?,
+                Some(Ctl::Yield) => return Ok(SliceEnd::Yielded),
+                Some(Ctl::Resume) | None => {}
+            }
+        }
+        eip = m.global(Global::Eip);
+    }
+}
+
+/// Runs every secondary thread that can run now (from the main thread's blocking
+/// points), each until it blocks again. The main thread's registers are kept.
+pub fn run_threads<M: Machine>(m: &mut M, p: &mut Process) {
+    if p.current != 0 || p.in_scheduler || p.threads.len() < 2 {
+        return;
+    }
+    if !(1..p.threads.len()).any(|i| crate::hle::threads::ready(p, i, false)) {
+        return;
+    }
+    p.in_scheduler = true;
+    let main = save_ctx(m);
+    for i in 1..p.threads.len() {
+        if !crate::hle::threads::ready(p, i, true) {
+            continue;
+        }
+        let Some(ctx) = p.threads[i].ctx.take() else { continue };
+        restore_ctx(m, &ctx);
+        if let Some(eax) = p.threads[i].resume_eax.take() {
+            m.set_global(Global::Eax, eax);
+        }
+        p.threads[i].state = crate::process::ThreadState::Running;
+        p.current = i;
+        p.slice_nest = Some(p.nest);
+        let owned = std::mem::replace(p, Process::empty());
+        m.engine().p = Some(owned);
+        let r = run_slice(m);
+        if let Some(back) = m.engine().p.take() {
+            *p = back;
+        }
+        p.current = 0;
+        p.slice_nest = None;
+        let t = &mut p.threads[i];
+        match r {
+            Ok(SliceEnd::Exited(code)) => {
+                t.state = crate::process::ThreadState::Exited(code);
+            }
+            Ok(end) => {
+                if matches!(end, SliceEnd::Preempted) || t.state == crate::process::ThreadState::Running {
+                    t.state = crate::process::ThreadState::Ready;
+                }
+                t.ctx = Some(Box::new(save_ctx(m)));
+            }
+            Err(e) => {
+                // A thread that fails ends; the process goes on (and says so).
+                let id = t.id;
+                t.state = crate::process::ThreadState::Exited(u32::MAX);
+                m.engine().ctl = None;
+                p.log(format!("thread {id:#x} stopped: {e}"));
+                m.print(&format!("thread {id:#x} stopped: {e}"));
+            }
+        }
+    }
+    restore_ctx(m, &main);
+    p.in_scheduler = false;
 }
 
 /// Calls `addr` with stdcall `args` from the host (DllMain, the entry point).

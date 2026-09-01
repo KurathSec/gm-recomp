@@ -133,6 +133,12 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn set_global(&mut self, g: G, v: u32) {
         let _ = self.cpu.globals[g as usize].set(&mut *self.cx, Val::I32(v as i32));
     }
+    fn xmm(&mut self, i: u32) -> u128 {
+        self.cpu.globals[G::Xmm0 as usize + i as usize].get(&mut *self.cx).v128().map(|v| v.as_u128()).unwrap_or(0)
+    }
+    fn set_xmm(&mut self, i: u32, v: u128) {
+        let _ = self.cpu.globals[G::Xmm0 as usize + i as usize].set(&mut *self.cx, Val::V128(v.into()));
+    }
     fn call_index(&mut self, idx: u32) -> Result<(), String> {
         let f = match self.cpu.table.get(&mut *self.cx, idx as u64) {
             Some(Ref::Func(Some(f))) => f,

@@ -167,7 +167,43 @@ pub struct Thread {
     pub last_error: u32,
     pub stack_base: u32,
     pub stack_limit: u32,
+    /// The thread's handle (0 for the main thread).
+    pub handle: u32,
+    pub state: ThreadState,
+    /// Registers while another thread runs (secondary threads only).
+    pub ctx: Option<Box<ThreadCtx>>,
+    /// EAX when the thread resumes (the result of the wait it blocked in).
+    pub resume_eax: Option<u32>,
 }
+
+/// What a guest thread is doing. Threads run one at a time: secondary threads are
+/// scheduled from the main thread's blocking points (see `hle::threads`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ThreadState {
+    #[default]
+    Running,
+    Ready,
+    /// Until this virtual time.
+    Sleeping(u64),
+    Waiting { handles: Vec<u32>, all: bool, until: Option<u64> },
+    /// For a critical section another thread owns.
+    CritSec(u32),
+    Suspended(u32),
+    Exited(u32),
+}
+
+/// A thread's registers while it is not running.
+#[derive(Debug, Clone)]
+pub struct ThreadCtx {
+    pub regs: crate::hle::Regs,
+    /// cf, pf, af, zf, sf, of, df
+    pub flags: [u32; 7],
+    pub xmm: [u128; 8],
+    pub mxcsr: u32,
+}
+
+/// Where a thread's start routine returns to.
+pub const THREAD_EXIT: u32 = RET_TO_HOST + 0xFFC;
 
 /// A DirectSound buffer: PCM data in guest memory plus playback state.
 #[derive(Debug, Clone)]
@@ -218,6 +254,18 @@ pub struct Process {
     pub process_heap: u32,
     pub threads: Vec<Thread>,
     pub main_thread: u32,
+    /// Index in `threads` of the running thread (0: main).
+    pub current: usize,
+    /// Nested guest calls in progress (host frames), and the depth a secondary
+    /// thread's slice started at: it can only block (yield) at that depth.
+    pub nest: u32,
+    pub slice_nest: Option<u32>,
+    /// The scheduler is running secondary threads.
+    pub in_scheduler: bool,
+    /// Critical sections held (address -> owning thread id), and the ones handed to
+    /// threads that woke up waiting for them.
+    pub cs_owners: HashMap<u32, u32>,
+    pub cs_pending: Vec<(u32, u32)>,
     pub cmdline: String,
     pub exe_path: String,
     pub cwd: String,
@@ -331,6 +379,12 @@ impl Process {
             process_heap: 0,
             threads: Vec::new(),
             main_thread: 0,
+            current: 0,
+            nest: 0,
+            slice_nest: None,
+            in_scheduler: false,
+            cs_owners: HashMap::new(),
+            cs_pending: Vec::new(),
             cmdline: cmdline.to_string(),
             exe_path: exe_path.to_string(),
             cwd,
@@ -558,7 +612,7 @@ impl Process {
         let heap = self.create_heap(mem, 0x0100_0000)?;
         self.process_heap = heap;
         p(mem, 0x18, heap)?;
-        self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE });
+        self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None });
         self.main_thread = 0x1238;
         Ok((TEB_BASE, stack_top))
     }
@@ -640,7 +694,11 @@ impl Process {
     }
 
     pub fn current_thread_mut(&mut self) -> &mut Thread {
-        let id = self.main_thread;
-        self.threads.iter_mut().find(|t| t.id == id).expect("main thread")
+        let i = self.current;
+        &mut self.threads[i]
+    }
+
+    pub fn current_thread_id(&self) -> u32 {
+        self.threads.get(self.current).map(|t| t.id).unwrap_or(self.main_thread)
     }
 }

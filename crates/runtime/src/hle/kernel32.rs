@@ -136,7 +136,7 @@ pub fn register(r: &mut Registry) {
     r.alias(k, "GetVersionExW", k, "GetVersionExA");
     r.add(k, "GetCurrentProcessId", |_c| ok(0, 0x1234));
     r.add(k, "GetCurrentProcess", |_c| ok(0, 0xFFFF_FFFF));
-    r.add(k, "GetCurrentThreadId", |c| ok(0, c.p.main_thread));
+    r.add(k, "GetCurrentThreadId", |c| ok(0, c.p.current_thread_id()));
     r.add(k, "GetCurrentThread", |_c| ok(0, 0xFFFF_FFFE));
     r.add(k, "ExitProcess", |c| {
         let code = c.arg(0);

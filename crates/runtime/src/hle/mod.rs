@@ -12,6 +12,7 @@ pub mod dsound;
 pub mod gpu;
 pub mod gdi32;
 pub mod kernel32;
+pub mod threads;
 pub mod mci;
 pub mod misc;
 pub mod msvcrt;
@@ -86,6 +87,11 @@ pub trait Host: Guest {
     /// SSE control/status register.
     fn mxcsr(&mut self) -> u32;
     fn set_mxcsr(&mut self, v: u32);
+    /// The running secondary thread blocked in this API: return to the scheduler
+    /// once it returns.
+    fn yield_thread(&mut self);
+    /// Lets the secondary threads that can run do so (the main thread is waiting).
+    fn run_threads(&mut self, p: &mut Process);
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far.
     fn poll_input(&mut self, _frame: u64) -> Vec<InputEvent> {
@@ -146,6 +152,10 @@ impl Ctx<'_> {
     pub fn advance_clock(&mut self, us: u64) {
         self.p.clock_us += us;
         dsound::tick(self);
+        // Time passed for the main thread: threads whose wait ended run now.
+        if self.p.current == 0 && self.p.threads.len() > 1 {
+            self.host.run_threads(self.p);
+        }
     }
     /// A clock read. Back-to-back reads with no other work in between (a spin-wait on
     /// the time) advance the clock in doubling steps of 1..128 µs, so polling loops
@@ -237,6 +247,7 @@ impl Registry {
         }
         user32::register_more(&mut r);
         user32::register_extra(&mut r);
+        threads::register(&mut r);
         r
     }
 

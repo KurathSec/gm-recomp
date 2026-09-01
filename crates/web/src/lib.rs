@@ -147,10 +147,13 @@ struct Glue {
     set: extern "C" fn(u32, u32),
     size: extern "C" fn() -> u32,
     grow: extern "C" fn(u32) -> i32,
+    /// XMM register i <-> 16 bytes of runtime memory.
+    vget: extern "C" fn(u32, *mut u8),
+    vset: extern "C" fn(u32, *const u8),
 }
 
 /// Export order of the glue accessors; JS places them in the table in this order.
-const GLUE_FUNCS: [&str; 7] = ["g2r", "r2g", "fill", "get", "set", "size", "grow"];
+const GLUE_FUNCS: [&str; 9] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset"];
 
 struct State {
     engine: Option<Engine>,
@@ -240,6 +243,15 @@ impl Machine for Web {
     fn set_global(&mut self, g: Global, v: u32) {
         (glue().set)(g as u32, v)
     }
+    fn xmm(&mut self, i: u32) -> u128 {
+        let mut b = [0u8; 16];
+        (glue().vget)(i, b.as_mut_ptr());
+        u128::from_le_bytes(b)
+    }
+    fn set_xmm(&mut self, i: u32, v: u128) {
+        let b = v.to_le_bytes();
+        (glue().vset)(i, b.as_ptr());
+    }
     fn call_index(&mut self, idx: u32) -> Result<(), String> {
         // Table slots hold translated functions of type () -> ().
         let f: extern "C" fn() = unsafe { std::mem::transmute(idx as usize) };
@@ -281,6 +293,7 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     types.ty().function([ValType::I32], [ValType::I32]); // 1: get / grow
     types.ty().function([ValType::I32; 2], []); // 2: set
     types.ty().function([], [ValType::I32]); // 3: size
+    types.ty().function([ValType::I32; 2], []); // 4: vget / vset
     let mut imports = ImportSection::new();
     imports.import("rt", "memory", EntityType::Memory(MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None }));
     let mut mems = MemorySection::new();
@@ -358,6 +371,29 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     let mut f = Function::new([]);
     f.instruction(&I::LocalGet(0)).instruction(&I::MemoryGrow(1)).instruction(&I::End);
     code.function(&f);
+    // vget(i, ptr) / vset(i, ptr): XMM register i to / from runtime memory
+    let xmm0 = abi::Global::Xmm0 as u32;
+    let mem0 = wasm_encoder::MemArg { offset: 0, align: 0, memory_index: 0 };
+    for store in [true, false] {
+        funcs.function(4);
+        let mut f = Function::new([]);
+        f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+        for _ in 0..8 {
+            f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+        }
+        f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..8).collect::<Vec<_>>().into(), 8));
+        for k in 0..8 {
+            f.instruction(&I::End);
+            if store {
+                f.instruction(&I::LocalGet(1)).instruction(&I::GlobalGet(xmm0 + k)).instruction(&I::V128Store(mem0));
+            } else {
+                f.instruction(&I::LocalGet(1)).instruction(&I::V128Load(mem0)).instruction(&I::GlobalSet(xmm0 + k));
+            }
+            f.instruction(&I::Return);
+        }
+        f.instruction(&I::End).instruction(&I::End);
+        code.function(&f);
+    }
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_NAME, ExportKind::Memory, 1);
@@ -424,6 +460,8 @@ pub extern "C" fn glue_install(base: u32) {
             set: std::mem::transmute(f(4)),
             size: std::mem::transmute(f(5)),
             grow: std::mem::transmute(f(6)),
+            vget: std::mem::transmute(f(7)),
+            vset: std::mem::transmute(f(8)),
         });
     }
 }
