@@ -125,30 +125,66 @@ pub struct Heap {
     pub regions: Vec<(u32, u32)>,
     /// addr -> size of live blocks
     pub blocks: BTreeMap<u32, u32>,
+    /// Free space by address (-> size) and by (size, address): best fit, coalesced.
+    free_at: BTreeMap<u32, u32>,
+    free_by_size: std::collections::BTreeSet<(u32, u32)>,
 }
 
 impl Heap {
+    pub fn new(base: u32, size: u32) -> Self {
+        let mut h = Heap { base, regions: Vec::new(), blocks: BTreeMap::new(), free_at: BTreeMap::new(), free_by_size: Default::default() };
+        h.add_region(base, size);
+        h
+    }
+
+    /// Adds address space (the first 16 bytes stay unused, as a heap header).
+    pub fn add_region(&mut self, base: u32, size: u32) {
+        self.regions.push((base, size));
+        self.insert_free(base + 16, size - 16);
+    }
+
+    fn insert_free(&mut self, at: u32, size: u32) {
+        self.free_at.insert(at, size);
+        self.free_by_size.insert((size, at));
+    }
+
+    fn remove_free(&mut self, at: u32) -> Option<u32> {
+        let size = self.free_at.remove(&at)?;
+        self.free_by_size.remove(&(size, at));
+        Some(size)
+    }
+
+    /// The smallest free block that fits, lowest address first among equals.
     pub fn alloc(&mut self, size: u32) -> Option<u32> {
         let size = size.max(1).div_ceil(16) * 16;
-        for &(rb, rs) in &self.regions {
-            let end = rb + rs;
-            let mut cursor = rb + 16;
-            for (&b, &s) in self.blocks.range(rb..end) {
-                if b - cursor >= size {
-                    break;
-                }
-                cursor = b + s;
-            }
-            if cursor.checked_add(size).is_some_and(|e| e <= end) {
-                self.blocks.insert(cursor, size);
-                return Some(cursor);
-            }
+        let &(fsize, at) = self.free_by_size.range((size, 0)..).next()?;
+        self.remove_free(at);
+        if fsize > size {
+            self.insert_free(at + size, fsize - size);
         }
-        None
+        self.blocks.insert(at, size);
+        Some(at)
     }
 
     pub fn free(&mut self, addr: u32) -> bool {
-        self.blocks.remove(&addr).is_some()
+        let Some(size) = self.blocks.remove(&addr) else { return false };
+        let (mut at, mut size) = (addr, size);
+        // merge with the free space right after and right before (within a region)
+        let region_end = self.regions.iter().find(|&&(b, s)| addr >= b && addr < b + s).map(|&(b, s)| b + s).unwrap_or(u32::MAX);
+        if at + size < region_end {
+            if let Some(next) = self.remove_free(at + size) {
+                size += next;
+            }
+        }
+        if let Some((&prev, &psize)) = self.free_at.range(..at).next_back() {
+            if prev + psize == at && self.regions.iter().any(|&(b, s)| prev >= b && at < b + s) {
+                self.remove_free(prev);
+                at = prev;
+                size += psize;
+            }
+        }
+        self.insert_free(at, size);
+        true
     }
 
     pub fn size_of(&self, addr: u32) -> Option<u32> {
@@ -645,7 +681,7 @@ impl Process {
     pub fn create_heap(&mut self, mem: &mut dyn Guest, size: u32) -> Result<u32, String> {
         let base = self.vm.alloc(0, size, true, PAGE_READWRITE, false, "heap").ok_or("no space for heap")?;
         mem.ensure_mapped(base, size).map_err(|e| e.to_string())?;
-        let heap = Heap { base, regions: vec![(base, size)], blocks: BTreeMap::new() };
+        let heap = Heap::new(base, size);
         self.heaps.insert(base, heap);
         Ok(base)
     }
@@ -663,7 +699,7 @@ impl Process {
                     return 0;
                 }
                 let h = self.heaps.get_mut(&heap).unwrap();
-                h.regions.push((base, grow));
+                h.add_region(base, grow);
                 match h.alloc(size) {
                     Some(a) => a,
                     None => return 0,

@@ -16,6 +16,8 @@ pub enum Engine {
         /// No CODE chunk means the game logic was compiled into the exe by YYC.
         yyc: bool,
         data_file: String,
+        /// Shader resources (compiled at run time by d3dcompiler).
+        shaders: u32,
     },
     Unknown,
 }
@@ -66,12 +68,13 @@ fn parse_gms_form(d: &[u8], name: &str) -> Option<Engine> {
     }
     let end = (8 + u32_at(d, 4)? as usize).min(d.len());
     let mut off = 8;
-    let (mut gen8, mut code_size) = (None, None);
+    let (mut gen8, mut code_size, mut shaders) = (None, None, 0);
     while off + 8 <= end {
         let size = u32_at(d, off + 4)? as usize;
         match &d[off..off + 4] {
             b"GEN8" => gen8 = Some(off + 8),
             b"CODE" => code_size = Some(size),
+            b"SHDR" if size >= 4 => shaders = u32_at(d, off + 8)?,
             _ => {}
         }
         off += 8 + size;
@@ -82,5 +85,6 @@ fn parse_gms_form(d: &[u8], name: &str) -> Option<Engine> {
         version: [u32_at(d, g + 44)?, u32_at(d, g + 48)?, u32_at(d, g + 52)?, u32_at(d, g + 56)?],
         yyc: code_size.unwrap_or(0) == 0,
         data_file: name.to_owned(),
+        shaders,
     })
 }

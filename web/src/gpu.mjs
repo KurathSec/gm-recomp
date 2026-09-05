@@ -8,9 +8,23 @@ const D = {
   texture: 9, texFormat: 11, texFlip: 13, targetW: 15, targetH: 16, viewport: 17, world: 23, view: 39, proj: 55,
   rs: 71, tss0: 327, tss1: 359, words: 391,
 };
+// DrawCall9 (crates/runtime/src/hle/gpu.rs), in 32-bit words.
+const D9 = {
+  prim: 0, primCount: 1, vertexCount: 2, minIndex: 3, indices: 4, indexSize: 5, streams: 6, elements: 14, elementCount: 78,
+  vs: 79, ps: 80, textures: 81, samplers: 129, targetW: 353, targetH: 354, viewport: 355, scissor: 361, rs: 365,
+  vsF: 621, psF: 1645, vsI: 2541, psI: 2605, vsB: 2669, psB: 2685, words: 2701,
+};
+const USAGE = ['POSITION', 'BLENDWEIGHT', 'BLENDINDICES', 'NORMAL', 'PSIZE', 'TEXCOORD', 'TANGENT', 'BINORMAL', 'TESSFACTOR', 'POSITIONT', 'COLOR', 'FOG', 'DEPTH', 'SAMPLE'];
+// D3DDECLTYPE -> [components, GL type, normalized]
+const DECL = {
+  0: [1, 'FLOAT', false], 1: [2, 'FLOAT', false], 2: [3, 'FLOAT', false], 3: [4, 'FLOAT', false], 4: [4, 'UNSIGNED_BYTE', true],
+  5: [4, 'UNSIGNED_BYTE', false], 6: [2, 'SHORT', false], 7: [4, 'SHORT', false], 8: [4, 'UNSIGNED_BYTE', true], 9: [2, 'SHORT', true],
+  10: [4, 'SHORT', true], 11: [2, 'UNSIGNED_SHORT', true], 12: [4, 'UNSIGNED_SHORT', true], 15: [2, 'HALF_FLOAT', false], 16: [4, 'HALF_FLOAT', false],
+};
 const RS = { ZENABLE: 7, FILLMODE: 8, ZWRITEENABLE: 14, ALPHATESTENABLE: 15, SRCBLEND: 19, DESTBLEND: 20, CULLMODE: 22,
   ZFUNC: 23, ALPHAREF: 24, ALPHAFUNC: 25, ALPHABLENDENABLE: 27, FOGENABLE: 28, FOGCOLOR: 34, FOGTABLEMODE: 35,
-  FOGSTART: 36, FOGEND: 37, FOGDENSITY: 38, TEXTUREFACTOR: 60, LIGHTING: 137, FOGVERTEXMODE: 140, COLORWRITEENABLE: 168, BLENDOP: 171 };
+  FOGSTART: 36, FOGEND: 37, FOGDENSITY: 38, TEXTUREFACTOR: 60, LIGHTING: 137, FOGVERTEXMODE: 140, COLORWRITEENABLE: 168, BLENDOP: 171,
+  SCISSORTESTENABLE: 174, SEPARATEALPHABLENDENABLE: 206, SRCBLENDALPHA: 207, DESTBLENDALPHA: 208, BLENDOPALPHA: 209 };
 const TSS = { COLOROP: 1, COLORARG1: 2, COLORARG2: 3, ALPHAOP: 4, ALPHAARG1: 5, ALPHAARG2: 6, ADDRESSU: 13, ADDRESSV: 14,
   MAGFILTER: 16, MINFILTER: 17, MIPFILTER: 18 };
 
@@ -352,7 +366,8 @@ export class D3DGL {
     for (let i = 0; i < 6; i++) key += f[D.viewport + i] + ',';
     for (const i of [RS.ZENABLE, RS.ZWRITEENABLE, RS.ALPHATESTENABLE, RS.SRCBLEND, RS.DESTBLEND, RS.CULLMODE, RS.ZFUNC, RS.ALPHAREF,
       RS.ALPHAFUNC, RS.ALPHABLENDENABLE, RS.FOGENABLE, RS.FOGCOLOR, RS.FOGTABLEMODE, RS.FOGSTART, RS.FOGEND, RS.FOGDENSITY,
-      RS.TEXTUREFACTOR, RS.FOGVERTEXMODE, RS.COLORWRITEENABLE, RS.BLENDOP]) key += rs(i) + ',';
+      RS.TEXTUREFACTOR, RS.FOGVERTEXMODE, RS.COLORWRITEENABLE, RS.BLENDOP, RS.SEPARATEALPHABLENDENABLE, RS.SRCBLENDALPHA,
+      RS.DESTBLENDALPHA, RS.BLENDOPALPHA]) key += rs(i) + ',';
     for (const i of [1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18]) key += t0(i) + ',' + t1(i) + ',';
     if (!rhw) for (let i = D.world; i < D.proj + 16; i++) key += w[i] + ',';
     if (key !== this.key || this.count + 6 * w[D.vertexCount] > MAX_BATCH) {
@@ -400,17 +415,31 @@ export class D3DGL {
     const fc = rs(RS.FOGCOLOR);
     gl.uniform4f(this.u.u_fogcolor, ((fc >>> 16) & 255) / 255, ((fc >>> 8) & 255) / 255, (fc & 255) / 255, 1);
     gl.uniform3f(this.u.u_fogparams, f[D.rs + RS.FOGSTART], f[D.rs + RS.FOGEND], f[D.rs + RS.FOGDENSITY]);
-    // Blending
+    this.renderState(rs, mode, null);
+  }
+
+  /** Blending, color mask, depth, culling (and the scissor rectangle, when given). */
+  renderState(rs, mode, scissor) {
+    const gl = this.gl;
     if (rs(RS.ALPHABLENDENABLE)) {
       gl.enable(gl.BLEND);
       const b = (x) => [0, gl.ZERO, gl.ONE, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.DST_ALPHA,
         gl.ONE_MINUS_DST_ALPHA, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA_SATURATE][x] ?? gl.ONE;
-      let src = rs(RS.SRCBLEND), dst = rs(RS.DESTBLEND);
-      if (src === 12) { src = 5; dst = 6; } // BOTHSRCALPHA
-      if (src === 13) { src = 6; dst = 5; } // BOTHINVSRCALPHA
-      gl.blendFunc(b(src), b(dst));
-      const op = rs(RS.BLENDOP);
-      gl.blendEquation([0, gl.FUNC_ADD, gl.FUNC_SUBTRACT, gl.FUNC_REVERSE_SUBTRACT, gl.MIN, gl.MAX][op] ?? gl.FUNC_ADD);
+      const pair = (src, dst) => {
+        if (src === 12) return [5, 6]; // BOTHSRCALPHA
+        if (src === 13) return [6, 5]; // BOTHINVSRCALPHA
+        return [src, dst];
+      };
+      const eq = (op) => [0, gl.FUNC_ADD, gl.FUNC_SUBTRACT, gl.FUNC_REVERSE_SUBTRACT, gl.MIN, gl.MAX][op] ?? gl.FUNC_ADD;
+      const [src, dst] = pair(rs(RS.SRCBLEND), rs(RS.DESTBLEND));
+      if (rs(RS.SEPARATEALPHABLENDENABLE)) {
+        const [sa, da] = pair(rs(RS.SRCBLENDALPHA), rs(RS.DESTBLENDALPHA));
+        gl.blendFuncSeparate(b(src), b(dst), b(sa), b(da));
+        gl.blendEquationSeparate(eq(rs(RS.BLENDOP)), eq(rs(RS.BLENDOPALPHA)));
+      } else {
+        gl.blendFunc(b(src), b(dst));
+        gl.blendEquation(eq(rs(RS.BLENDOP)));
+      }
     } else gl.disable(gl.BLEND);
     const cw = rs(RS.COLORWRITEENABLE);
     gl.colorMask(!!(cw & 1), !!(cw & 2), !!(cw & 4), !!(cw & 8));
@@ -423,11 +452,16 @@ export class D3DGL {
     // Culling: stored rows keep D3D's orientation, so D3D clockwise is GL counter-clockwise.
     const cull = rs(RS.CULLMODE);
     gl.frontFace(gl.CCW);
-    if (cull === 1 || mode !== gl.TRIANGLES) gl.disable(gl.CULL_FACE);
+    const tri = mode === gl.TRIANGLES || mode === gl.TRIANGLE_STRIP || mode === gl.TRIANGLE_FAN;
+    if (cull === 1 || !tri) gl.disable(gl.CULL_FACE);
     else {
       gl.enable(gl.CULL_FACE);
       gl.cullFace(cull === 3 ? gl.BACK : gl.FRONT);
     }
+    if (scissor && rs(RS.SCISSORTESTENABLE)) {
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(scissor[0], scissor[1], Math.max(0, scissor[2]), Math.max(0, scissor[3]));
+    } else gl.disable(gl.SCISSOR_TEST);
   }
 
   samplerParams(t, u, v, mag, min, mip) {
@@ -568,13 +602,141 @@ export class D3DGL {
 
   shaderDelete(id) {
     this.shaders?.delete(id);
+    for (const [k, p] of this.programs ?? []) {
+      if (k.split('|').includes(String(id))) {
+        this.gl.deleteProgram(p.prog);
+        this.programs.delete(k);
+      }
+    }
   }
 
-  draw9(ptr) {
-    if (!this.warned9) {
-      this.warned9 = true;
-      console.warn('gmrecomp: shader draws are not rendered yet');
+  /** The program for a vertex/pixel shader pair (translated by crates/runtime/src/hle/d3d9_shader.rs). */
+  program9(vsId, psId) {
+    const key = `${vsId}|${psId}`;
+    this.programs ??= new Map();
+    let p = this.programs.get(key);
+    if (p !== undefined) return p;
+    const gl = this.gl;
+    const vs = this.shaders?.get(vsId), ps = this.shaders?.get(psId);
+    p = null;
+    if (vs && ps) {
+      // Pixel shader inputs the vertex shader does not write read as zero.
+      const written = new Set([...vs.glsl.matchAll(/^out vec4 (v_\w+);/gm)].map((m) => m[1]));
+      const missing = [...ps.glsl.matchAll(/^in vec4 (v_\w+);/gm)].map((m) => m[1]).filter((v) => !written.has(v));
+      const vsrc = vs.glsl
+        .replace('// @varyings', missing.map((v) => `out vec4 ${v};`).join('\n'))
+        .replace('// @init', missing.map((v) => `${v} = vec4(0.0);`).join('\n'));
+      try {
+        const prog = gl.createProgram();
+        gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, vsrc));
+        gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, ps.glsl));
+        gl.linkProgram(prog);
+        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+        const u = (n) => gl.getUniformLocation(prog, n);
+        // attribute name -> (location, input register)
+        const attrs = new Map();
+        for (const m of vs.glsl.matchAll(/^in vec4 a_(\w+); \/\/ v(\d+)/gm)) attrs.set(m[1], { loc: gl.getAttribLocation(prog, `a_${m[1]}`), v: Number(m[2]) });
+        const samplers = [...ps.glsl.matchAll(/uniform highp \w+ s(\d+);/g)].map((m) => Number(m[1]));
+        gl.useProgram(prog);
+        for (const s of samplers) gl.uniform1i(u(`s${s}`), s);
+        p = { prog, attrs, samplers, vc: u('vc'), vi: u('vi'), vb: u('vb'), pc: u('pc'), pi: u('pi'), pb: u('pb'), fixup: u('u_fixup'), bgra: u('u_bgra'), atest: u('u_atest'), aref: u('u_aref') };
+      } catch (e) {
+        console.error(`gmrecomp: shaders ${vsId.toString(16)}/${psId.toString(16)}: ${e.message}`);
+      }
     }
+    this.programs.set(key, p);
+    return p;
+  }
+
+  /** One DrawCall9 record: a draw through translated vertex and pixel shaders. */
+  draw9(ptr) {
+    const w = new Uint32Array(this.rtBuffer(), ptr, D9.words);
+    const f = new Float32Array(this.rtBuffer(), ptr, D9.words);
+    const i32 = new Int32Array(this.rtBuffer(), ptr, D9.words);
+    const p = this.program9(w[D9.vs], w[D9.ps]);
+    if (!p) return;
+    this.flush();
+    this.draws++;
+    const gl = this.gl;
+    const guest = this.guestBuffer();
+    gl.useProgram(p.prog);
+    this.vao9 ??= gl.createVertexArray();
+    gl.bindVertexArray(this.vao9);
+    this.vbo9 ??= [0, 1, 2, 3].map(() => gl.createBuffer());
+    this.ibo9 ??= gl.createBuffer();
+    const prim = w[D9.prim], n = w[D9.primCount], min = w[D9.minIndex], count = w[D9.vertexCount];
+    // Vertex data of each stream used, from vertex `min` on.
+    const used = new Set();
+    for (let e = 0; e < w[D9.elementCount]; e++) used.add(w[D9.elements + 4 * e]);
+    for (const s of used) {
+      const addr = w[D9.streams + 2 * s], stride = w[D9.streams + 2 * s + 1];
+      if (!addr || !stride) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo9[s]);
+      gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(guest, addr + min * stride, count * stride), gl.STREAM_DRAW);
+    }
+    let bgra = 0;
+    const bound = new Set();
+    for (let e = 0; e < w[D9.elementCount]; e++) {
+      const [stream, offset, type, use] = [0, 1, 2, 3].map((k) => w[D9.elements + 4 * e + k]);
+      const a = p.attrs.get(`${USAGE[use & 0xff] ?? 'UNKNOWN'}${use >> 8}`);
+      if (!a || a.loc < 0 || bound.has(a.loc)) continue;
+      const fmt = DECL[type];
+      if (!fmt) continue;
+      bound.add(a.loc);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo9[stream]);
+      gl.enableVertexAttribArray(a.loc);
+      gl.vertexAttribPointer(a.loc, fmt[0], gl[fmt[1]], fmt[2], w[D9.streams + 2 * stream + 1], offset);
+      if (type === 4) bgra |= 1 << a.v;
+    }
+    for (const a of p.attrs.values()) {
+      if (a.loc >= 0 && !bound.has(a.loc)) {
+        gl.disableVertexAttribArray(a.loc);
+        gl.vertexAttrib4f(a.loc, 0, 0, 0, 1);
+      }
+    }
+    // Constants
+    gl.uniform4fv(p.vc, f.subarray(D9.vsF, D9.vsF + 1024));
+    gl.uniform4iv(p.vi, i32.subarray(D9.vsI, D9.vsI + 64));
+    gl.uniform1iv(p.vb, i32.subarray(D9.vsB, D9.vsB + 16));
+    gl.uniform4fv(p.pc, f.subarray(D9.psF, D9.psF + 896));
+    gl.uniform4iv(p.pi, i32.subarray(D9.psI, D9.psI + 64));
+    gl.uniform1iv(p.pb, i32.subarray(D9.psB, D9.psB + 16));
+    const vp = Array.from(f.subarray(D9.viewport, D9.viewport + 6));
+    gl.viewport(vp[0], vp[1], vp[2], vp[3]);
+    gl.depthRange(vp[4], vp[5]);
+    gl.uniform2f(p.fixup, 1 / Math.max(1, vp[2]), 1 / Math.max(1, vp[3]));
+    gl.uniform1i(p.bgra, bgra);
+    const rs = (i) => w[D9.rs + i];
+    gl.uniform1i(p.atest, rs(RS.ALPHATESTENABLE) ? rs(RS.ALPHAFUNC) : 8);
+    gl.uniform1f(p.aref, rs(RS.ALPHAREF) & 255);
+    // Textures with their sampler states
+    for (const s of p.samplers) {
+      const id = w[D9.textures + 3 * s];
+      const t = id ? this.textures.get(id) : null;
+      gl.activeTexture(gl.TEXTURE0 + s);
+      gl.bindTexture(gl.TEXTURE_2D, t ? t.tex : this.white);
+      const sm = (k) => w[D9.samplers + 14 * s + k];
+      if (t) this.samplerParams(t, sm(1), sm(2), sm(5), sm(6), sm(7));
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    const mode = [0, gl.POINTS, gl.LINES, gl.LINE_STRIP, gl.TRIANGLES, gl.TRIANGLE_STRIP, gl.TRIANGLE_FAN][prim] ?? gl.TRIANGLES;
+    this.renderState(rs, mode, Array.from(i32.subarray(D9.scissor, D9.scissor + 4)));
+    const vcount = [0, n, 2 * n, n + 1, 3 * n, n + 2, n + 2][prim] ?? 0;
+    if (w[D9.indices]) {
+      const size = w[D9.indexSize];
+      const src = size === 4 ? new Uint32Array(guest.slice(w[D9.indices], w[D9.indices] + 4 * vcount)) : new Uint16Array(guest.slice(w[D9.indices], w[D9.indices] + 2 * vcount));
+      if (min) for (let k = 0; k < src.length; k++) src[k] -= min;
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo9);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, src, gl.STREAM_DRAW);
+      gl.drawElements(mode, vcount, size === 4 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0);
+    } else {
+      gl.drawArrays(mode, 0, vcount);
+    }
+    // Back to the fixed-function renderer's program and vertex layout.
+    gl.useProgram(this.prog);
+    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+    this.key = '';
   }
 
   /** The back buffer as a PNG (ArrayBuffer). */

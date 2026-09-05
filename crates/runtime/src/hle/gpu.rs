@@ -144,6 +144,8 @@ pub struct DrawCall9 {
     pub ps_b: [u32; 16],
 }
 
+const _: () = assert!(std::mem::size_of::<DrawCall9>() == 2701 * 4);
+
 /// The host renderer. Every method has a no-op default (the harness).
 pub trait Gpu {
     /// The back buffer (render target 0) was created or resized.

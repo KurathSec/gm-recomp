@@ -49,12 +49,17 @@ enum Cmd {
     },
 }
 
-/// DLLs the game's modules import that it does not ship and the runtime does not
-/// emulate (the Visual C++ runtimes of extension DLLs, say) are copied from the system
-/// DLL folder (Wine's PE builds) to files/C/Windows/system32, where the runtime looks
-/// after the game directory, with the DLLs they need in turn.
-fn supply_system_dlls(files_dir: &Path, system: &Path) -> Result<Vec<String>> {
+/// DLLs the game's modules need that it does not ship and the runtime does not emulate
+/// are copied from the system DLL folder (Wine's PE builds, debug sections stripped)
+/// to files/C/Windows/system32, where the runtime looks after the game directory,
+/// with the DLLs they need in turn. "Need" is a static import, or for redistributable
+/// runtimes (Visual C++, the shader compiler) a name in the module's strings, as
+/// D3DX loads d3dcompiler; the shader compiler only when the game has shaders.
+fn supply_system_dlls(files_dir: &Path, system: &Path, shaders: bool) -> Result<Vec<String>> {
     let emulated = |stem: &str| runtime::hle::kernel32::CORE_DLLS.contains(&stem) || runtime::hle::kernel32::HLE_DLLS.contains(&stem);
+    let redistributable = |name: &str| {
+        ["msvcr", "msvcp", "vcruntime", "concrt", "ucrtbase"].iter().any(|p| name.starts_with(p)) || (shaders && name.starts_with("d3dcompiler_"))
+    };
     let mut all = Vec::new();
     walk(files_dir, files_dir, &mut all)?;
     let shipped: std::collections::HashSet<String> =
@@ -69,8 +74,9 @@ fn supply_system_dlls(files_dir: &Path, system: &Path) -> Result<Vec<String>> {
     while let Some(path) = queue.pop() {
         let Ok(bytes) = fs::read(&path) else { continue };
         let Ok(pe) = pe::Pe::parse(&bytes) else { continue };
-        for d in pe.imports().unwrap_or_default() {
-            let name = d.dll.to_lowercase();
+        let mut wanted: Vec<String> = pe.imports().unwrap_or_default().iter().map(|d| d.dll.to_lowercase()).collect();
+        wanted.extend(dll_names_in(&bytes).into_iter().filter(|n| redistributable(n)));
+        for name in wanted {
             let stem = name.trim_end_matches(".dll").to_string();
             if emulated(&stem) || shipped.contains(&name) || supplied.contains(&name) {
                 continue;
@@ -82,11 +88,39 @@ fn supply_system_dlls(files_dir: &Path, system: &Path) -> Result<Vec<String>> {
             fs::create_dir_all(&sysdir)?;
             let dst = sysdir.join(&name);
             fs::copy(&src, &dst)?;
+            // Wine's builds carry DWARF; the runtime needs none of it.
+            let _ = std::process::Command::new("objcopy").arg("--strip-debug").arg(&dst).status();
             supplied.push(name);
             queue.push(dst);
         }
     }
     Ok(supplied)
+}
+
+/// "*.dll" names in a binary's ASCII and UTF-16 strings (lowercase).
+fn dll_names_in(bytes: &[u8]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let ok = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.';
+    for step in [1usize, 2] {
+        let mut i = 0;
+        while i + 4 * step <= bytes.len() {
+            let at = |k: usize| bytes[i + k * step];
+            let is_dll = (0..4).all(|k| step == 1 || bytes.get(i + k * step + 1) == Some(&0))
+                && at(0) == b'.' && at(1).eq_ignore_ascii_case(&b'd') && at(2).eq_ignore_ascii_case(&b'l') && at(3).eq_ignore_ascii_case(&b'l');
+            if is_dll {
+                let mut start = i;
+                while start >= step && ok(bytes[start - step]) && (step == 1 || bytes[start - step + 1] == 0) {
+                    start -= step;
+                }
+                let name: String = (start..i + 4 * step).step_by(step).map(|k| bytes[k] as char).collect();
+                if name.len() > 4 && name.len() < 64 {
+                    out.insert(name.to_lowercase());
+                }
+            }
+            i += step;
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// <out>/index.json: [{slug, title, engine}] of every imported game, by title.
@@ -214,9 +248,6 @@ fn import_one(input: &Path, out: &Path, sys: &inventory::SystemExports, force: b
     let staged = extract::stage(input, &files_dir)?;
     let iexpress = extract::unwrap_iexpress(&files_dir, &staging.join("scratch"))?;
     let _ = fs::remove_dir_all(staging.join("scratch"));
-    for dll in supply_system_dlls(&files_dir, &sys.dir)? {
-        println!("  supplying {dll} (imported, neither shipped nor emulated)");
-    }
 
     let mut slug = slugify(&staged.title);
     if slug.is_empty() {
@@ -258,6 +289,22 @@ fn import_one(input: &Path, out: &Path, sys: &inventory::SystemExports, force: b
         let exe_dir = files_dir.join(&entry);
         engine::detect(&exe, exe_dir.parent().unwrap())
     };
+    let shaders = matches!(engine, engine::Engine::Gms { shaders, .. } if shaders > 0);
+    let supplied = supply_system_dlls(&files_dir, &sys.dir, shaders)?;
+    for dll in &supplied {
+        println!("  supplying {dll} (needed, neither shipped nor emulated)");
+    }
+    if !supplied.is_empty() {
+        files.clear();
+        walk(&files_dir, &files_dir, &mut files)?;
+        for f in files.iter().filter(|f| f.path.starts_with("C/")) {
+            let bytes = fs::read(files_dir.join(&f.path))?;
+            match inventory::analyze(&f.path, &bytes, sys) {
+                Ok(m) => modules.push(m),
+                Err(e) => unsupported_binaries.push((f.path.clone(), e.to_string())),
+            }
+        }
+    }
     let manifest = Manifest {
         slug: slug.clone(),
         title: staged.title,
