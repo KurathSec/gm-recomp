@@ -173,6 +173,12 @@ impl Ctx<'_> {
 
 pub type ApiFn = fn(&mut Ctx) -> ApiResult;
 
+impl ApiEntry {
+    pub fn clone_name(&self) -> String {
+        format!("{}!{}", self.dll, self.name)
+    }
+}
+
 pub struct ApiEntry {
     pub dll: String,
     pub name: String,
@@ -197,7 +203,7 @@ pub struct Registry {
     /// Math functions behind table-driven msvcrt entries, by API id.
     pub math_fns: HashMap<u32, fn(f64) -> f64>,
     /// APIs that do not end a clock spin-wait (clock reads, empty message polls).
-    pub idle_ok: std::collections::HashSet<u32>,
+    pub idle_ok: std::collections::HashSet<u32, crate::fasthash::AddrHash>,
     /// Exported variables (msvcrt's `_iob`...): their initial contents, built from
     /// the address they get (so they can point into themselves).
     pub data: HashMap<(String, String), (u32, fn(u32) -> Vec<u8>)>,

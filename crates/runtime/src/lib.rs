@@ -3,6 +3,7 @@
 //! supplies memory, translation and the dispatcher.
 
 pub mod engine;
+pub mod fasthash;
 pub mod hle;
 pub mod loader;
 pub mod mem;

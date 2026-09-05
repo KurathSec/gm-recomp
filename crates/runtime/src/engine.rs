@@ -42,11 +42,14 @@ pub struct ModInfo {
     pub jump_tables: HashMap<u32, Vec<u32>>,
 }
 
+pub use crate::fasthash::AddrHash;
+
 /// Host-independent engine state; the host keeps it where callbacks can reach it.
 pub struct Engine {
-    pub p: Option<Process>,
-    /// Guest entry address -> function table index.
-    pub funcs: HashMap<u32, u32>,
+    /// Boxed: it is lent out at every API call (4 KB to move otherwise).
+    pub p: Option<Box<Process>>,
+    /// Guest entry address -> function table index (looked up at every dispatch).
+    pub funcs: HashMap<u32, u32, AddrHash>,
     /// Table index of a function that does nothing (returned after an API call).
     pub nop_index: u32,
     pub mods: Vec<ModInfo>,
@@ -79,8 +82,8 @@ pub struct Engine {
 impl Engine {
     pub fn new(p: Process) -> Self {
         Engine {
-            p: Some(p),
-            funcs: HashMap::new(),
+            p: Some(Box::new(p)),
+            funcs: HashMap::default(),
             nop_index: 0,
             mods: Vec::new(),
             exit: None,
@@ -246,13 +249,13 @@ impl<M: Machine> Host for M {
         // Lend the process to the nested dispatcher.
         p.nest += 1;
         let owned = std::mem::replace(p, Process::empty());
-        self.engine().p = Some(owned);
+        self.engine().p = Some(Box::new(owned));
         let r = run_until(self, addr, marker, Some(frame_top));
         {
             let e = self.engine();
             e.depth -= 1;
             if let Some(back) = e.p.take() {
-                *p = back;
+                *p = *back;
             }
         }
         p.nest -= 1;
@@ -350,25 +353,29 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
         let e = m.engine_ref();
         (e.trace, e.depth, e.max_api_calls)
     };
-    let (name, func, nargs, pop, calls) = {
+    let (func, nargs, pop, calls) = {
         let Some(p) = m.engine().p.as_mut() else { return stop(m, "process not available".into()) };
         p.api_calls += 1;
         if !p.registry.idle_ok.contains(&id.0) {
             p.idle_streak = 0;
         }
         let e = &p.registry.entries[id.0 as usize];
-        (format!("{}!{}", e.dll, e.name), e.func, e.nargs, e.pop, p.api_calls)
+        (e.func, e.nargs, e.pop, p.api_calls)
     };
+    // "dll!name", for traces and errors only
+    let name_of = |m: &mut M| m.engine_ref().p.as_ref().map(|p| p.registry.entries[id.0 as usize].clone_name()).unwrap_or_default();
     if calls > max_calls {
         return stop(m, format!("API call budget exhausted ({max_calls})"));
     }
     let ra = m.read_u32(regs.esp).unwrap_or(0);
     if trace {
+        let name = name_of(m);
         let args = format_args(m, regs.esp, if nargs > 0 { nargs.min(8) } else { 4 });
         let line = format!("{:w$}{name}({args}) from {ra:#x}", "", w = (depth * 2) as usize);
         m.print(&line);
     }
     let Some(f) = func else {
+        let name = name_of(m);
         let _ = with_ctx(m, &mut regs, id, |c| c.p.unimplemented.push(name.clone()));
         return stop(m, format!("unimplemented API {name} called from {ra:#x}"));
     };
@@ -403,7 +410,10 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
         // globals already hold that context.
         Err(ApiError(msg)) if msg == UNWIND => request(m, Ctl::Resume),
         Err(ApiError(msg)) if msg == EXITED => stop(m, msg),
-        Err(ApiError(msg)) => stop(m, format!("{name}: {msg}")),
+        Err(ApiError(msg)) => {
+            let name = name_of(m);
+            stop(m, format!("{name}: {msg}"))
+        }
     }
 }
 
@@ -818,10 +828,10 @@ pub fn run_threads<M: Machine>(m: &mut M, p: &mut Process) {
         p.current = i;
         p.slice_nest = Some(p.nest);
         let owned = std::mem::replace(p, Process::empty());
-        m.engine().p = Some(owned);
+        m.engine().p = Some(Box::new(owned));
         let r = run_slice(m);
         if let Some(back) = m.engine().p.take() {
-            *p = back;
+            *p = *back;
         }
         p.current = 0;
         p.slice_nest = None;

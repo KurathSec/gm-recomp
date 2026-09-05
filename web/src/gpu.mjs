@@ -187,8 +187,10 @@ export class D3DGL {
    * @param {OffscreenCanvas|HTMLCanvasElement} canvas
    * @param {() => ArrayBuffer} guestBuffer  current guest memory buffer
    * @param {() => ArrayBuffer} rtBuffer  current runtime memory buffer (DrawCall records)
+   * @param {(line: string) => void} [print]  where problems are reported
    */
-  constructor(canvas, guestBuffer, rtBuffer) {
+  constructor(canvas, guestBuffer, rtBuffer, print = console.warn) {
+    this.print = print;
     this.canvas = canvas;
     this.guestBuffer = guestBuffer;
     this.rtBuffer = rtBuffer;
@@ -598,6 +600,13 @@ export class D3DGL {
 
   shaderCreate(id, vertex, glsl) {
     (this.shaders ??= new Map()).set(id, { vertex, glsl });
+    // Compile now so a translation problem shows up when the game creates the shader.
+    const gl = this.gl;
+    const s = gl.createShader(vertex ? gl.VERTEX_SHADER : gl.FRAGMENT_SHADER);
+    gl.shaderSource(s, glsl.replace('// @varyings', '').replace('// @init', ''));
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) this.print(`shader ${id.toString(16)}: ${gl.getShaderInfoLog(s)}`);
+    gl.deleteShader(s);
   }
 
   shaderDelete(id) {
@@ -641,7 +650,7 @@ export class D3DGL {
         for (const s of samplers) gl.uniform1i(u(`s${s}`), s);
         p = { prog, attrs, samplers, vc: u('vc'), vi: u('vi'), vb: u('vb'), pc: u('pc'), pi: u('pi'), pb: u('pb'), fixup: u('u_fixup'), bgra: u('u_bgra'), atest: u('u_atest'), aref: u('u_aref') };
       } catch (e) {
-        console.error(`gmrecomp: shaders ${vsId.toString(16)}/${psId.toString(16)}: ${e.message}`);
+        this.print(`shaders ${vsId.toString(16)}/${psId.toString(16)}: ${e.message}`);
       }
     }
     this.programs.set(key, p);

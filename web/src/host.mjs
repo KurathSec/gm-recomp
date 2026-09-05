@@ -198,7 +198,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   const e = enc.encode(exe);
   const ep = x.alloc(e.length);
   mem().set(e, ep);
-  if (canvas) gpu = new D3DGL(canvas, () => glue.exports.mem.buffer, () => x.memory.buffer);
+  if (canvas) gpu = new D3DGL(canvas, () => glue.exports.mem.buffer, () => x.memory.buffer, print);
   if (onReady) {
     onReady({
       key: (vk, scan, down) => x.input_key(vk, scan, down ? 1 : 0),
