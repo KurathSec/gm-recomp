@@ -562,6 +562,19 @@ pub extern "C" fn input_mouse(x: i32, y: i32, buttons: u32) {
     state().input.push(runtime::InputEvent::Mouse { x, y, buttons });
 }
 
+/// A game controller's state in XInput terms (see `runtime::InputEvent::Pad`):
+/// `triggers` = left | right << 8.
+#[unsafe(no_mangle)]
+pub extern "C" fn input_pad(index: u32, connected: u32, buttons: u32, triggers: u32, lx: i32, ly: i32, rx: i32, ry: i32) {
+    state().input.push(runtime::InputEvent::Pad {
+        index: index as u8,
+        connected: connected != 0,
+        buttons: buttons as u16,
+        triggers: [triggers as u8, (triggers >> 8) as u8],
+        thumbs: [lx as i16, ly as i16, rx as i16, ry as i16],
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_resolve(addr: i32) -> i32 {
     engine::rt_resolve(&mut Web, addr as u32) as i32

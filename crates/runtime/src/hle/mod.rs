@@ -17,6 +17,7 @@ pub mod mci;
 pub mod misc;
 pub mod msvcrt;
 pub mod nls;
+pub mod pads;
 pub mod user32;
 
 use crate::mem::Guest;
@@ -106,6 +107,20 @@ pub enum InputEvent {
     /// Client coordinates of the game window and the button state (bit 0 left,
     /// bit 1 right, bit 2 middle).
     Mouse { x: i32, y: i32, buttons: u32 },
+    /// Game controller `index` (0..4) in XInput terms: XINPUT_GAMEPAD button bits,
+    /// triggers 0..255, thumb sticks (LX, LY, RX, RY; up and right positive).
+    Pad { index: u8, connected: bool, buttons: u16, triggers: [u8; 2], thumbs: [i16; 4] },
+}
+
+/// A game controller as XInput and the joystick API report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PadState {
+    pub connected: bool,
+    pub buttons: u16,
+    pub triggers: [u8; 2],
+    pub thumbs: [i16; 4],
+    /// XINPUT_STATE.dwPacketNumber: changes with the state.
+    pub packet: u32,
 }
 
 pub struct Ctx<'a> {
@@ -254,6 +269,7 @@ impl Registry {
         user32::register_more(&mut r);
         user32::register_extra(&mut r);
         threads::register(&mut r);
+        pads::register(&mut r);
         r
     }
 

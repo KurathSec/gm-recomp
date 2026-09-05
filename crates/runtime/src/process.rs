@@ -368,6 +368,8 @@ pub struct Process {
     pub crt_rand: u32,
     /// setlocale's "C" string.
     pub crt_locale: u32,
+    /// Game controllers 0..3.
+    pub pads: [crate::hle::PadState; 4],
     /// Waitable timers: (handle, virtual time they become signaled).
     pub timers_due: Vec<(u32, u64)>,
     pub textures_created: u64,
@@ -481,6 +483,7 @@ impl Process {
             crt_rand: 1,
             crt_locale: 0,
             timers_due: Vec::new(),
+            pads: Default::default(),
             textures_created: 0,
             next_d3d_handle: 0x1000,
             trace: false,

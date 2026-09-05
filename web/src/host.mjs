@@ -20,7 +20,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {OffscreenCanvas} [o.canvas]  render target; without it nothing is drawn
  * @param {boolean} [o.pace]  hold frames to the game's own timing (needs JSPI)
  * @param {(frame: number, gpu: D3DGL) => void|Promise<void>} [o.onFrame]  after each Present
- * @param {(input: {key: Function, mouse: Function}) => void} [o.onReady]  input entry points,
+ * @param {(input: {key: Function, mouse: Function, pad: Function}) => void} [o.onReady]  input entry points,
  *   usable while the guest is suspended in Present
  * @param {(w: number, h: number) => void} [o.onResize]  the shown frame changed size
  * @param {{sab: SharedArrayBuffer, frames: number}} [o.audioRing]  where the sound mix goes
@@ -203,6 +203,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     onReady({
       key: (vk, scan, down) => x.input_key(vk, scan, down ? 1 : 0),
       mouse: (mx, my, buttons) => x.input_mouse(mx | 0, my | 0, buttons),
+      pad: (i, connected, buttons, lt, rt, lx, ly, rx, ry) => x.input_pad(i, connected ? 1 : 0, buttons, lt | (rt << 8), lx, ly, rx, ry),
     });
   }
   if (x.init(ep, e.length, frames, trace ? 1 : 0, epoch, nopIndex, gpu ? 1 : 0) !== 0) {

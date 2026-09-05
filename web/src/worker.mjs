@@ -14,11 +14,13 @@ function handleInput(data) {
     if (k) input.key(k[0], k[1], data.down);
   } else if (data.type === 'mouse') {
     input.mouse(data.x, data.y, data.buttons);
+  } else if (data.type === 'pad') {
+    input.pad(data.index, data.connected, data.buttons, data.lt, data.rt, data.lx, data.ly, data.rx, data.ry);
   }
 }
 
 self.onmessage = async ({ data }) => {
-  if (data.type === 'key' || data.type === 'mouse') return handleInput(data);
+  if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
   const { game, frames = 0, epoch, canvas, capture = [], pace = true, script = [], persist = true } = data;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {

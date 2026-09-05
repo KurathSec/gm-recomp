@@ -345,6 +345,32 @@
           w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons });
         };
         for (const t of ['mousemove', 'mousedown', 'mouseup']) screen.addEventListener(t, mouse);
+
+        // Game controllers (the standard layout matches an Xbox controller): XInput state,
+        // sent when it changes.
+        const PAD_BUTTONS = { 0: 0x1000, 1: 0x2000, 2: 0x4000, 3: 0x8000, 4: 0x0100, 5: 0x0200, 8: 0x0020, 9: 0x0010, 10: 0x0040, 11: 0x0080, 12: 0x1, 13: 0x2, 14: 0x4, 15: 0x8 };
+        const padLast = ['', '', '', ''];
+        const axis = (v) => Math.max(-32768, Math.min(32767, Math.round((v ?? 0) * 32767)));
+        const pollPads = () => {
+          const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+          for (let i = 0; i < 4; i++) {
+            const g = pads[i];
+            let state;
+            if (g && g.connected) {
+              let buttons = 0;
+              for (const [k, bit] of Object.entries(PAD_BUTTONS)) if (g.buttons[k]?.pressed) buttons |= bit;
+              const trig = (k) => Math.round(255 * (g.buttons[k]?.value ?? 0));
+              state = { connected: true, buttons, lt: trig(6), rt: trig(7), lx: axis(g.axes[0]), ly: axis(-(g.axes[1] ?? 0)), rx: axis(g.axes[2]), ry: axis(-(g.axes[3] ?? 0)) };
+            } else state = { connected: false, buttons: 0, lt: 0, rt: 0, lx: 0, ly: 0, rx: 0, ry: 0 };
+            const key = JSON.stringify(state);
+            if (key !== padLast[i]) {
+              padLast[i] = key;
+              w.postMessage({ type: 'pad', index: i, ...state });
+            }
+          }
+          requestAnimationFrame(pollPads);
+        };
+        requestAnimationFrame(pollPads);
         screen.addEventListener('contextmenu', (e) => e.preventDefault());
       }
     </script>

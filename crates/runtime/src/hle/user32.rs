@@ -1273,7 +1273,7 @@ pub fn send_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> Resul
 
 /// Applies input from the host: key state, key messages to the focus window, mouse
 /// position and button messages.
-pub fn pump_input(c: &mut Ctx) {
+pub(crate) fn pump_input(c: &mut Ctx) {
     let frame = c.p.frames_presented;
     let events = c.host.poll_input(frame);
     for ev in events {
@@ -1309,6 +1309,14 @@ pub fn pump_input(c: &mut Ctx) {
                 let ext = if scan & 0x100 != 0 { 1 << 24 } else { 0 };
                 let lp = 1 | ((scan as u32 & 0xFF) << 16) | ext | if down { if was_down { 1 << 30 } else { 0 } } else { 0xC000_0000 };
                 post_message(c, target, if down { WM_KEYDOWN } else { 0x0101 }, msg_vk, lp);
+            }
+            super::InputEvent::Pad { index, connected, buttons, triggers, thumbs } => {
+                if let Some(pad) = c.p.pads.get_mut(index as usize) {
+                    let new = super::PadState { connected, buttons, triggers, thumbs, packet: pad.packet };
+                    if new != *pad {
+                        *pad = super::PadState { packet: pad.packet.wrapping_add(1), ..new };
+                    }
+                }
             }
             super::InputEvent::Mouse { x, y, buttons } => {
                 let target = if c.p.capture != 0 { c.p.capture } else { mouse_window(c) };
