@@ -2,9 +2,11 @@
 //! register that holds a zero, an infinity or a normal double stored as f64. The
 //! common instructions run in the shared `x87` module on those registers when the
 //! f64 result is provably the one the 80-bit unit produces: precision control 53
-//! bits and round-to-nearest for arithmetic, no denormals, NaNs, overflow or
-//! underflow, no stack faults. The precision flag and C1 ("rounded up") come from
-//! exact error terms (TwoSum, Dekker's product). Anything a check rejects runs
+//! bits for arithmetic, no denormals, NaNs, overflow or underflow, no stack faults.
+//! The precision flag and C1 ("rounded up") come from exact error terms (TwoSum,
+//! Dekker's product); the directed rounding modes move the round-to-nearest result
+//! one step toward the exact value when the error's sign says it lies on the wrong
+//! side. Anything a check rejects runs
 //! through `rt.fpu` on the same state, so both paths agree by construction.
 //!
 //! Translated code calls one helper per instruction form (`f<k>(a, ip) -> i32`, `a`
@@ -37,6 +39,7 @@ const fn pow2(e: i64) -> f64 {
 const F32_MIN_NORMAL: f64 = pow2(-126);
 /// Below this, rounding to single might reach the subnormal range.
 const F32_TINY: f64 = pow2(-125);
+const F32_MAX: f64 = f32::MAX as f64;
 /// Limits that keep the error-term computations free of overflow and underflow.
 const SPLIT_MAX: f64 = pow2(995);
 const ADD_MAX: f64 = pow2(1020);
@@ -406,15 +409,41 @@ impl B {
     fn exact_if(&mut self, fl: u32, r: u32) -> &mut Self {
         self.i(W::If(BlockType::Empty)).clear_c1_at(fl).g(r).i(W::Return).i(W::End)
     }
-    /// PE if `err` != 0, and C1 if the result was rounded away from zero, which is
-    /// when `err` and `r` differ in sign (for a sum or product: exact = result + err,
-    /// r = the result; for a quotient: err = the remainder, r = the dividend).
+    /// PE if `err` != 0, and C1 if the result `r` was rounded away from zero, which is
+    /// when `err` (exact - r, or a value with its sign) and `r` differ in sign.
     fn flags_from_error(&mut self, fl: u32, err: u32, r: u32) -> &mut Self {
         self.g(fl).g(fl).i(W::I32Load16U(ma(fb::SW))).c(!SW_C1 & 0xffff).i(W::I32And);
         self.g(err).k(0.0).i(W::F64Ne).c(SW_PE_SHIFT).i(W::I32Shl).i(W::I32Or);
         self.g(err).k(0.0).i(W::F64Lt).g(r).k(0.0).i(W::F64Lt).i(W::I32Xor);
         self.g(err).k(0.0).i(W::F64Ne).i(W::I32And).c(9).i(W::I32Shl).i(W::I32Or);
         self.i(W::I32Store16(ma(fb::SW)))
+    }
+    /// `into` = the control word's rounding control (block address local `fl`), also
+    /// left on the stack.
+    fn rc_at(&mut self, fl: u32, into: u32) -> &mut Self {
+        self.g(fl).i(W::I32Load16U(ma(fb::CW))).c(10).i(W::I32ShrU).c(3).i(W::I32And).t(into)
+    }
+    /// i32 on the stack: 1 (a step away from zero) -> +1, 0 (toward zero) -> -1.
+    fn step(&mut self) -> &mut Self {
+        self.c(1).i(W::I32Shl).c(1).i(W::I32Sub)
+    }
+    /// Rounds `r`, the round-to-nearest result of an operation whose exact value is
+    /// r + e (`e` exact, or with the sign of the true error), by the control word's
+    /// RC: in a directed mode, one step toward the exact value when it lies on the
+    /// wrong side (chop: nearer zero, up: above, down: below). `e` then gets the sign
+    /// of the new error. Returns NaN when the step overflows.
+    fn round_directed(&mut self, fl: u32, r: u32, e: u32, rc: u32) -> &mut Self {
+        self.rc_at(fl, rc).i(W::If(BlockType::Empty));
+        self.g(e).k(0.0).i(W::F64Lt).g(r).k(0.0).i(W::F64Lt).i(W::I32Xor).g(e).k(0.0).i(W::F64Ne).i(W::I32And);
+        self.g(e).k(0.0).i(W::F64Gt).g(e).k(0.0).i(W::F64Lt).g(rc).c(2).i(W::I32Eq).i(W::Select);
+        self.g(rc).c(3).i(W::I32Eq).i(W::Select).i(W::If(BlockType::Empty));
+        // the exact value lies beyond r (away from zero) when e and r agree in sign
+        self.g(r).i(W::I64ReinterpretF64);
+        self.g(e).k(0.0).i(W::F64Lt).g(r).k(0.0).i(W::F64Lt).i(W::I32Eq).step().i(W::I64ExtendI32S);
+        self.i(W::I64Add).i(W::F64ReinterpretI64).s(r);
+        self.g(e).i(W::F64Neg).s(e);
+        self.abs_cmp(r, INF, W::F64Eq).nan_if();
+        self.i(W::End).i(W::End)
     }
     /// Dekker's split: hi, lo = x
     fn split(&mut self, x: u32, c: u32, hi: u32, lo: u32) -> &mut Self {
@@ -501,6 +530,10 @@ impl B {
         self.g(XB).c(SW_PE_SHIFT).i(W::I32Shl).g(XC).c(9).i(W::I32Shl).i(W::I32Or).i(W::I32Or);
         self.i(W::I32Store16(ma(fb::SW)))
     }
+    /// `into` = the control word's rounding control, also left on the stack.
+    fn rc(&mut self, into: u32) -> &mut Self {
+        self.rc_at(F, into)
+    }
     fn set_fip(&mut self) -> &mut Self {
         self.g(F).g(IP).i(W::I32Store(ma(fb::FIP)))
     }
@@ -554,7 +587,7 @@ impl B {
             return self.g(X).i(W::F64Trunc).s(into);
         }
         // select(a, b, c) = c ? a : b
-        self.g(F).i(W::I32Load16U(ma(fb::CW))).c(10).i(W::I32ShrU).c(3).i(W::I32And).s(XB);
+        self.rc(XB).i(W::Drop);
         self.g(X).i(W::F64Nearest).g(X).i(W::F64Floor).g(X).i(W::F64Ceil).g(X).i(W::F64Trunc);
         self.g(XB).c(2).i(W::I32Eq).i(W::Select);
         self.g(XB).c(1).i(W::I32Eq).i(W::Select);
@@ -616,12 +649,22 @@ fn form_body(form: Form) -> Function {
                     b.clear_c1();
                 }
                 Src::M32 => {
-                    b.need_fast(fb::FAST_NEAREST).need_f64(PA).load_st(PA, X);
-                    b.g(X).i(W::F32DemoteF64).i(W::F64PromoteF32).s(Y);
-                    // overflow (an infinite result from a finite value)
-                    b.abs_cmp(Y, INF, W::F64Eq).abs_cmp(X, INF, W::F64Ne).i(W::I32And).fail_if();
+                    b.need_fast(fb::FAST_INEXACT).need_f64(PA).load_st(PA, X);
+                    // beyond the largest single (overflow in some rounding mode)
+                    b.abs_cmp(X, F32_MAX, W::F64Gt).abs_cmp(X, INF, W::F64Ne).i(W::I32And).fail_if();
                     // near or below the single-precision underflow threshold
                     b.abs_cmp(X, F32_TINY, W::F64Lt).g(X).k(0.0).i(W::F64Ne).i(W::I32And).fail_if();
+                    b.g(X).i(W::F32DemoteF64).i(W::F64PromoteF32).s(Y);
+                    // directed rounding: one step toward X when Y lies on the wrong side
+                    // (chop: beyond it in magnitude, up: below it, down: above it)
+                    b.rc(XB).i(W::If(BlockType::Empty));
+                    b.g(Y).i(W::F64Abs).g(X).i(W::F64Abs).i(W::F64Gt);
+                    b.g(Y).g(X).i(W::F64Lt).g(Y).g(X).i(W::F64Gt).g(XB).c(2).i(W::I32Eq).i(W::Select);
+                    b.g(XB).c(3).i(W::I32Eq).i(W::Select).i(W::If(BlockType::Empty));
+                    b.g(Y).i(W::F32DemoteF64).i(W::I32ReinterpretF32);
+                    b.g(Y).i(W::F64Abs).g(X).i(W::F64Abs).i(W::F64Lt).step();
+                    b.i(W::I32Add).i(W::F32ReinterpretI32).i(W::F64PromoteF32).s(Y);
+                    b.i(W::End).i(W::End);
                     b.inexact_flags(X, Y);
                     b.g(A).g(Y).i(W::F32DemoteF64).i(W::F32Store(ma(0)));
                     b.sw_inexact();
@@ -778,11 +821,10 @@ fn form_body(form: Form) -> Function {
             // unmasking an exception that is already flagged makes it pending
             b.g(F).i(W::I32Load16U(ma(fb::SW))).g(XB).c(u32::MAX).i(W::I32Xor).i(W::I32And).c(0x3f).i(W::I32And).fail_if();
             b.g(F).g(XB).i(W::I32Store16(ma(fb::CW)));
-            // FAST bits as fpu::block::fast_bits: XC = PM, PA = PM && RC nearest
+            // FAST bits as fpu::block::fast_bits: XC = PM
             b.g(XB).c(5).i(W::I32ShrU).c(1).i(W::I32And).s(XC);
-            b.g(XC).g(XB).c(0xc00).i(W::I32And).i(W::I32Eqz).i(W::I32And).s(PA);
-            b.g(F).c(fb::FAST_MOVE).g(XC).c(1).i(W::I32Shl).i(W::I32Or).g(PA).c(2).i(W::I32Shl).i(W::I32Or);
-            b.g(PA).g(XB).c(0x300).i(W::I32And).c(0x200).i(W::I32Eq).i(W::I32And).c(3).i(W::I32Shl).i(W::I32Or);
+            b.g(F).c(fb::FAST_MOVE).g(XC).c(fb::FAST_INEXACT.trailing_zeros()).i(W::I32Shl).i(W::I32Or);
+            b.g(XC).g(XB).c(0x300).i(W::I32And).c(0x200).i(W::I32Eq).i(W::I32And).c(fb::FAST_ARITH.trailing_zeros()).i(W::I32Shl).i(W::I32Or);
             b.i(W::I32Store(ma(fb::FAST)));
         }
         Ffree => {
@@ -803,8 +845,8 @@ fn form_body(form: Form) -> Function {
 
 /// (a, b, block) -> a + b, or NaN when the fast path must not decide.
 fn h_add() -> Function {
-    let (a, b, fl, s, bb, e) = (0, 1, 2, 3, 4, 5);
-    let mut x = B::new(vec![(3, ValType::F64)]);
+    let (a, b, fl, s, bb, e, rc) = (0, 1, 2, 3, 4, 5, 6);
+    let mut x = B::new(vec![(3, ValType::F64), (1, ValType::I32)]);
     x.g(a).g(b).i(W::F64Add).s(s);
     x.g(s).g(s).i(W::F64Ne).nan_if(); // inf - inf
     x.abs_cmp(s, INF, W::F64Eq).i(W::If(BlockType::Empty));
@@ -816,6 +858,9 @@ fn h_add() -> Function {
     // TwoSum
     x.g(s).g(a).i(W::F64Sub).s(bb);
     x.g(a).g(s).g(bb).i(W::F64Sub).i(W::F64Sub).g(b).g(bb).i(W::F64Sub).i(W::F64Add).s(e);
+    x.round_directed(fl, s, e, rc);
+    // an exact zero sum of opposite signs is -0 when rounding down
+    x.g(rc).c(1).i(W::I32Eq).g(s).k(0.0).i(W::F64Eq).i(W::I32And).nan_if();
     x.flags_from_error(fl, e, s);
     x.g(s);
     x.finish()
@@ -823,8 +868,8 @@ fn h_add() -> Function {
 
 /// (a, b, block) -> a * b, or NaN.
 fn h_mul() -> Function {
-    let (a, b, fl, p, c, ah, al, bh, bl, e) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
-    let mut x = B::new(vec![(7, ValType::F64)]);
+    let (a, b, fl, p, c, ah, al, bh, bl, e, rc) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+    let mut x = B::new(vec![(7, ValType::F64), (1, ValType::I32)]);
     x.g(a).g(b).i(W::F64Mul).s(p);
     x.g(p).g(p).i(W::F64Ne).nan_if(); // 0 * inf
     x.abs_cmp(p, INF, W::F64Eq).i(W::If(BlockType::Empty));
@@ -835,6 +880,7 @@ fn h_mul() -> Function {
     x.ret_nan().i(W::End); // underflow
     x.abs_cmp(p, TINY, W::F64Lt).abs_cmp(a, SPLIT_MAX, W::F64Ge).i(W::I32Or).abs_cmp(b, SPLIT_MAX, W::F64Ge).i(W::I32Or).nan_if();
     x.split(a, c, ah, al).split(b, c, bh, bl).product_error(p, ah, al, bh, bl, e);
+    x.round_directed(fl, p, e, rc);
     x.flags_from_error(fl, e, p);
     x.g(p);
     x.finish()
@@ -842,8 +888,8 @@ fn h_mul() -> Function {
 
 /// (a, b, block) -> a / b, or NaN.
 fn h_div() -> Function {
-    let (a, b, fl, q, c, qh, ql, bh, bl, p, e, r) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
-    let mut x = B::new(vec![(9, ValType::F64)]);
+    let (a, b, fl, q, c, qh, ql, bh, bl, p, e, r, rc) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    let mut x = B::new(vec![(9, ValType::F64), (1, ValType::I32)]);
     x.g(b).k(0.0).i(W::F64Eq).nan_if(); // zero divide, 0/0
     x.g(a).g(b).i(W::F64Div).s(q);
     x.g(q).g(q).i(W::F64Ne).nan_if(); // inf/inf
@@ -859,8 +905,10 @@ fn h_div() -> Function {
     x.g(q).g(b).i(W::F64Mul).s(p);
     x.split(q, c, qh, ql).split(b, c, bh, bl).product_error(p, qh, ql, bh, bl, e);
     x.g(a).g(p).i(W::F64Sub).g(e).i(W::F64Sub).s(r);
-    // |q| > |a/b| exactly when r and a differ in sign
-    x.flags_from_error(fl, r, a);
+    // a/b - q = r/b: e takes its sign
+    x.g(r).i(W::F64Neg).g(r).g(b).k(0.0).i(W::F64Lt).i(W::Select).s(e);
+    x.round_directed(fl, q, e, rc);
+    x.flags_from_error(fl, e, q);
     x.g(q);
     x.finish()
 }

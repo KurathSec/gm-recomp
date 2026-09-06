@@ -66,9 +66,10 @@ pub struct Engine {
     pub recent: VecDeque<[u32; 4]>,
     pub recent_cap: usize,
     pub dispatches: u64,
-    /// x87/MMX instructions run through `rt.fpu`, by mnemonic when `fpu_profile` is on.
+    /// x87/MMX instructions run through `rt.fpu`, by instruction form and address when
+    /// `fpu_profile` is on.
     pub fpu_ops: u64,
-    pub fpu_profile: Option<HashMap<iced_x86::Mnemonic, u64>>,
+    pub fpu_profile: Option<HashMap<(iced_x86::Code, u32), u64>>,
     /// Declare guest memory shared in generated modules (browser threads).
     pub shared_memory: bool,
     /// Addresses reported when translated code calls them indirectly (debugging).
@@ -494,7 +495,8 @@ pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
 /// `rt.fpu`: one x87/MMX instruction. A pending unmasked exception becomes a fault
 /// (#MF) raised once the translated code has stored its registers.
 pub fn rt_fpu<M: Machine>(m: &mut M, code: i32, a: u32, b: u32, ip: u32, fop: u32) -> i32 {
-    let mn = iced_x86::Code::try_from(code as usize).map(|c| c.mnemonic()).unwrap_or(iced_x86::Mnemonic::INVALID);
+    let form = iced_x86::Code::try_from(code as usize).unwrap_or(iced_x86::Code::INVALID);
+    let mn = form.mnemonic();
     let mut f = fpu_load(m);
     if f.fault_pending(mn) {
         let (sw, cw) = (f.status_word(), f.control_word());
@@ -522,7 +524,7 @@ pub fn rt_fpu<M: Machine>(m: &mut M, code: i32, a: u32, b: u32, ip: u32, fop: u3
     let e = m.engine();
     e.fpu_ops += 1;
     if let Some(h) = e.fpu_profile.as_mut() {
-        *h.entry(mn).or_default() += 1;
+        *h.entry((form, ip)).or_default() += 1;
     }
     let r = f.exec(mn, a, b, ip, fop as u16, &mut FpuMem(m));
     fpu_store(m, &f);

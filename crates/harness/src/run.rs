@@ -365,10 +365,18 @@ pub fn run(opts: RunOpts) -> Result<()> {
         );
         eprintln!("x87 instructions via rt.fpu: {}", e.fpu_ops);
         if let Some(h) = &e.fpu_profile {
-            let mut v: Vec<_> = h.iter().collect();
-            v.sort_by(|a, b| b.1.cmp(a.1));
+            let mut forms: std::collections::HashMap<iced_x86::Code, u64> = Default::default();
+            for (&(form, _), &n) in h {
+                *forms.entry(form).or_default() += n;
+            }
+            let mut v: Vec<_> = forms.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
             let top: Vec<String> = v.iter().take(30).map(|(k, n)| format!("{k:?} {n}")).collect();
             eprintln!("  {}", top.join(", "));
+            let mut sites: Vec<_> = h.iter().collect();
+            sites.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = sites.iter().take(20).map(|((form, ip), n)| format!("{ip:08x} {form:?} {n}")).collect();
+            eprintln!("  hottest: {}", top.join(", "));
         }
         if !e.recent.is_empty() {
             eprintln!("---- last {} dispatches (eip esp eax ebx) ----", e.recent.len());

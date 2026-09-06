@@ -34,19 +34,17 @@ pub const EXT_IMAGE: u8 = 2;
 
 /// No unmasked exception is pending.
 pub const FAST_MOVE: u32 = 1;
-/// … and precision exceptions are masked (inexact results allowed: fist, frndint).
+/// … and precision exceptions are masked (inexact results allowed: fist, frndint,
+/// fst m32; any rounding mode).
 pub const FAST_INEXACT: u32 = 2;
-/// … and rounding is to nearest (fst m32).
-pub const FAST_NEAREST: u32 = 4;
-/// … and precision control is 53 bits (add, sub, mul, div in f64).
-pub const FAST_ARITH: u32 = 8;
+/// … and precision control is 53 bits (add, sub, mul, div in f64; any rounding mode).
+pub const FAST_ARITH: u32 = 4;
 
 /// `FAST` for a control word with no exception pending.
 pub fn fast_bits(cw: u16) -> u32 {
     let pm = (cw >> 5) & 1 != 0;
-    let nearest = (cw >> 10) & 3 == 0;
     let pc53 = (cw >> 8) & 3 == 2;
-    FAST_MOVE | if pm { FAST_INEXACT } else { 0 } | if pm && nearest { FAST_NEAREST } else { 0 } | if pm && nearest && pc53 { FAST_ARITH } else { 0 }
+    FAST_MOVE | if pm { FAST_INEXACT } else { 0 } | if pm && pc53 { FAST_ARITH } else { 0 }
 }
 
 /// The f64 equal to an 80-bit image, when that is a zero, an infinity or a normal double.

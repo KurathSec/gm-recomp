@@ -36,21 +36,25 @@ div in all operand forms, fnstsw/fnstcw/fldcw, ffree/fincstp/fdecstp, wait. A he
 returns -1 (and has changed nothing) whenever the result might differ from the 80-bit
 unit's, and translated code then calls `rt.fpu`:
 
-- arithmetic needs precision control 53 bits, round-to-nearest and PM masked; with
-  operands that are doubles, an f64 operation then rounds exactly like the x87 does,
-  except where its narrower exponent range shows. Results that are infinite from finite
+- arithmetic needs precision control 53 bits and PM masked; with operands that are
+  doubles, an f64 operation then rounds exactly like the x87 does in round-to-nearest,
+  except where its narrower exponent range shows. In the directed modes (chop, up,
+  down) the nearest result is moved one step toward the exact value when the sign of
+  the exact error says it lies on the wrong side; fst m32 does the same with the
+  demoted value. (D3DX9 runs whole pixel-conversion loops in chop mode.) Results that are infinite from finite
   operands, NaN, or at/below 2^-1022 are rejected, as are operands near the limits where
   the error terms would overflow or underflow.
 - PE and C1 ("rounded up in magnitude") come from the exact rounding error: TwoSum for
-  add/sub, Dekker's product for mul, the exact remainder a - q*b for div.
+  add/sub, Dekker's product for mul, the exact remainder a - q*b for div. A zero sum
+  in round-down mode (where its sign changes) falls back.
 - memory operands that are NaNs or denormals, empty source registers, full destination
   registers and pending unmasked exceptions all fall back.
 - fild m64 of integers wider than 53 bits keeps the exact 80-bit image, and fistp m64
   stores such an image directly (Delphi copies Int64 values this way).
 
 `cpu-diff --mode x87fast` tests these paths: doubles in registers and memory, 53-bit
-precision, RC mostly nearest, GameMaker's unmasked IE/ZE/OE in 30 % of cases, values
-near every limit the helpers check. `GMR_X87_SLOW=1` turns the fast paths off (harness
+precision, RC nearest in 70 % of cases and random otherwise, GameMaker's unmasked
+IE/ZE/OE in 30 % of cases, values near every limit the helpers check. `GMR_X87_SLOW=1` turns the fast paths off (harness
 runs and tests); Needle's 300-frame state hash is the same either way, and the fast
 paths take its x87 work through `rt.fpu` from 488 M to 1.3 M instructions (300 frames:
 40 s -> 9.5 s in the harness, 44 s -> 13 s in Chrome).
@@ -93,8 +97,9 @@ Results at commit time (5000 cases per run, two seeds each): integer `mixed`, `f
 - SSE: `min/max` return the source on NaN or equal zeros; conversions give 0x80000000 for
   NaN/out-of-range; packed shifts saturate on counts ≥ lane width.
 
-x87fast (5000 cases, seeds 1-7): 0-1 failures per run, all in the soft model's handling
-of extended denormals reached through misaligned random `fld m80` reads (see below).
+x87fast (5000 cases, seeds 1-20, with the directed-rounding paths): 0-2 failures per
+seed, identical with `GMR_X87_SLOW=1`, so all in the soft model: extended denormals and
+unnormals reached through misaligned random `fld m80` reads (see below).
 
 ## Known deviations
 
