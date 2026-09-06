@@ -8,7 +8,7 @@ use super::com::{self, Interface, Method, okn, out, out_zero, ret, S_OK};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{Handle, SoundBuffer};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 pub const DSERR_INVALIDPARAM: u32 = 0x8007_0057;
 pub const DSERR_INVALIDCALL: u32 = 0x8878_0032;
@@ -128,7 +128,7 @@ fn ds_create_buffer(c: &mut Ctx) -> ApiResult {
     let heap = c.p.process_heap;
     let g: &mut dyn Guest = &mut *c.host;
     let data = c.p.heap_alloc(g, heap, bytes, true);
-    let obj = com::create(c, "DirectSoundBuffer", &BUFFER_CLASS, HashMap::new());
+    let obj = com::create(c, "DirectSoundBuffer", &BUFFER_CLASS, HashMap::default());
     c.p.sound_buffers.insert(
         obj,
         SoundBuffer {
@@ -178,7 +178,7 @@ fn ds_duplicate(c: &mut Ctx) -> ApiResult {
     b.play = 0;
     b.cursor = 0.0;
     b.notify.clear();
-    let obj = com::create(c, "DirectSoundBuffer", &BUFFER_CLASS, HashMap::new());
+    let obj = com::create(c, "DirectSoundBuffer", &BUFFER_CLASS, HashMap::default());
     c.p.sound_buffers.insert(obj, b);
     out(c, pp, obj);
     ret(c, S_OK)
@@ -458,7 +458,7 @@ static BUFFER_CLASS: [&Interface; 3] = [&SOUND_BUFFER8, &SOUND_NOTIFY, &SOUND_3D
 
 fn create_device(c: &mut Ctx, nargs: u32) -> ApiResult {
     let pp = c.arg(1);
-    let obj = com::create(c, "DirectSound", &DEVICE_CLASS, HashMap::new());
+    let obj = com::create(c, "DirectSound", &DEVICE_CLASS, HashMap::default());
     c.trace(format!(" = {obj:#x}"));
     out(c, pp, obj);
     Ok(Ret::stdcall(nargs, S_OK))

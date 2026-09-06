@@ -8,7 +8,7 @@ use super::gpu::{self, DeviceState};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{D3dObject, Process};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 pub const D3D_OK: u32 = 0;
 pub const D3DERR_INVALIDCALL: u32 = 0x8876_086C;
@@ -296,7 +296,7 @@ fn d3d_create_device(c: &mut Ctx) -> ApiResult {
     if let Some(o) = c.p.d3d_objects.get_mut(&d3d) {
         o.refcount += 1;
     }
-    let data = HashMap::from([("w", w), ("h", h), ("fmt", fmt), ("hwnd", hwnd), ("flags", flags), ("d3d", d3d)]);
+    let data = HashMap::from_iter([("w", w), ("h", h), ("fmt", fmt), ("hwnd", hwnd), ("flags", flags), ("d3d", d3d)]);
     let dev = new_object(c, "IDirect3DDevice8", IDIRECT3DDEVICE8, data);
     let auto_depth = c.host.read_u32(pp + 32).unwrap_or(0);
     reset_state(c, w, h, auto_depth != 0);
@@ -434,7 +434,7 @@ pub(crate) fn present_frame(c: &mut Ctx, src_rect: [i32; 4], dst_w: u32, dst_h: 
 }
 
 fn new_surface(c: &mut Ctx, w: u32, h: u32, fmt: u32, usage: u32, pool: u32) -> u32 {
-    let data = HashMap::from([("w", w), ("h", h), ("fmt", fmt), ("usage", usage), ("pool", pool), ("type", 1)]);
+    let data = HashMap::from_iter([("w", w), ("h", h), ("fmt", fmt), ("usage", usage), ("pool", pool), ("type", 1)]);
     new_object(c, "IDirect3DSurface8", IDIRECT3DSURFACE8, data)
 }
 
@@ -519,7 +519,7 @@ fn dev_create_texture(c: &mut Ctx) -> ApiResult {
     if levels == 0 {
         levels = 32 - w.max(h).leading_zeros();
     }
-    let data = HashMap::from([("w", w), ("h", h), ("levels", levels), ("usage", usage), ("fmt", fmt), ("pool", pool), ("type", 3)]);
+    let data = HashMap::from_iter([("w", w), ("h", h), ("levels", levels), ("usage", usage), ("fmt", fmt), ("pool", pool), ("type", 3)]);
     let tex = new_object(c, "IDirect3DTexture8", IDIRECT3DTEXTURE8, data);
     c.p.textures_created += 1;
     c.p.gpu.texture_create(tex, w, h, levels, fmt, usage & 1 != 0);
@@ -536,7 +536,7 @@ fn dev_create_buffer(c: &mut Ctx, index: bool) -> ApiResult {
     let pool = c.arg(4);
     let pp = c.arg(5);
     let bits = alloc_storage(c, len.max(4));
-    let data = HashMap::from([("len", len), ("usage", usage), ("fvf", fvf_or_fmt), ("pool", pool), ("bits", bits), ("owned_bits", 1)]);
+    let data = HashMap::from_iter([("len", len), ("usage", usage), ("fvf", fvf_or_fmt), ("pool", pool), ("bits", bits), ("owned_bits", 1)]);
     let obj = if index {
         new_object(c, "IDirect3DIndexBuffer8", IDIRECT3DINDEXBUFFER8, data)
     } else {
@@ -1240,7 +1240,7 @@ fn register_iface(r: &mut Registry, iface: &str, methods: &[Method]) {
 pub fn register(r: &mut Registry) {
     r.add(DLL, "Direct3DCreate8", |c| {
         let sdk = c.arg(0);
-        let obj = new_object(c, "IDirect3D8", IDIRECT3D8, HashMap::new());
+        let obj = new_object(c, "IDirect3D8", IDIRECT3D8, HashMap::default());
         c.trace(format!("(sdk {sdk}) = {obj:#x}"));
         Ok(Ret::stdcall(1, obj))
     });

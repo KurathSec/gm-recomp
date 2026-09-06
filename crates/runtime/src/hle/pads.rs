@@ -3,7 +3,6 @@
 //! Gamepad API in its standard layout, which matches an Xbox controller).
 
 use super::{ApiResult, Ctx, Registry, Ret};
-use crate::mem::Guest;
 
 const ERROR_DEVICE_NOT_CONNECTED: u32 = 1167;
 const JOYERR_PARMS: u32 = 165;

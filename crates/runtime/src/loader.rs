@@ -3,7 +3,7 @@
 
 use crate::mem::{Guest, PAGE_EXECUTE_READWRITE, Vm};
 use pe::{ImportName, Pe};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
@@ -88,7 +88,7 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
             imports.push((dll_name.clone(), fname, slot));
         }
     }
-    let mut exports = HashMap::new();
+    let mut exports = HashMap::default();
     for e in pe.exports().map_err(|e| e.to_string())? {
         if e.forwarder.is_some() {
             continue;

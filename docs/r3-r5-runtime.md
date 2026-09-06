@@ -14,13 +14,15 @@ code anywhere.
 | I wanna run the Marathon | GMS 1.4 VM | title screen; title music from the GMS audio thread (correlation 0.999 with mus_Title.ogg) |
 | Crimson Needle 3 | GMS 1.4 VM | title screen |
 | indigo needle | GMS 1.4 VM | title screen; GMFile.dll runs on Wine's msvcp100 |
-| untitled needle game | GMS 1.4 YYC | title screen, file select and "new game" by keyboard; its shaders compile |
+| untitled needle game | GMS 1.4 YYC | intro cutscene, tutorial: runs, jumps, falls into and climbs out of a pit; its shaders compile |
 | RNG Dungeon | GMS 1.4 YYC | title screen; all 22 shaders translate and compile as GLSL in Chrome |
 
 - All seven run 200 frames in the harness; the held-out games (Vandal, Bread) have not
   been run (that is R6).
 - Harness, Node, Chrome and Firefox end the same run in the same state hash, threads
-  included.
+  and scripted input included. Every map in the runtime uses a fixed hasher, so
+  iteration order (timers, windows) is the same in native and wasm builds. Parallel
+  harness runs of one game need their own `--write-dir`.
 - No shaded draw has been seen yet in the frames tested (the games draw their title
   screens fixed-function); the translator is checked by compiling every shader.
 
@@ -136,20 +138,42 @@ Measured on the development machine (timings vary with its other load):
 
 | Run | Before | After |
 |---|---|---|
-| Needle, 300 frames, harness | 40 s | 9.5 s |
+| Needle, 300 frames, harness | 40 s | 8.5 s |
 | Needle, 300 frames, Chrome (`nopace`) | 44 s | 13 s |
 | RNG Dungeon, Chrome | 34 s | 11.6 s |
 | RNG Dungeon, harness | 138 s | 12 s |
+| untitled needle game tutorial room, per frame, harness | 15.3 ms | 7.9 ms |
 
-- x87 fast paths moved out of each translated function into one shared `x87` module
+Frame cost in that tutorial room (YYC, the heaviest scene measured), guest time per
+frame over the second half of a 1120-frame run:
+
+| Host | median | p95 | p99 |
+|---|---|---|---|
+| Chrome | 9.5 ms | 14.0 ms | 16.8 ms |
+| Firefox | 10.1 ms | 12.6 ms | 14.3 ms |
+
+The budget at 50 fps is 20 ms. Room changes still take one long frame (~170 ms:
+the new room's code is translated then).
+
+- Calls between translated functions: almost every function is its own module
+  (translated on first call), so a call is an indirect call through `rt.resolve`.
+  Translated code first probes a direct-mapped cache in reserved guest memory
+  (`abi::RESOLVE_CACHE`, 64 K entries of [address, table index]) and calls the
+  runtime only on a miss; the runtime fills it with translated functions, never API
+  stubs. In the tutorial room this took `rt.resolve` from 347 000 calls per frame to
+  almost none. The state hash leaves the cache out.
+- x87 fast paths cover every rounding mode (D3DX9 converts pixels in chop mode; the
+  soft model had been running ~6 000 instructions per frame of it).
+- x87 fast paths live in one shared `x87` module, not in each translated function
   (Cranelift compile times had exploded with them inline); the state hash is the same
   with them on or off (`GMR_X87_SLOW=1`).
 - The guest heap is best-fit with coalescing; first-fit was O(n) per allocation and
   dominated GMS loading.
 - The process state is boxed (it was copied, 4.4 KB, on every API call); the
   function map uses an address hasher; API names in logs are built only when logged.
-- GMS frames cost about 17 ms at p95 in Chrome (20 ms budget at 50 fps); the page
-  prints median/p95/p99 frame cost at the end of `frames=` runs.
+- `GMR_FPU_PROFILE=1` lists the x87 instructions that still reach `rt.fpu`, by form
+  and by address; `node --cpu-prof web/tools/run-node.mjs ...` profiles the browser
+  build by translated function (`f_<address>`).
 
 ## Known gaps
 

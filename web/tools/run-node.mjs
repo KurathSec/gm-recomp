@@ -1,5 +1,6 @@
 // Runs an imported game with the browser runtime under Node:
 //   node web/tools/run-node.mjs web/public/games/<slug> [--frames N] [--trace] [--epoch S]
+//        [--key frame:vk:down ...] (as the harness: vk in hex, down 1/0, after that frame)
 import { readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { runGame } from '../src/host.mjs';
@@ -30,7 +31,12 @@ const runtimeBytes = await readFile(new URL('../../target/wasm/wasm32-unknown-un
 const t = performance.now();
 const dumpMem = opt('--dump-mem', null);
 let guest;
-const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onExit: (s) => (guest = s.guestMemory) });
+const keys = args.flatMap((a, i) => (a === '--key' ? [args[i + 1].split(':')] : [])).map(([f, vk, d]) => [Number(f), parseInt(vk, 16), d === '1']);
+let input;
+const onFrame = (frame) => {
+  for (const [f, vk, down] of keys) if (f === frame) input.key(vk, 0, down);
+};
+const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory) });
 if (dumpMem) await writeFile(dumpMem, new Uint8Array(guest.buffer));
 console.log(`status ${status}, ${((performance.now() - t) / 1000).toFixed(1)}s total`);
 process.exit(status);

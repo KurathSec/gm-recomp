@@ -137,6 +137,15 @@ impl runtime::hle::gpu::Gpu for WebGpu {
     }
 }
 
+/// Without rendering (Node), the host still hears of each Present, for scripted input.
+struct FrameGpu;
+
+impl runtime::hle::gpu::Gpu for FrameGpu {
+    fn present(&mut self, clock_us: u64, src: [i32; 4], dst_w: u32, dst_h: u32) {
+        unsafe { gpu_present(clock_us as f64 / 1000.0, src[0], src[1], src[2], src[3], dst_w, dst_h) }
+    }
+}
+
 /// Guest address space limit (the stub and marker pages sit just below 2 GiB).
 const GUEST_MAX_PAGES: u64 = 32768;
 
@@ -504,6 +513,8 @@ pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace
         p.gpu = Box::new(WebGpu);
         p.audio = Box::new(WebAudio);
         p.saves = Box::new(WebSaves);
+    } else {
+        p.gpu = Box::new(FrameGpu);
     }
     let mut e = Engine::new(p);
     e.trace = trace != 0;
@@ -545,10 +556,11 @@ pub extern "C" fn run() -> i32 {
         },
         format!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)"),
         format!(
-            "frames presented: {}  api calls: {}  dispatches: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
+            e.resolves,
             e.translated,
             e.translate_us as f64 / 1e6,
             p.now_ms()

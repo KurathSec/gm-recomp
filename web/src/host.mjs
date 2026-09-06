@@ -19,7 +19,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(state: {guestMemory: WebAssembly.Memory}) => void} [o.onExit]  inspection after the run
  * @param {OffscreenCanvas} [o.canvas]  render target; without it nothing is drawn
  * @param {boolean} [o.pace]  hold frames to the game's own timing (needs JSPI)
- * @param {(frame: number, gpu: D3DGL) => void|Promise<void>} [o.onFrame]  after each Present
+ * @param {(frame: number, gpu: D3DGL|null) => void|Promise<void>} [o.onFrame]  after each Present
  * @param {(input: {key: Function, mouse: Function, pad: Function}) => void} [o.onReady]  input entry points,
  *   usable while the guest is suspended in Present
  * @param {(w: number, h: number) => void} [o.onResize]  the shown frame changed size
@@ -42,12 +42,16 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   let gpu = null;
   let glue;
   let startReal;
-  // Wall-clock cost of each frame (Present to Present), for the summary.
+  // Wall-clock cost of each frame: from the guest resuming after one Present to the
+  // next (the wait for the frame's time, and the event loop, are not counted).
   const frameMs = [];
   let lastPresent = 0;
+  let resumed = 0;
+  let headlessFrames = 0;
   const present = (clockMs, x, y, w, h, dw, dh) => {
     const t = performance.now();
-    if (lastPresent) frameMs.push(t - lastPresent);
+    if (resumed) frameMs.push(t - resumed);
+    else if (lastPresent) frameMs.push(t - lastPresent);
     const resized = canvas.width !== dw || canvas.height !== dh;
     gpu.present(x, y, w, h, dw, dh);
     if (resized && onResize) onResize(dw, dh);
@@ -73,7 +77,12 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
     gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst, pitch),
     gpu_present: (clockMs, x, y, w, h, dw, dh) => {
-      if (!gpu) return;
+      if (!gpu) {
+        // Headless (Node): frames are only counted.
+        headlessFrames++;
+        if (onFrame) onFrame(headlessFrames, null);
+        return;
+      }
       const { frame } = present(clockMs, x, y, w, h, dw, dh);
       if (onFrame) onFrame(frame, gpu);
     },
@@ -85,6 +94,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       const { frame, wait } = present(clockMs, x, y, w, h, dw, dh);
       if (onFrame) await onFrame(frame, gpu);
       await new Promise((r) => setTimeout(r, pace ? Math.max(0, wait) : 0));
+      resumed = performance.now();
     });
   }
 

@@ -34,6 +34,7 @@ pub struct RunOpts {
     pub dump: Vec<(u32, u32)>,
     /// Keep files written by earlier runs (saves) instead of starting clean.
     pub keep_writes: bool,
+    pub write_dir: Option<PathBuf>,
     /// Write the whole guest memory to this file when the run stops.
     pub dump_mem: Option<PathBuf>,
     /// Scripted key events: (after frame, virtual-key code, pressed).
@@ -223,7 +224,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
 
     // Files the game writes go to a scratch layer, never into the imported game files.
     let slug = opts.game_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let write_root = PathBuf::from("target/gamedata").join(&slug);
+    let write_root = opts.write_dir.clone().unwrap_or_else(|| PathBuf::from("target/gamedata").join(&slug));
     if !opts.keep_writes {
         let _ = std::fs::remove_dir_all(&write_root);
     }
@@ -355,10 +356,11 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eprintln!("fpu: cw={:#06x} sw={:#06x} tw={:#06x}", final_fpu.control_word(), final_fpu.status_word(), final_fpu.tag_word());
     if let Some(p) = p {
         eprintln!(
-            "frames presented: {}  api calls: {}  dispatches: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
+            e.resolves,
             e.translated,
             e.translate_us as f64 / 1e6,
             p.now_ms()

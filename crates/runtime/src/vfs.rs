@@ -3,7 +3,8 @@
 //! Windows. `DirFs` serves a host directory with a copy-on-write layer (the harness);
 //! `MemFs` keeps everything in memory (the browser, which persists it itself).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::fasthash::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,7 +126,7 @@ pub struct DirFs {
 
 impl DirFs {
     pub fn new(root: PathBuf, overlay: Option<PathBuf>) -> Self {
-        DirFs { root, overlay, deleted: HashSet::new() }
+        DirFs { root, overlay, deleted: HashSet::default() }
     }
 
     /// Finds `path` under `base`, matching each component case-insensitively.

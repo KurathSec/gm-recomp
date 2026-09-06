@@ -37,6 +37,8 @@ harness run <game dir> [--frames N] [--trace] [--aot] [--seconds S] [--recent K]
   returns; callers check it and return further when it differs (non-local control
   flow such as Delphi's `push addr; ret` finally blocks, SEH continuation, longjmp).
   The dispatcher then resumes at `eip`, translating the target as a new function.
+- Calls to code outside the current module go through `rt.resolve` (guest address ->
+  function table index), behind an inline cache in guest memory (`abi::RESOLVE_CACHE`).
 - HLE stubs live at `0x7F000000 + id*16`; `resolve` on a stub runs the API and returns
   a no-op function. Callbacks into the guest (`call_guest`) push a per-depth marker
   return address in the `0x7FFF0000` page and run a nested dispatcher.

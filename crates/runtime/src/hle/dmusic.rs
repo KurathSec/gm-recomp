@@ -7,7 +7,7 @@
 use super::audio::{self, Pcm, Source};
 use super::com::{self, E_FAIL, Interface, S_FALSE, S_OK, create, field, okn, out, out_zero, ret, set_field};
 use super::{ApiResult, Ctx, Registry};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// A loaded sound (wave data, or a MIDI file's length).
 pub struct DmSound {
@@ -172,7 +172,7 @@ fn load_segment(c: &mut Ctx, name: String, bytes: Vec<u8>) -> Result<u32, u32> {
     let midi = midi_us.and_then(|_| super::midi::parse(&bytes));
     c.p.dm_sounds.push(DmSound { name, pcm, midi_us, midi });
     let sound = c.p.dm_sounds.len() as u32; // 1-based in the object's fields
-    Ok(create(c, "DirectMusicSegment", &SEGMENT_CLASS, HashMap::from([("sound", sound), ("repeats", 0), ("length", music_time(us))])))
+    Ok(create(c, "DirectMusicSegment", &SEGMENT_CLASS, HashMap::from_iter([("sound", sound), ("repeats", 0), ("length", music_time(us))])))
 }
 
 /// Hands out `obj` through `ppv` as the interface `iid` asks for.
@@ -313,7 +313,7 @@ fn seg_set_length(c: &mut Ctx) -> ApiResult {
 fn seg_clone(c: &mut Ctx) -> ApiResult {
     let (this, pp) = (c.arg(0), c.arg(3));
     let (sound, repeats, length) = (field(c, this, "sound"), field(c, this, "repeats"), field(c, this, "length"));
-    let seg = create(c, "DirectMusicSegment", &SEGMENT_CLASS, HashMap::from([("sound", sound), ("repeats", repeats), ("length", length)]));
+    let seg = create(c, "DirectMusicSegment", &SEGMENT_CLASS, HashMap::from_iter([("sound", sound), ("repeats", repeats), ("length", length)]));
     out(c, pp, seg);
     ret(c, S_OK)
 }
@@ -398,7 +398,7 @@ fn path_get_object(c: &mut Ctx) -> ApiResult {
     if stage == DMUS_PATH_BUFFER && (want.eq_ignore_ascii_case(IID_SOUND_BUFFER8) || want.eq_ignore_ascii_case(IID_SOUND_BUFFER)) {
         let mut buf = field(c, this, "buffer");
         if buf == 0 {
-            buf = create(c, "DirectMusicPathBuffer", &PATH_BUFFER_CLASS, HashMap::from([("path", this)]));
+            buf = create(c, "DirectMusicPathBuffer", &PATH_BUFFER_CLASS, HashMap::from_iter([("path", this)]));
             set_field(c, this, "buffer", buf);
         } else if let Some(o) = c.p.d3d_objects.get_mut(&buf) {
             o.refcount += 1;
@@ -510,14 +510,14 @@ fn perf_get_time(c: &mut Ctx) -> ApiResult {
 
 fn perf_create_standard_audio_path(c: &mut Ctx) -> ApiResult {
     let (kind, pchannels, activate, pp) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4));
-    let path = create(c, "DirectMusicAudioPath", &AUDIOPATH_CLASS, HashMap::from([("kind", kind), ("pchannels", pchannels), ("inactive", (activate == 0) as u32)]));
+    let path = create(c, "DirectMusicAudioPath", &AUDIOPATH_CLASS, HashMap::from_iter([("kind", kind), ("pchannels", pchannels), ("inactive", (activate == 0) as u32)]));
     out(c, pp, path);
     ret(c, S_OK)
 }
 
 fn default_path(c: &mut Ctx) -> u32 {
     if c.p.dm_default_path == 0 {
-        c.p.dm_default_path = create(c, "DirectMusicAudioPath", &AUDIOPATH_CLASS, HashMap::from([("kind", 8)]));
+        c.p.dm_default_path = create(c, "DirectMusicAudioPath", &AUDIOPATH_CLASS, HashMap::from_iter([("kind", 8)]));
     }
     c.p.dm_default_path
 }
@@ -544,7 +544,7 @@ fn perf_play_segment_ex(c: &mut Ctx) -> ApiResult {
     }
     let now = c.p.clock_us;
     let repeats = field(c, seg, "repeats");
-    let state = create(c, "DirectMusicSegmentState", &SEGMENT_STATE_CLASS, HashMap::from([("segment", seg), ("repeats", repeats), ("start", music_time(now))]));
+    let state = create(c, "DirectMusicSegmentState", &SEGMENT_STATE_CLASS, HashMap::from_iter([("segment", seg), ("repeats", repeats), ("start", music_time(now))]));
     c.trace(format!("({}, flags {flags:#x}, repeats {repeats}, path {path:#x}) = state {state:#x}", c.p.dm_sounds[sound - 1].name));
     c.p.dm_voices.push(DmVoice { segment: seg, state, path, sound: sound - 1, primary, cursor: 0.0, last_us: now, started_us: now, repeats_left: repeats, midi: None });
     if pp_state != 0 {
@@ -570,7 +570,7 @@ fn perf_play_segment(c: &mut Ctx) -> ApiResult {
     }
     let now = c.p.clock_us;
     let repeats = field(c, seg, "repeats");
-    let state = create(c, "DirectMusicSegmentState", &SEGMENT_STATE_CLASS, HashMap::from([("segment", seg), ("repeats", repeats), ("start", music_time(now))]));
+    let state = create(c, "DirectMusicSegmentState", &SEGMENT_STATE_CLASS, HashMap::from_iter([("segment", seg), ("repeats", repeats), ("start", music_time(now))]));
     c.p.dm_voices.push(DmVoice { segment: seg, state, path, sound: sound - 1, primary, cursor: 0.0, last_us: now, started_us: now, repeats_left: repeats, midi: None });
     out(c, pp_state, state);
     ret(c, S_OK)

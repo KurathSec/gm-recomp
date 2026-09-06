@@ -108,6 +108,10 @@ enum Cmd {
         /// Keep files the game wrote in earlier runs.
         #[arg(long)]
         keep_writes: bool,
+        /// Where files the game writes go (default target/gamedata/<slug>); runs of
+        /// the same game in parallel need their own.
+        #[arg(long)]
+        write_dir: Option<PathBuf>,
         /// Write the guest memory image to this file at the end.
         #[arg(long)]
         dump_mem: Option<PathBuf>,
@@ -164,7 +168,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, key, mouse, audio_out } => {
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, key, mouse, audio_out } => {
             let mouse = mouse
                 .iter()
                 .map(|k| {
@@ -188,7 +192,7 @@ fn main() -> Result<()> {
                     Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, dump_mem, keys, mouse, audio_out })
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, keys, mouse, audio_out })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

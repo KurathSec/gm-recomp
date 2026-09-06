@@ -26,12 +26,14 @@ pub(crate) const L_T0: u32 = 19;
 pub(crate) const L_T1: u32 = 20;
 pub(crate) const L_T2: u32 = 21;
 pub(crate) const L_T3: u32 = 22;
-pub(crate) const L_Q0: u32 = 23;
-pub(crate) const L_Q1: u32 = 24;
-pub(crate) const L_D0: u32 = 25;
-pub(crate) const L_V0: u32 = 26;
-pub(crate) const L_V1: u32 = 27;
-pub const LOCALS: [(u32, ValType); 4] = [(23, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128)];
+pub(crate) const L_R0: u32 = 23; // scratch of the resolve-cache probe
+pub(crate) const L_R1: u32 = 24;
+pub(crate) const L_Q0: u32 = 25;
+pub(crate) const L_Q1: u32 = 26;
+pub(crate) const L_D0: u32 = 27;
+pub(crate) const L_V0: u32 = 28;
+pub(crate) const L_V1: u32 = 29;
+pub const LOCALS: [(u32, ValType); 4] = [(25, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128)];
 
 pub(crate) fn mem0() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
@@ -64,6 +66,7 @@ pub struct FuncEmit<'a> {
     pub probe: bool,
     /// Call the `x87` module's fast paths before `rt.fpu`.
     pub x87_inline: bool,
+    pub resolve_cache: bool,
     /// Flags some later instruction (or a successor) will read after the current one.
     needed: u8,
     ip: u32,
@@ -93,6 +96,7 @@ impl<'a> FuncEmit<'a> {
             pending: None,
             probe: false,
             x87_inline: true,
+            resolve_cache: false,
             needed: 0,
             ip: 0,
             next_ip: 0,
@@ -173,6 +177,15 @@ impl<'a> FuncEmit<'a> {
     pub(crate) fn reload_all(&mut self) {
         self.reload_regs();
         self.reload_flags();
+    }
+
+    /// [guest address] -> [table index]
+    fn resolve(&mut self) {
+        if self.resolve_cache {
+            crate::abi::emit_resolve(&mut self.f, L_R0, L_R1);
+        } else {
+            self.call_rt(RtFunc::Resolve);
+        }
     }
 
     fn call_rt(&mut self, f: RtFunc) {
@@ -755,7 +768,7 @@ impl<'a> FuncEmit<'a> {
             self.i(W::Call(idx));
         } else {
             self.c(target);
-            self.call_rt(RtFunc::Resolve);
+            self.resolve();
             self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
         }
         self.after_call();
@@ -766,7 +779,7 @@ impl<'a> FuncEmit<'a> {
         self.push32_const(self.next_ip);
         self.spill_all();
         self.get(L_T1);
-        self.call_rt(RtFunc::Resolve);
+        self.resolve();
         self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
         self.after_call();
     }
@@ -803,7 +816,7 @@ impl<'a> FuncEmit<'a> {
     fn tail_dynamic(&mut self) {
         self.spill_all();
         self.get(L_T1);
-        self.call_rt(RtFunc::Resolve);
+        self.resolve();
         self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
     }
 
@@ -813,7 +826,7 @@ impl<'a> FuncEmit<'a> {
             self.i(W::ReturnCall(idx));
         } else {
             self.c(target);
-            self.call_rt(RtFunc::Resolve);
+            self.resolve();
             self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
         }
     }

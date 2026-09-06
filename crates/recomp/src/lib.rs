@@ -25,6 +25,9 @@ pub struct Options {
     pub probes: Vec<u32>,
     /// Send every x87 instruction through `rt.fpu` (to check the inline paths).
     pub no_x87_inline: bool,
+    /// Probe `abi::RESOLVE_CACHE` before calling `rt.resolve` (needs the cache's
+    /// memory; the CPU tests run without it).
+    pub resolve_cache: bool,
 }
 
 pub struct Translator<'m> {
@@ -111,6 +114,7 @@ impl<'m> Translator<'m> {
             let mut fe = lift::FuncEmit::new(cfg, &func_index);
             fe.probe = self.opts.probes.contains(&entry);
             fe.x87_inline = !self.opts.no_x87_inline;
+            fe.resolve_cache = self.opts.resolve_cache;
             fe.emit();
             self.unimplemented.extend(fe.unimplemented.drain(..));
             functions.function(types::FUNC);

@@ -8,7 +8,7 @@ use super::gpu::{self, DrawCall9};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{D3dObject, Process};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 pub const D3D_OK: u32 = 0;
 pub const D3DERR_INVALIDCALL: u32 = 0x8876_086C;
@@ -452,7 +452,7 @@ fn d3d_create_device(c: &mut Ctx) -> ApiResult {
     }
     c.trace(format!("({w}x{h} fmt {fmt} windowed {windowed} flags {flags:#x} hwnd {target_win:#x} depth {auto_depth}/{depth_fmt})"));
     add_ref_obj(c, this(c));
-    let data = HashMap::from([("w", w), ("h", h), ("fmt", fmt), ("hwnd", target_win), ("flags", flags), ("d3d", this(c)), ("depth_fmt", depth_fmt)]);
+    let data = HashMap::from_iter([("w", w), ("h", h), ("fmt", fmt), ("hwnd", target_win), ("flags", flags), ("d3d", this(c)), ("depth_fmt", depth_fmt)]);
     let dev = new_object(c, "IDirect3DDevice9Ex", IDIRECT3DDEVICE9, data);
     reset_state(c, dev, w, h, auto_depth != 0);
     c.p.d3d.window = target_win;
@@ -579,7 +579,7 @@ fn dev_reset(c: &mut Ctx) -> ApiResult {
 }
 
 fn new_surface(c: &mut Ctx, w: u32, h: u32, fmt: u32, usage: u32, pool: u32) -> u32 {
-    let data = HashMap::from([("w", w), ("h", h), ("fmt", fmt), ("usage", usage), ("pool", pool), ("type", 1)]);
+    let data = HashMap::from_iter([("w", w), ("h", h), ("fmt", fmt), ("usage", usage), ("pool", pool), ("type", 1)]);
     new_object(c, "IDirect3DSurface9", IDIRECT3DSURFACE9, data)
 }
 
@@ -666,7 +666,7 @@ fn dev_create_texture(c: &mut Ctx) -> ApiResult {
     if levels == 0 {
         levels = if usage & 0x400 != 0 { 1 } else { 32 - w.max(h).leading_zeros() }; // AUTOGENMIPMAP: one level
     }
-    let data = HashMap::from([("w", w), ("h", h), ("levels", levels), ("usage", usage), ("fmt", fmt), ("pool", pool), ("type", 3)]);
+    let data = HashMap::from_iter([("w", w), ("h", h), ("levels", levels), ("usage", usage), ("fmt", fmt), ("pool", pool), ("type", 3)]);
     let tex = new_object(c, "IDirect3DTexture9", IDIRECT3DTEXTURE9, data);
     c.p.textures_created += 1;
     c.p.gpu.texture_create(tex, w, h, levels, fmt, usage & D3DUSAGE_RENDERTARGET != 0);
@@ -679,7 +679,7 @@ fn dev_create_texture(c: &mut Ctx) -> ApiResult {
 fn dev_create_buffer(c: &mut Ctx, index: bool) -> ApiResult {
     let (len, usage, fvf_or_fmt, pool, pp) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5));
     let bits = alloc_storage(c, len.max(4));
-    let data = HashMap::from([("len", len), ("usage", usage), ("fvf", fvf_or_fmt), ("pool", pool), ("bits", bits), ("owned_bits", 1)]);
+    let data = HashMap::from_iter([("len", len), ("usage", usage), ("fvf", fvf_or_fmt), ("pool", pool), ("bits", bits), ("owned_bits", 1)]);
     let obj = if index {
         new_object(c, "IDirect3DIndexBuffer9", IDIRECT3DINDEXBUFFER9, data)
     } else {
@@ -880,7 +880,7 @@ fn dev_create_shader(c: &mut Ctx, vertex: bool) -> ApiResult {
     for (i, t) in tokens.iter().enumerate() {
         let _ = c.host.write_u32(copy + 4 * i as u32, *t);
     }
-    let obj = new_object(c, iface, methods, HashMap::from([("heap_bits", copy), ("tokens", tokens.len() as u32)]));
+    let obj = new_object(c, iface, methods, HashMap::from_iter([("heap_bits", copy), ("tokens", tokens.len() as u32)]));
     match super::d3d9_shader::translate(&tokens) {
         Ok(glsl) => {
             c.p.gpu.shader_create(obj, vertex, &glsl);
@@ -935,7 +935,7 @@ fn new_declaration(c: &mut Ctx, elements: &[[u32; 4]]) -> u32 {
             let _ = c.host.write_u32(copy + 16 * i as u32 + 4 * k, e[k as usize]);
         }
     }
-    new_object(c, "IDirect3DVertexDeclaration9", IDIRECT3DVERTEXDECLARATION9, HashMap::from([("heap_bits", copy), ("count", elements.len() as u32)]))
+    new_object(c, "IDirect3DVertexDeclaration9", IDIRECT3DVERTEXDECLARATION9, HashMap::from_iter([("heap_bits", copy), ("count", elements.len() as u32)]))
 }
 
 fn declaration(c: &Ctx, decl: u32) -> Vec<[u32; 4]> {
@@ -1360,7 +1360,7 @@ fn dev_update_texture(c: &mut Ctx) -> ApiResult {
 
 fn dev_create_state_block(c: &mut Ctx) -> ApiResult {
     let pp = c.arg(2);
-    let sb = new_object(c, "IDirect3DStateBlock9", IDIRECT3DSTATEBLOCK9, HashMap::new());
+    let sb = new_object(c, "IDirect3DStateBlock9", IDIRECT3DSTATEBLOCK9, HashMap::default());
     let snap = (*c.p.d3d9).clone();
     c.p.d3d9_blocks.insert(sb, Box::new(snap));
     out(c, pp, sb);
@@ -1369,7 +1369,7 @@ fn dev_create_state_block(c: &mut Ctx) -> ApiResult {
 
 fn dev_end_state_block(c: &mut Ctx) -> ApiResult {
     let pp = c.arg(1);
-    let sb = new_object(c, "IDirect3DStateBlock9", IDIRECT3DSTATEBLOCK9, HashMap::new());
+    let sb = new_object(c, "IDirect3DStateBlock9", IDIRECT3DSTATEBLOCK9, HashMap::default());
     let snap = (*c.p.d3d9).clone();
     c.p.d3d9_blocks.insert(sb, Box::new(snap));
     out(c, pp, sb);
@@ -1382,7 +1382,7 @@ fn dev_create_query(c: &mut Ctx) -> ApiResult {
         // a NULL pointer asks whether the type is supported
         return ret(c, if matches!(ty, 8 | 9) { D3D_OK } else { D3DERR_NOTAVAILABLE });
     }
-    let q = new_object(c, "IDirect3DQuery9", IDIRECT3DQUERY9, HashMap::from([("qtype", ty)]));
+    let q = new_object(c, "IDirect3DQuery9", IDIRECT3DQUERY9, HashMap::from_iter([("qtype", ty)]));
     out(c, pp, q);
     ret(c, D3D_OK)
 }
@@ -1392,7 +1392,7 @@ fn dev_get_swap_chain(c: &mut Ctx) -> ApiResult {
     let dev = this(c);
     let mut sc = field(c, dev, "swapchain");
     if sc == 0 || !c.p.d3d_objects.contains_key(&sc) {
-        sc = new_object(c, "IDirect3DSwapChain9", IDIRECT3DSWAPCHAIN9, HashMap::from([("device", dev)]));
+        sc = new_object(c, "IDirect3DSwapChain9", IDIRECT3DSWAPCHAIN9, HashMap::from_iter([("device", dev)]));
         set_field(c, dev, "swapchain", sc);
     } else {
         add_ref_obj(c, sc);
@@ -2049,7 +2049,7 @@ fn register_iface(r: &mut Registry, iface: &str, methods: &[Method]) {
 
 fn create(c: &mut Ctx) -> ApiResult {
     let ex = c.name().ends_with("Ex");
-    let obj = new_object(c, "IDirect3D9Ex", IDIRECT3D9, HashMap::new());
+    let obj = new_object(c, "IDirect3D9Ex", IDIRECT3D9, HashMap::default());
     c.trace(format!("(sdk {}) = {obj:#x}", c.arg(0)));
     if ex {
         // Direct3DCreate9Ex(sdk, &d3d) -> HRESULT

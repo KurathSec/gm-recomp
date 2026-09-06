@@ -4,7 +4,8 @@
 use crate::hle::{ApiId, Registry};
 use crate::loader::LoadedModule;
 use crate::mem::{Guest, PAGE_READWRITE, Vm};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+use crate::fasthash::HashMap;
 
 pub const STUB_BASE: u32 = 0x7F00_0000;
 pub const STUB_STRIDE: u32 = 16;
@@ -403,6 +404,7 @@ impl Process {
         vm.alloc(STUB_BASE, 0x0010_0000, true, PAGE_READWRITE, false, "hle stubs");
         vm.alloc(crate::hle::DATA_EXPORTS, crate::hle::DATA_EXPORTS_SIZE, true, PAGE_READWRITE, false, "exported variables");
         vm.alloc(RET_TO_HOST, 0x1000, true, PAGE_READWRITE, false, "host return");
+        vm.alloc(recomp::abi::RESOLVE_CACHE, recomp::abi::RESOLVE_CACHE_SIZE, true, PAGE_READWRITE, false, "resolve cache");
         // The page below each TEB holds the thread's x87 state (fpu::block).
         vm.alloc(TEB_BASE - 0x1000, 0x1000, true, PAGE_READWRITE, false, "thread state");
         vm.alloc(TEB_BASE, 0x1000, true, PAGE_READWRITE, false, "teb");
@@ -413,10 +415,10 @@ impl Process {
             vm,
             registry,
             modules: Vec::new(),
-            fake_modules: HashMap::new(),
-            handles: HashMap::new(),
+            fake_modules: HashMap::default(),
+            handles: HashMap::default(),
             next_handle: 0x100,
-            heaps: HashMap::new(),
+            heaps: HashMap::default(),
             process_heap: 0,
             threads: Vec::new(),
             main_thread: 0,
@@ -424,7 +426,7 @@ impl Process {
             nest: 0,
             slice_nest: None,
             in_scheduler: false,
-            cs_owners: HashMap::new(),
+            cs_owners: HashMap::default(),
             cs_pending: Vec::new(),
             cmdline: cmdline.to_string(),
             exe_path: exe_path.to_string(),
@@ -447,24 +449,24 @@ impl Process {
             idle_streak: 0,
             exit_code: None,
             tls_used: vec![false; 1088],
-            atoms: HashMap::new(),
+            atoms: HashMap::default(),
             next_atom: 0xC000,
-            classes: HashMap::new(),
-            windows: HashMap::new(),
+            classes: HashMap::default(),
+            windows: HashMap::default(),
             next_hwnd: 0x0001_0010,
             messages: VecDeque::new(),
             focus: 0,
             active: 0,
             capture: 0,
             next_gdi: 0x0100_0000,
-            stock_objects: HashMap::new(),
-            registry_values: HashMap::new(),
+            stock_objects: HashMap::default(),
+            registry_values: HashMap::default(),
             frames_presented: 0,
             frame_limit: u64::MAX,
-            d3d_objects: HashMap::new(),
+            d3d_objects: HashMap::default(),
             d3d: Default::default(),
             d3d9: Default::default(),
-            d3d9_blocks: HashMap::new(),
+            d3d9_blocks: HashMap::default(),
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
             mixer: Default::default(),
@@ -472,17 +474,17 @@ impl Process {
             dm_voices: Vec::new(),
             dm_master_volume: 0,
             dm_default_path: 0,
-            dm_search_dirs: HashMap::new(),
+            dm_search_dirs: HashMap::default(),
             audio: Box::new(crate::hle::audio::NullSink),
             mci: BTreeMap::new(),
-            mci_media: HashMap::new(),
+            mci_media: HashMap::default(),
             next_mci: 0,
-            com_vtables: HashMap::new(),
-            com_ifaces: HashMap::new(),
-            com_classes: HashMap::new(),
+            com_vtables: HashMap::default(),
+            com_ifaces: HashMap::default(),
+            com_classes: HashMap::default(),
             draw_calls: 0,
             crt_errno: 0,
-            crt_files: HashMap::new(),
+            crt_files: HashMap::default(),
             crt_rand: 1,
             crt_locale: 0,
             timers_due: Vec::new(),

@@ -19,3 +19,12 @@ impl std::hash::Hasher for AddrHasher {
 }
 
 pub type AddrHash = std::hash::BuildHasherDefault<AddrHasher>;
+
+/// Maps and sets with a fixed hasher, used throughout the runtime: their iteration
+/// order then depends only on what was inserted, so HLE code that iterates them
+/// (timers, windows, objects) behaves the same in every host. std's default hasher
+/// is seeded randomly on native targets but not on wasm32-unknown-unknown, which made
+/// harness runs differ from browser runs and from each other.
+pub type FixedHash = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+pub type HashMap<K, V, S = FixedHash> = std::collections::HashMap<K, V, S>;
+pub type HashSet<K, S = FixedHash> = std::collections::HashSet<K, S>;

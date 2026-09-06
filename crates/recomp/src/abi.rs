@@ -7,6 +7,45 @@
 
 use wasm_encoder::ValType;
 
+/// Direct-mapped cache of `rt.resolve` results in guest memory (reserved by the
+/// runtime): entry k is [guest address, table index] at `RESOLVE_CACHE + 8 * k`.
+/// Translated code probes it before calling `rt.resolve`; the runtime fills it with
+/// translated functions only (never API stubs, which must reach the runtime).
+pub const RESOLVE_CACHE: u32 = 0x7F20_0000;
+pub const RESOLVE_CACHE_BITS: u32 = 16;
+pub const RESOLVE_CACHE_SIZE: u32 = 8 << RESOLVE_CACHE_BITS;
+const RESOLVE_HASH: u32 = 0x9E37_79B1;
+
+/// Byte offset of the cache entry for `addr` (what translated code computes).
+pub fn resolve_slot(addr: u32) -> u32 {
+    (addr.wrapping_mul(RESOLVE_HASH) >> (32 - RESOLVE_CACHE_BITS)) << 3
+}
+
+/// The probe: [addr] -> [table index], calling `rt.resolve` (import 0) on a miss.
+/// `a` and `o` are scratch i32 locals.
+pub fn emit_resolve(f: &mut wasm_encoder::Function, a: u32, o: u32) {
+    use wasm_encoder::{BlockType, Instruction as W, MemArg};
+    let at = |off: u32| MemArg { offset: off as u64, align: 2, memory_index: 0 };
+    f.instruction(&W::LocalTee(a));
+    f.instruction(&W::I32Const(RESOLVE_HASH as i32));
+    f.instruction(&W::I32Mul);
+    f.instruction(&W::I32Const((32 - RESOLVE_CACHE_BITS) as i32));
+    f.instruction(&W::I32ShrU);
+    f.instruction(&W::I32Const(3));
+    f.instruction(&W::I32Shl);
+    f.instruction(&W::LocalTee(o));
+    f.instruction(&W::I32Load(at(RESOLVE_CACHE)));
+    f.instruction(&W::LocalGet(a));
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+    f.instruction(&W::LocalGet(o));
+    f.instruction(&W::I32Load(at(RESOLVE_CACHE + 4)));
+    f.instruction(&W::Else);
+    f.instruction(&W::LocalGet(a));
+    f.instruction(&W::Call(RtFunc::Resolve as u32));
+    f.instruction(&W::End);
+}
+
 pub const CPU_MODULE: &str = "cpu";
 pub const RT_MODULE: &str = "rt";
 pub const MEMORY_NAME: &str = "mem";

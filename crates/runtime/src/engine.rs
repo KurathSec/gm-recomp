@@ -12,9 +12,10 @@
 use crate::hle::{ApiError, ApiId, Ctx, Host, Regs};
 use crate::mem::Guest;
 use crate::process::{ThreadCtx, Process, RET_TO_HOST};
-use recomp::abi::{trap, Global};
+use recomp::abi::{self, trap, Global};
 use recomp::cfg::FuncInfo;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use crate::fasthash::{HashMap, HashSet};
 
 /// Error text that makes nested host frames unwind to the guest context a handler chose.
 pub const UNWIND: &str = "unwind through host frame";
@@ -39,7 +40,8 @@ pub struct ModInfo {
     pub base: u32,
     pub size: u32,
     pub functions: HashSet<u32>,
-    pub jump_tables: HashMap<u32, Vec<u32>>,
+    /// As discovery returns them (only looked up).
+    pub jump_tables: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 pub use crate::fasthash::AddrHash;
@@ -66,6 +68,9 @@ pub struct Engine {
     pub recent: VecDeque<[u32; 4]>,
     pub recent_cap: usize,
     pub dispatches: u64,
+    /// `rt.resolve` calls that found a translated function (indirect and cross-module
+    /// calls).
+    pub resolves: u64,
     /// x87/MMX instructions run through `rt.fpu`, by instruction form and address when
     /// `fpu_profile` is on.
     pub fpu_ops: u64,
@@ -95,10 +100,11 @@ impl Engine {
             trace: false,
             max_api_calls: u64::MAX,
             tsc: 0,
-            bad_functions: HashSet::new(),
+            bad_functions: HashSet::default(),
             recent: VecDeque::new(),
             recent_cap: 0,
             dispatches: 0,
+            resolves: 0,
             fpu_ops: 0,
             fpu_profile: None,
             shared_memory: false,
@@ -578,8 +584,8 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
     };
     for (name, base, size, file) in new {
         let t = m.now_us();
-        let mut functions = HashSet::new();
-        let mut jump_tables = HashMap::new();
+        let mut functions = HashSet::default();
+        let mut jump_tables = HashMap::default();
         match pe::Pe::parse(&file) {
             Ok(pe) => {
                 let d = x86::discover(&pe);
@@ -614,10 +620,10 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
         let mem = CodeMem(&*m);
         let probes = m.engine_ref().probes.clone();
         let no_x87_inline = m.engine_ref().no_x87_inline;
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline });
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true });
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
-            let empty_jt = HashMap::new();
+            let empty_jt = std::collections::HashMap::new();
             let jt = md.map(|md| &md.jump_tables).unwrap_or(&empty_jt);
             let is_fn = |a: u32| funcs.contains_key(&a) || md.map(|md| md.functions.contains(&a)).unwrap_or(false);
             let info = FuncInfo { jump_tables: jt, is_function: &is_fn };
@@ -680,6 +686,8 @@ pub fn translate_all<M: Machine>(m: &mut M, chunk: usize) -> Result<usize, Strin
 
 pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
     if let Some(&i) = m.engine_ref().funcs.get(&addr) {
+        m.engine().resolves += 1;
+        cache_resolved(m, addr, i);
         return Ok(i);
     }
     if let Some(id) = Process::stub_id(addr) {
@@ -698,7 +706,21 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
         m.engine().bad_functions.insert(addr);
         return Err(format!("cannot translate function at {addr:#x}"));
     }
-    m.engine_ref().funcs.get(&addr).copied().ok_or_else(|| format!("translation of {addr:#x} produced no function"))
+    let i = m.engine_ref().funcs.get(&addr).copied().ok_or_else(|| format!("translation of {addr:#x} produced no function"))?;
+    cache_resolved(m, addr, i);
+    Ok(i)
+}
+
+/// Enters a translated function in the resolve cache that translated code probes
+/// (`abi::RESOLVE_CACHE`). Watched addresses stay out, so every call reports.
+fn cache_resolved<M: Machine>(m: &mut M, addr: u32, idx: u32) {
+    if m.engine_ref().watch.contains(&addr) {
+        return;
+    }
+    let mut entry = [0u8; 8];
+    entry[..4].copy_from_slice(&addr.to_le_bytes());
+    entry[4..].copy_from_slice(&idx.to_le_bytes());
+    let _ = m.write(abi::RESOLVE_CACHE + abi::resolve_slot(addr), &entry);
 }
 
 // ---- dispatcher ---------------------------------------------------------------------------------
@@ -900,7 +922,7 @@ pub struct Started {
 /// process's VFS (game directory).
 pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let mut order = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     // Imported DLLs come from the game directory, else the system directory.
     let read = |m: &M, name: &str| {
         let fs = &m.engine_ref().process().fs;
@@ -948,6 +970,7 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let r = p.setup_main_thread(m, image_base).and_then(|r| p.setup_static_tls(m).map(|_| r));
     m.engine().p = Some(p);
     let (teb, stack_top) = r?;
+    m.ensure_mapped(abi::RESOLVE_CACHE, abi::RESOLVE_CACHE_SIZE).map_err(|_| "cannot map the resolve cache".to_string())?;
     m.set_global(Global::FsBase, teb);
     m.set_global(Global::Mxcsr, 0x1F80);
     let regs = Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: stack_top - 0x100, ebp: 0, esi: 0, edi: 0, eip: entry, fs_base: teb };
@@ -1035,7 +1058,9 @@ pub fn state_hash<M: Machine>(m: &mut M, limit: u32) -> (u64, u32) {
             let off = off as usize;
             buf[off..(off + fpu::block::SIZE).min(65536)].fill(0);
         }
-        if buf.iter().any(|&b| b != 0) {
+        // The resolve cache depends on how code was translated (batches, order).
+        let cache = abi::RESOLVE_CACHE as u64..abi::RESOLVE_CACHE as u64 + abi::RESOLVE_CACHE_SIZE as u64;
+        if !cache.contains(&addr) && buf.iter().any(|&b| b != 0) {
             mix(&mut h, &((addr / 65536) as u32).to_le_bytes());
             mix(&mut h, &buf);
             chunks += 1;

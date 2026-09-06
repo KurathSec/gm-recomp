@@ -72,7 +72,7 @@ and the same input gives the same state hash in the harness, Node, Chrome and Fi
 | I wanna run the Marathon | GMS 1.4 VM | title screen; title music from the GMS audio thread |
 | Crimson Needle 3 | GMS 1.4 VM | title screen |
 | indigo needle | GMS 1.4 VM + GMFile.dll | title screen (extension runs on Wine's msvcp100) |
-| untitled needle game | GMS 1.4 YYC | title screen; keyboard; shaders compiled by Wine's d3dcompiler |
+| untitled needle game | GMS 1.4 YYC | intro and tutorial played by script (run, jump); shaders compiled by Wine's d3dcompiler |
 | RNG Dungeon | GMS 1.4 YYC | title screen; all 22 shaders translate to GLSL |
 
 See `docs/` for each milestone's notes (`r1-cpu.md` CPU and tests, `r2-harness.md`

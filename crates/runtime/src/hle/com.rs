@@ -6,7 +6,7 @@
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{D3dObject, Process};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 pub const S_OK: u32 = 0;
 pub const S_FALSE: u32 = 1;
@@ -521,7 +521,7 @@ static CLASSES: [(&str, &str, &[&Interface]); 3] = [
 /// CoCreateInstance for the classes implemented here; None if the CLSID is unknown.
 pub fn create_instance(c: &mut Ctx, clsid: &str, iid_p: u32, ppv: u32) -> Option<u32> {
     let &(_, kind, ifaces) = CLASSES.iter().find(|(id, _, _)| id.eq_ignore_ascii_case(clsid))?;
-    let obj = create(c, kind, ifaces, HashMap::new());
+    let obj = create(c, kind, ifaces, HashMap::default());
     let mut g = [0u8; 16];
     let _ = c.host.read(iid_p, &mut g);
     let want = format_iid(&g);

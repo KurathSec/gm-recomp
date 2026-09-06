@@ -23,7 +23,7 @@ pub mod user32;
 
 use crate::mem::Guest;
 use crate::process::Process;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ApiId(pub u32);
