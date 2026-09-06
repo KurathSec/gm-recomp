@@ -24,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Generate random instruction sequences, run them natively (Wine) and in wasm, compare.
+    /// Generate random instruction sequences, run them natively and in wasm, compare.
     CpuDiff {
         #[arg(long, default_value_t = 2000)]
         count: usize,

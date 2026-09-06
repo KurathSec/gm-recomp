@@ -2,8 +2,7 @@
 //! standard audio path per sound, segments loaded from the sound's temp file through
 //! the loader, PlaySegmentEx / StopEx / IsPlaying, path volume and the path's buffer
 //! for pan. Wave segments play through the mixer on the virtual clock, like
-//! DirectSound buffers; MIDI segments keep their duration but are silent until a
-//! synthesizer is connected.
+//! DirectSound buffers; MIDI segments go through the SoundFont synthesizer (`midi`).
 
 use super::audio::{self, Pcm, Source};
 use super::com::{self, E_FAIL, Interface, S_FALSE, S_OK, create, field, okn, out, out_zero, ret, set_field};

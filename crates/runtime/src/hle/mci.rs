@@ -1,7 +1,7 @@
 //! MCI (winmm) media playback: the command and string interfaces over one table of
 //! devices. Wave, MP3 (what GameMaker's "multimedia" sounds open through MPEGVideo)
 //! and MIDI elements play through the mixer on the virtual clock; positions, lengths
-//! and MM_MCINOTIFY follow that clock. MIDI is silent until a synthesizer exists.
+//! and MM_MCINOTIFY follow that clock. MIDI goes through the SoundFont synthesizer.
 
 use super::audio::{self, Pcm, Source};
 use super::{ApiResult, Ctx, Ret};
