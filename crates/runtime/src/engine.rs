@@ -133,6 +133,10 @@ pub trait Machine: Guest {
     fn take_input(&mut self, _frame: u64) -> Vec<crate::hle::InputEvent> {
         Vec::new()
     }
+    /// A General MIDI SoundFont, once available (the first call may start loading it).
+    fn soundfont(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -295,6 +299,10 @@ impl<M: Machine> Host for M {
 
     fn run_threads(&mut self, p: &mut Process) {
         run_threads(self, p);
+    }
+
+    fn soundfont(&mut self) -> Option<Vec<u8>> {
+        Machine::soundfont(self)
     }
 
     fn set_fpu_state(&mut self, f: &fpu::Fpu) {

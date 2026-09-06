@@ -51,6 +51,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// Changed files, serialized as by `WebSaves`.
     fn fs_persist(data: *const u8, len: usize);
+    /// Starts fetching the MIDI SoundFont; it arrives through `soundfont_add`.
+    fn soundfont_request();
 }
 
 /// Hands the game's file changes to the page (web/src/host.mjs `onSave`): per entry
@@ -163,9 +165,12 @@ struct State {
     fs: Option<MemFs>,
     started: Option<engine::Started>,
     guest_bytes: u64,
+    /// The MIDI SoundFont: asked for, and the bytes until the runtime takes them.
+    soundfont_requested: bool,
+    soundfont: Option<Vec<u8>>,
 }
 
-static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0 };
+static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -272,6 +277,14 @@ impl Machine for Web {
     }
     fn take_input(&mut self, _frame: u64) -> Vec<runtime::InputEvent> {
         Web::take_input()
+    }
+    fn soundfont(&mut self) -> Option<Vec<u8>> {
+        let st = state();
+        if !st.soundfont_requested {
+            st.soundfont_requested = true;
+            unsafe { soundfont_request() };
+        }
+        st.soundfont.take()
     }
 }
 
@@ -560,6 +573,13 @@ pub extern "C" fn input_key(vk: u32, scan: u32, down: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn input_mouse(x: i32, y: i32, buttons: u32) {
     state().input.push(runtime::InputEvent::Mouse { x, y, buttons });
+}
+
+/// The MIDI SoundFont the page fetched (bytes at `ptr`, from `alloc`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soundfont_add(ptr: *mut u8, len: usize) {
+    let bytes = unsafe { Vec::from_raw_parts(ptr, len, len) };
+    state().soundfont = Some(bytes);
 }
 
 /// A game controller's state in XInput terms (see `runtime::InputEvent::Pad`):

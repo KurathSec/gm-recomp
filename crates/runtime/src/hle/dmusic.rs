@@ -14,8 +14,9 @@ use std::collections::HashMap;
 pub struct DmSound {
     pub name: String,
     pub pcm: Pcm,
-    /// MIDI files: their length in µs (no audio yet).
+    /// MIDI files: their length in µs, and the file for the synthesizer.
     pub midi_us: Option<u64>,
+    pub midi: Option<std::sync::Arc<rustysynth::MidiFile>>,
 }
 
 /// A segment playing on the performance.
@@ -31,6 +32,8 @@ pub struct DmVoice {
     pub started_us: u64,
     /// Plays left after the current one (u32::MAX: forever).
     pub repeats_left: u32,
+    /// MIDI segments: the synthesizer playing them.
+    pub midi: Option<Box<super::midi::MidiPlayer>>,
 }
 
 const DMUS_OBJ_CLASS: u32 = 0x2;
@@ -161,14 +164,14 @@ fn load_segment(c: &mut Ctx, name: String, bytes: Vec<u8>) -> Result<u32, u32> {
             }
         }
     } else if let Some(us) = midi_length_us(&bytes) {
-        c.p.log(format!("DirectMusic: {name}: MIDI playback is silent (no synthesizer yet)"));
         (Pcm::default(), Some(us))
     } else {
         c.p.log(format!("DirectMusic: {name}: unsupported content"));
         return Err(DMUS_E_UNSUPPORTED_STREAM);
     };
     let us = midi_us.unwrap_or_else(|| if pcm.rate == 0 { 0 } else { pcm.frames() * 1_000_000 / pcm.rate as u64 });
-    c.p.dm_sounds.push(DmSound { name, pcm, midi_us });
+    let midi = midi_us.and_then(|_| super::midi::parse(&bytes));
+    c.p.dm_sounds.push(DmSound { name, pcm, midi_us, midi });
     let sound = c.p.dm_sounds.len() as u32; // 1-based in the object's fields
     Ok(create(c, "DirectMusicSegment", &SEGMENT_CLASS, HashMap::from([("sound", sound), ("repeats", 0), ("length", music_time(us))])))
 }
@@ -544,7 +547,7 @@ fn perf_play_segment_ex(c: &mut Ctx) -> ApiResult {
     let repeats = field(c, seg, "repeats");
     let state = create(c, "DirectMusicSegmentState", &SEGMENT_STATE_CLASS, HashMap::from([("segment", seg), ("repeats", repeats), ("start", music_time(now))]));
     c.trace(format!("({}, flags {flags:#x}, repeats {repeats}, path {path:#x}) = state {state:#x}", c.p.dm_sounds[sound - 1].name));
-    c.p.dm_voices.push(DmVoice { segment: seg, state, path, sound: sound - 1, primary, cursor: 0.0, last_us: now, started_us: now, repeats_left: repeats });
+    c.p.dm_voices.push(DmVoice { segment: seg, state, path, sound: sound - 1, primary, cursor: 0.0, last_us: now, started_us: now, repeats_left: repeats, midi: None });
     if pp_state != 0 {
         out(c, pp_state, state);
     } else if let Some(o) = c.p.d3d_objects.get_mut(&state) {
@@ -569,7 +572,7 @@ fn perf_play_segment(c: &mut Ctx) -> ApiResult {
     let now = c.p.clock_us;
     let repeats = field(c, seg, "repeats");
     let state = create(c, "DirectMusicSegmentState", &SEGMENT_STATE_CLASS, HashMap::from([("segment", seg), ("repeats", repeats), ("start", music_time(now))]));
-    c.p.dm_voices.push(DmVoice { segment: seg, state, path, sound: sound - 1, primary, cursor: 0.0, last_us: now, started_us: now, repeats_left: repeats });
+    c.p.dm_voices.push(DmVoice { segment: seg, state, path, sound: sound - 1, primary, cursor: 0.0, last_us: now, started_us: now, repeats_left: repeats, midi: None });
     out(c, pp_state, state);
     ret(c, S_OK)
 }
@@ -731,7 +734,20 @@ pub fn tick(c: &mut Ctx) {
         }
         let sound = &c.p.dm_sounds[v.sound];
         if let Some(len) = sound.midi_us {
-            // silent: just keep time
+            // the synthesizer plays it (once the SoundFont is there); the length rules
+            let file = sound.midi.clone();
+            if v.midi.is_none() {
+                if let (Some(file), Some(sf)) = (file, super::midi::soundfont(c)) {
+                    let rate = c.p.mixer.rate;
+                    v.midi = super::midi::player(&sf, &file, v.repeats_left != 0, rate).map(Box::new);
+                }
+            }
+            if let Some(player) = v.midi.as_mut() {
+                let volume = (field(c, v.path, "volume") as i32 + c.p.dm_master_volume).clamp(-10000, 0);
+                if field(c, v.path, "inactive") == 0 {
+                    super::midi::render(&mut c.p.mixer, player, t0, now, volume);
+                }
+            }
             let mut end = v.started_us + len;
             while now >= end && v.repeats_left > 0 && len > 0 {
                 if v.repeats_left != DMUS_SEG_REPEAT_INFINITE {

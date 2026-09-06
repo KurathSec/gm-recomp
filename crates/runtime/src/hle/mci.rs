@@ -65,12 +65,15 @@ pub struct McDevice {
     /// 0..=1000
     pub volume: u32,
     pub time_format: u32,
+    /// MIDI elements: the synthesizer playing them.
+    pub midi: Option<Box<super::midi::MidiPlayer>>,
 }
 
 /// Decoded media: a sound, or a MIDI file's length.
 pub struct Media {
     pub pcm: Pcm,
     pub midi_us: Option<u64>,
+    pub midi: Option<std::sync::Arc<rustysynth::MidiFile>>,
 }
 
 impl Media {
@@ -138,22 +141,21 @@ fn load_media(c: &mut Ctx, element: &str) -> Option<Rc<Media>> {
     let bytes = c.p.fs.read_all(&key)?;
     let media = if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
         match audio::parse_wav(&bytes) {
-            Ok(pcm) => Media { pcm, midi_us: None },
+            Ok(pcm) => Media { pcm, midi_us: None, midi: None },
             Err(e) => {
                 c.p.log(format!("MCI: {element}: {e}"));
-                Media { pcm: Pcm::default(), midi_us: Some(0) }
+                Media { pcm: Pcm::default(), midi_us: Some(0), midi: None }
             }
         }
     } else if bytes.starts_with(b"MThd") || bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"RMID") {
         let smf = if bytes.starts_with(b"RIFF") { bytes.get(20..).unwrap_or(&[]).to_vec() } else { bytes };
-        c.p.log(format!("MCI: {element}: MIDI playback is silent (no synthesizer yet)"));
-        Media { pcm: Pcm::default(), midi_us: Some(super::dmusic::midi_length_us(&smf).unwrap_or(0)) }
+        Media { pcm: Pcm::default(), midi_us: Some(super::dmusic::midi_length_us(&smf).unwrap_or(0)), midi: super::midi::parse(&smf) }
     } else {
         match decode_compressed(bytes) {
-            Ok(pcm) => Media { pcm, midi_us: None },
+            Ok(pcm) => Media { pcm, midi_us: None, midi: None },
             Err(e) => {
                 c.p.log(format!("MCI: {element}: cannot decode ({e})"));
-                Media { pcm: Pcm::default(), midi_us: Some(0) }
+                Media { pcm: Pcm::default(), midi_us: Some(0), midi: None }
             }
         }
     };
@@ -163,12 +165,12 @@ fn load_media(c: &mut Ctx, element: &str) -> Option<Rc<Media>> {
 }
 
 fn open(c: &mut Ctx, element: &str, alias: &str) -> Result<u32, u32> {
-    let media = if element.is_empty() { Rc::new(Media { pcm: Pcm::default(), midi_us: Some(0) }) } else { load_media(c, element).ok_or(MCIERR_FILE_NOT_FOUND)? };
+    let media = if element.is_empty() { Rc::new(Media { pcm: Pcm::default(), midi_us: Some(0), midi: None }) } else { load_media(c, element).ok_or(MCIERR_FILE_NOT_FOUND)? };
     c.p.next_mci += 1;
     let id = c.p.next_mci;
     let to = media.frames();
     let now = c.p.clock_us;
-    c.p.mci.insert(id, McDevice { element: element.to_string(), alias: alias.to_ascii_lowercase(), media, mode: MCI_MODE_STOP, pos: 0.0, last_us: now, to, repeat: false, notify: 0, volume: 1000, time_format: MCI_FORMAT_MILLISECONDS });
+    c.p.mci.insert(id, McDevice { element: element.to_string(), alias: alias.to_ascii_lowercase(), media, mode: MCI_MODE_STOP, pos: 0.0, last_us: now, to, repeat: false, notify: 0, volume: 1000, time_format: MCI_FORMAT_MILLISECONDS, midi: None });
     c.p.log(format!("MCI open {element:?} = device {id}"));
     Ok(id)
 }
@@ -200,6 +202,8 @@ fn play(c: &mut Ctx, id: u32, from_ms: Option<u32>, to_ms: Option<u32>, repeat: 
     }
     d.repeat = repeat;
     d.mode = MCI_MODE_PLAY;
+    // the synthesizer cannot seek: a MIDI play starts it over
+    d.midi = None;
     d.last_us = now;
     if let Some(h) = notify_hwnd {
         d.notify = h;
@@ -230,6 +234,9 @@ fn devices(c: &Ctx, id: u32) -> Vec<u32> {
 pub fn tick(c: &mut Ctx) {
     let now = c.p.clock_us;
     let mut ended = Vec::new();
+    // MIDI devices that play get a synthesizer once the SoundFont is there.
+    let need_synth = c.p.mci.values().any(|d| d.mode == MCI_MODE_PLAY && d.media.midi.is_some() && d.midi.is_none());
+    let sf = if need_synth { super::midi::soundfont(c) } else { None };
     let p = &mut *c.p;
     for (&id, d) in p.mci.iter_mut() {
         let t0 = d.last_us;
@@ -239,12 +246,16 @@ pub fn tick(c: &mut Ctx) {
         }
         let rate = d.media.rate();
         let total = d.media.frames();
+        let volume = if d.volume >= 1000 { 0 } else if d.volume == 0 { -10000 } else { (2000.0 * (d.volume as f64 / 1000.0).log10()) as i32 };
+        if let (Some(file), None, Some(sf)) = (&d.media.midi, &d.midi, &sf) {
+            d.midi = super::midi::player(sf, file, d.repeat, p.mixer.rate).map(Box::new);
+        }
+        if let Some(player) = d.midi.as_mut() {
+            super::midi::render(&mut p.mixer, player, t0, now, volume);
+        }
         if d.media.midi_us.is_none() && total > 0.0 {
             let pcm = &d.media.pcm;
             let read = |i: u64| pcm.frame(i);
-            // DirectShow volume is linear in 0..1000 as a fraction of full scale... in
-            // practice mapped to decibels; MCI reports the value back unchanged.
-            let volume = if d.volume >= 1000 { 0 } else if d.volume == 0 { -10000 } else { (2000.0 * (d.volume as f64 / 1000.0).log10()) as i32 };
             let src = Source { frame: &read, frames: d.to.ceil() as u64, freq: pcm.rate, looping: d.repeat, volume, pan: 0 };
             audio::mix_source(&mut p.mixer, &src, d.pos, t0, now);
         }

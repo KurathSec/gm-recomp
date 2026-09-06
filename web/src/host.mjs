@@ -26,8 +26,9 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {{sab: SharedArrayBuffer, frames: number}} [o.audioRing]  where the sound mix goes
  * @param {(changes: {path: string, data: Uint8Array|null, mtime: number}[]) => void} [o.onSave]
  *   files the game wrote or removed (its saves; not the temp directory)
+ * @param {string} [o.soundfontUrl]  a General MIDI SoundFont, fetched when a game first plays MIDI
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize, audioRing, onSave }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2' }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -93,6 +94,18 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
     now_us() {
       return performance.now() * 1000;
+    },
+    soundfont_request() {
+      fetch(soundfontUrl)
+        .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((buf) => {
+          const b = new Uint8Array(buf);
+          const p = rt.exports.alloc(b.length);
+          mem().set(b, p);
+          rt.exports.soundfont_add(p, b.length);
+          print(`MIDI SoundFont loaded (${(b.length / 1048576).toFixed(1)} MB)`);
+        })
+        .catch((e) => print(`no MIDI SoundFont (${e.message ?? e}): MIDI music stays silent`));
     },
     fs_persist(ptr, len) {
       if (!onSave) return;

@@ -368,6 +368,9 @@ pub struct Process {
     pub crt_rand: u32,
     /// setlocale's "C" string.
     pub crt_locale: u32,
+    /// The MIDI SoundFont, once the host supplied it (or failed to).
+    pub soundfont: Option<std::sync::Arc<rustysynth::SoundFont>>,
+    pub soundfont_failed: bool,
     /// Game controllers 0..3.
     pub pads: [crate::hle::PadState; 4],
     /// Waitable timers: (handle, virtual time they become signaled).
@@ -484,6 +487,8 @@ impl Process {
             crt_locale: 0,
             timers_due: Vec::new(),
             pads: Default::default(),
+            soundfont: None,
+            soundfont_failed: false,
             textures_created: 0,
             next_d3d_handle: 0x1000,
             trace: false,

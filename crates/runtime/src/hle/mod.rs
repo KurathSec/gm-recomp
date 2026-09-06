@@ -14,6 +14,7 @@ pub mod gdi32;
 pub mod kernel32;
 pub mod threads;
 pub mod mci;
+pub mod midi;
 pub mod misc;
 pub mod msvcrt;
 pub mod nls;
@@ -93,6 +94,10 @@ pub trait Host: Guest {
     fn yield_thread(&mut self);
     /// Lets the secondary threads that can run do so (the main thread is waiting).
     fn run_threads(&mut self, p: &mut Process);
+    /// A General MIDI SoundFont, once available (the first call may start loading it).
+    fn soundfont(&mut self) -> Option<Vec<u8>> {
+        None
+    }
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far.
     fn poll_input(&mut self, _frame: u64) -> Vec<InputEvent> {

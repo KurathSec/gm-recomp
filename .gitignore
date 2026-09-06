@@ -4,3 +4,4 @@
 # Imported game data is never committed.
 /web/public/games
 /out
+/web/soundfont.sf2

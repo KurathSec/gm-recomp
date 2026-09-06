@@ -59,6 +59,8 @@ struct Hd {
     /// Scripted input not delivered yet, by frame.
     keys: Vec<(u64, u8, bool)>,
     mouse: Vec<(u64, i32, i32, u32)>,
+    /// The MIDI SoundFont was handed over (or there is none).
+    soundfont_given: bool,
 }
 
 /// Store and Caller both give direct access to their data.
@@ -132,6 +134,17 @@ impl<C: Cx> Machine for Wt<'_, C> {
     }
     fn set_global(&mut self, g: G, v: u32) {
         let _ = self.cpu.globals[g as usize].set(&mut *self.cx, Val::I32(v as i32));
+    }
+    fn soundfont(&mut self) -> Option<Vec<u8>> {
+        // GMR_SOUNDFONT, else the system's General MIDI SoundFont; offered once
+        let mut cx = self.cx.as_context_mut();
+        let hd = cx.data_mut();
+        if hd.soundfont_given {
+            return None;
+        }
+        hd.soundfont_given = true;
+        let path = std::env::var("GMR_SOUNDFONT").unwrap_or_else(|_| "/usr/share/soundfonts/default.sf2".into());
+        std::fs::read(path).ok()
     }
     fn xmm(&mut self, i: u32) -> u128 {
         self.cpu.globals[G::Xmm0 as usize + i as usize].get(&mut *self.cx).v128().map(|v| v.as_u128()).unwrap_or(0)
@@ -243,7 +256,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone() });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), soundfont_given: false });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;
