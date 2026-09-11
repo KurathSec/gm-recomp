@@ -7,6 +7,7 @@ pub mod com;
 pub mod d3d8;
 pub mod d3d9;
 pub mod d3d9_shader;
+pub mod dinput;
 pub mod dmusic;
 pub mod dsound;
 pub mod gpu;
@@ -275,6 +276,7 @@ impl Registry {
         user32::register_extra(&mut r);
         threads::register(&mut r);
         pads::register(&mut r);
+        dinput::register(&mut r);
         r
     }
 

@@ -1759,9 +1759,6 @@ pub fn register(r: &mut Registry) {
         "DirectDrawEnumerateExA" => (3, 0),
         "DirectDrawEnumerateExW" => (3, 0),
     });
-    const_apis!(r, "dinput8.dll", {
-        "DirectInput8Create" => (5, E_NOINTERFACE),
-    });
     const_apis!(r, "dinput.dll", {
         "DirectInputCreateA" => (4, E_NOINTERFACE),
         "DirectInputCreateW" => (4, E_NOINTERFACE),

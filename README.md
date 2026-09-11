@@ -70,7 +70,7 @@ and the same input gives the same state hash in the harness, Node, Chrome and Fi
 | Not Another Needle Game | GM 8.1 | mouse menus; New Game starts the game; music (supersound.dll on DirectSound) |
 | i wanna uhuhu spike | GM 8.0 | the kid runs and jumps in the hub; first stage; MP3 music (MCI), sound effects (DirectMusic) |
 | I wanna run the Marathon | GMS 1.4 VM | file select, hub, the marathon starts; title music from the GMS audio thread |
-| Crimson Needle 3 | GMS 1.4 VM | title screen; it does not react to Shift/Enter/Z/Space/Esc or a click yet (open question) |
+| Crimson Needle 3 | GMS 1.4 VM | title, Shift to the save-file screen |
 | indigo needle | GMS 1.4 VM + GMFile.dll | title room, the player moves (extension runs on Wine's msvcp100) |
 | untitled needle game | GMS 1.4 YYC | intro and tutorial: run, jump; shaders compiled by Wine's d3dcompiler |
 | RNG Dungeon | GMS 1.4 YYC | intro, file select, a save chosen; all 22 shaders translate to GLSL |

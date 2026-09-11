@@ -384,6 +384,8 @@ pub struct Process {
     pub api_calls: u64,
     pub unimplemented: Vec<String>,
     pub key_state: [u8; 256],
+    /// DirectInput keyboard state, by DIK code (scan code, 0x80 for extended keys).
+    pub dik: [u8; 256],
     /// Last mouse position (client coordinates of the game window) and buttons.
     pub mouse: (i32, i32),
     pub mouse_buttons: u32,
@@ -500,6 +502,7 @@ impl Process {
             api_calls: 0,
             unimplemented: Vec::new(),
             key_state: [0; 256],
+            dik: [0; 256],
             mouse: (0, 0),
             mouse_buttons: 0,
             log: Vec::new(),

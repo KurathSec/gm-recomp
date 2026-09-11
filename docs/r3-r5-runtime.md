@@ -12,7 +12,7 @@ code anywhere.
 | Not Another Needle Game | GM 8.1 | mouse menus, New Game starts the game; music through the recompiled supersound.dll |
 | i wanna uhuhu spike | GM 8.0 | hub room: run, jump, double jump, warp to the first stage; MP3 music via MCI (correlation 0.9999 with ffmpeg's decode); DirectMusic sound effects |
 | I wanna run the Marathon | GMS 1.4 VM | file select, hub, warp, the marathon starts ("On your mark... Go!!"); title music from the GMS audio thread (correlation 0.999 with mus_Title.ogg) |
-| Crimson Needle 3 | GMS 1.4 VM | title screen; key messages reach its window procedure, but the title does not react to Shift, Enter, Z, Space, J, Esc or a click (open) |
+| Crimson Needle 3 | GMS 1.4 VM | title, Shift to the save-file screen (needed the D3D9 binding references below) |
 | indigo needle | GMS 1.4 VM | title room, the player walks and falls; GMFile.dll runs on Wine's msvcp100 |
 | untitled needle game | GMS 1.4 YYC | intro cutscene, tutorial: runs, jumps, falls into and climbs out of a pit; its shaders compile |
 | RNG Dungeon | GMS 1.4 YYC | intro, title, file select, a save chosen; all 22 shaders translate and compile as GLSL in Chrome |
@@ -102,6 +102,11 @@ code anywhere.
   fixed-function path (GMS draws that way with FVF vertices); with shaders they go to
   the host as `DrawCall9` records (vertex declaration, streams, constants, samplers,
   render state).
+- The device holds a reference to everything bound to it (render targets, depth
+  surface, textures, streams, index buffer, shaders, declaration; state-block Apply
+  moves them) and to its back buffer, as Direct3D does. Without that, Crimson Needle
+  3 released its last reference to the back buffer surface on a room change, the
+  heap reused the address, and the game drew off screen from then on.
 - Render targets are framebuffers; `StretchRect` is `blitFramebuffer`,
   `GetRenderTargetData` is `readPixels` into the guest's surface.
 - Shader bytecode (vs/ps 2.0, 2.x, 3.0) is translated to GLSL ES 3.00 when created.
@@ -126,11 +131,16 @@ code anywhere.
 - `LoadLibrary` searches the game directory, then system32, and loads a DLL's
   dependencies before running its entry point.
 
-## Game controllers (`hle/pads.rs`)
+## Game controllers and DirectInput (`hle/pads.rs`, `hle/dinput.rs`)
 
 - The page polls the Gamepad API (standard layout = Xbox controller) and sends
   changes to the worker. XInput (xinput1_1–1_4, 9_1_0) for GMS and the winmm
   joystick API for GameMaker 8 read those states.
+- DirectInput 8 (A and W): the system keyboard (by DIK scan code), the system mouse
+  (relative motion) and each connected controller as a joystick, as Windows lists an
+  Xbox controller (triggers on Z, D-pad as POV); standard data formats, axis ranges,
+  names, object enumeration. Buffered data is not kept. GMS 1.4 enumerates its
+  joysticks through it.
 
 ## Performance
 

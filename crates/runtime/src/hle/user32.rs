@@ -1279,6 +1279,10 @@ pub(crate) fn pump_input(c: &mut Ctx) {
     for ev in events {
         match ev {
             super::InputEvent::Key { vk, scan, down } => {
+                let dik = (scan & 0x7F) as usize | if scan & 0x100 != 0 { 0x80 } else { 0 };
+                if scan & 0xFF != 0 {
+                    c.p.dik[dik] = if down { 0x80 } else { 0 };
+                }
                 let k = &mut c.p.key_state[vk as usize];
                 let was_down = *k & 0x80 != 0;
                 if down {

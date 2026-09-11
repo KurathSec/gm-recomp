@@ -71,6 +71,9 @@ pub struct State9 {
     /// Render target 0 (surface or texture object, 0 = back buffer) and its size.
     pub target: (u32, u32, u32),
     pub depth: u32,
+    /// The surface bound as render target 0 (0 until the first SetRenderTarget: the
+    /// back buffer).
+    pub rt: u32,
     pub backbuffer: (u32, u32),
 }
 
@@ -161,6 +164,7 @@ impl Default for State9 {
             ps_b: [0; 16],
             target: (0, 0, 0),
             depth: 0,
+            rt: 0,
             backbuffer: (0, 0),
         }
     }
@@ -283,6 +287,24 @@ fn add_ref(c: &mut Ctx) -> ApiResult {
 
 fn release(c: &mut Ctx) -> ApiResult {
     let t = this(c);
+    let n = release_obj(c, t);
+    ret(c, n)
+}
+
+/// The device's reference moves from `old` to `new`: Direct3D holds a reference to
+/// every object bound to it (render targets, depth surface, textures, streams, index
+/// buffer, shaders, declaration), so an application may release its own.
+fn rebind(c: &mut Ctx, old: u32, new: u32) {
+    if new != 0 {
+        add_ref_obj(c, new);
+    }
+    if old != 0 {
+        release_obj(c, old);
+    }
+}
+
+/// Drops a reference, destroying the object at zero; returns the count left.
+fn release_obj(c: &mut Ctx, t: u32) -> u32 {
     let n = match c.p.d3d_objects.get_mut(&t) {
         Some(o) => {
             o.refcount = o.refcount.saturating_sub(1);
@@ -318,7 +340,7 @@ fn release(c: &mut Ctx) -> ApiResult {
             c.trace(format!(": freed {}", o.kind));
         }
     }
-    ret(c, n)
+    n
 }
 
 // ---- IDirect3D9(Ex) ------------------------------------------------------------------
@@ -587,12 +609,14 @@ fn new_surface(c: &mut Ctx, w: u32, h: u32, fmt: u32, usage: u32, pool: u32) -> 
 fn back_buffer(c: &mut Ctx) -> u32 {
     let dev = c.p.d3d9.device;
     let mut s = field(c, dev, "backbuffer");
-    if s == 0 || !c.p.d3d_objects.contains_key(&s) {
+    if s == 0 || !c.p.d3d_objects.contains_key(&s) || field(c, s, "backbuffer") == 0 {
         let (w, h) = c.p.d3d9.backbuffer;
         let fmt = field(c, dev, "fmt");
         s = new_surface(c, w, h, fmt, D3DUSAGE_RENDERTARGET, 0);
         set_field(c, s, "backbuffer", 1);
         set_field(c, dev, "backbuffer", s);
+        // the device's own reference: the swap chain owns its back buffer
+        add_ref_obj(c, s);
     } else {
         add_ref_obj(c, s);
     }
@@ -626,6 +650,9 @@ fn dev_set_render_target(c: &mut Ctx) -> ApiResult {
     }
     let (w, h) = (field(c, surf, "w"), field(c, surf, "h"));
     let id = target_id(c, surf);
+    let old = c.p.d3d9.rt;
+    rebind(c, old, surf);
+    c.p.d3d9.rt = surf;
     let st = &mut c.p.d3d9;
     st.target = (id, w, h);
     st.viewport = [0.0, 0.0, w as f32, h as f32, 0.0, 1.0];
@@ -643,7 +670,11 @@ fn dev_get_render_target(c: &mut Ctx) -> ApiResult {
         return ret(c, D3DERR_NOTFOUND);
     }
     let (target, tw, th) = c.p.d3d9.target;
-    let s = if target == 0 {
+    let rt = c.p.d3d9.rt;
+    let s = if rt != 0 && c.p.d3d_objects.contains_key(&rt) {
+        add_ref_obj(c, rt);
+        rt
+    } else if target == 0 {
         back_buffer(c)
     } else if kind(c, target) == "IDirect3DSurface9" {
         add_ref_obj(c, target);
@@ -788,6 +819,8 @@ fn dev_get_render_state(c: &mut Ctx) -> ApiResult {
 fn dev_set_texture(c: &mut Ctx) -> ApiResult {
     let (stage, tex) = (c.arg(1) as usize, c.arg(2));
     if stage < 16 {
+        let old = c.p.d3d9.textures[stage];
+        rebind(c, old, tex);
         c.p.d3d9.textures[stage] = tex;
     }
     ret(c, D3D_OK)
@@ -1504,7 +1537,9 @@ const IDIRECT3DDEVICE9: &[Method] = &[
     ("SetRenderTarget", 3, dev_set_render_target),
     ("GetRenderTarget", 3, dev_get_render_target),
     ("SetDepthStencilSurface", 2, |c| {
-        c.p.d3d9.depth = c.arg(1);
+        let (old, new) = (c.p.d3d9.depth, c.arg(1));
+        rebind(c, old, new);
+        c.p.d3d9.depth = new;
         ret(c, D3D_OK)
     }),
     ("GetDepthStencilSurface", 2, dev_get_depth_stencil),
@@ -1589,6 +1624,8 @@ const IDIRECT3DDEVICE9: &[Method] = &[
         ret(c, D3D_OK)
     }),
     ("SetVertexDeclaration", 2, |c| {
+        let old = c.p.d3d9.decl;
+        rebind(c, old, c.arg(1));
         c.p.d3d9.decl = c.arg(1);
         if c.arg(1) != 0 {
             c.p.d3d9.fvf = 0;
@@ -1603,6 +1640,8 @@ const IDIRECT3DDEVICE9: &[Method] = &[
     }),
     ("SetFVF", 2, |c| {
         c.p.d3d9.fvf = c.arg(1);
+        let old = c.p.d3d9.decl;
+        rebind(c, old, 0);
         c.p.d3d9.decl = 0;
         ret(c, D3D_OK)
     }),
@@ -1613,6 +1652,8 @@ const IDIRECT3DDEVICE9: &[Method] = &[
     }),
     ("CreateVertexShader", 3, |c| dev_create_shader(c, true)),
     ("SetVertexShader", 2, |c| {
+        let old = c.p.d3d9.vs;
+        rebind(c, old, c.arg(1));
         c.p.d3d9.vs = c.arg(1);
         ret(c, D3D_OK)
     }),
@@ -1631,6 +1672,8 @@ const IDIRECT3DDEVICE9: &[Method] = &[
     ("SetStreamSource", 5, |c| {
         let (i, vb, off, stride) = (c.arg(1) as usize, c.arg(2), c.arg(3), c.arg(4));
         if i < 4 {
+            let old = c.p.d3d9.streams[i].0;
+            rebind(c, old, vb);
             c.p.d3d9.streams[i] = (vb, off, stride, c.p.d3d9.streams[i].3);
         }
         ret(c, D3D_OK)
@@ -1658,6 +1701,8 @@ const IDIRECT3DDEVICE9: &[Method] = &[
         ret(c, D3D_OK)
     }),
     ("SetIndices", 2, |c| {
+        let old = c.p.d3d9.indices;
+        rebind(c, old, c.arg(1));
         c.p.d3d9.indices = c.arg(1);
         ret(c, D3D_OK)
     }),
@@ -1669,6 +1714,8 @@ const IDIRECT3DDEVICE9: &[Method] = &[
     }),
     ("CreatePixelShader", 3, |c| dev_create_shader(c, false)),
     ("SetPixelShader", 2, |c| {
+        let old = c.p.d3d9.ps;
+        rebind(c, old, c.arg(1));
         c.p.d3d9.ps = c.arg(1);
         ret(c, D3D_OK)
     }),
@@ -1972,8 +2019,17 @@ static IDIRECT3DSTATEBLOCK9: &[Method] = &[
             // Render targets and the back buffer are not part of a state block.
             let mut s = (**b).clone();
             let cur = &c.p.d3d9;
-            (s.target, s.depth, s.backbuffer, s.device) = (cur.target, cur.depth, cur.backbuffer, cur.device);
+            (s.target, s.depth, s.rt, s.backbuffer, s.device) = (cur.target, cur.depth, cur.rt, cur.backbuffer, cur.device);
+            // the device's references follow the bindings the block changes
+            let mut moves: Vec<(u32, u32)> = cur.textures.iter().zip(&s.textures).map(|(&a, &b)| (a, b)).collect();
+            moves.extend(cur.streams.iter().zip(&s.streams).map(|(a, b)| (a.0, b.0)));
+            moves.extend([(cur.indices, s.indices), (cur.vs, s.vs), (cur.ps, s.ps), (cur.decl, s.decl)]);
             c.p.d3d9 = Box::new(s);
+            for (old, new) in moves {
+                if old != new {
+                    rebind(c, old, new);
+                }
+            }
         }
         ret(c, D3D_OK)
     }),

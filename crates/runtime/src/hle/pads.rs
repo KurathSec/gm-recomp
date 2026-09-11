@@ -103,9 +103,20 @@ pub fn register(r: &mut Registry) {
     r.add(w, "joyGetPos", |c| joy_pos_impl(c, false));
 }
 
-fn joy_pos_impl(c: &mut Ctx, ex: bool) -> ApiResult {
-    let (i, out) = (c.arg(0), c.arg(1));
-    let Some(p) = pad(c, i) else { return ok(2, if i < 16 { JOYERR_UNPLUGGED } else { JOYERR_PARMS }) };
+/// A controller as the legacy joystick drivers report it (winmm, DirectInput): axes
+/// 0..65535 with Y down, the triggers sharing the Z axis, buttons in the joystick
+/// order, the D-pad as a POV hat in hundredths of a degree (`None` centered).
+pub(crate) struct Joy {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub rx: u32,
+    pub ry: u32,
+    pub buttons: u32,
+    pub pov: Option<u32>,
+}
+
+pub(crate) fn joy(p: &super::PadState) -> Joy {
     let axis = |v: i16, invert: bool| -> u32 {
         let v = if invert { -(v as i32) - 1 } else { v as i32 };
         (v + 32768).clamp(0, 65535) as u32
@@ -118,26 +129,38 @@ fn joy_pos_impl(c: &mut Ctx, ex: bool) -> ApiResult {
     }
     let (up, down, left, right) = (p.buttons & 1 != 0, p.buttons & 2 != 0, p.buttons & 4 != 0, p.buttons & 8 != 0);
     let pov = match (up, down, left, right) {
-        (true, _, false, false) => 0,
-        (true, _, false, true) => 4500,
-        (false, false, false, true) => 9000,
-        (false, true, false, true) => 13500,
-        (false, true, false, false) => 18000,
-        (false, true, true, false) => 22500,
-        (false, false, true, false) => 27000,
-        (true, _, true, false) => 31500,
-        _ => 0xFFFF,
+        (true, _, false, false) => Some(0),
+        (true, _, false, true) => Some(4500),
+        (false, false, false, true) => Some(9000),
+        (false, true, false, true) => Some(13500),
+        (false, true, false, false) => Some(18000),
+        (false, true, true, false) => Some(22500),
+        (false, false, true, false) => Some(27000),
+        (true, _, true, false) => Some(31500),
+        _ => None,
     };
     // triggers on the Z axis, as the Xbox controller's legacy driver reports them
     let z = (32768 + p.triggers[0] as i32 * 128 - p.triggers[1] as i32 * 128).clamp(0, 65535) as u32;
+    Joy { x: axis(p.thumbs[0], false), y: axis(p.thumbs[1], true), z, rx: axis(p.thumbs[2], false), ry: axis(p.thumbs[3], true), buttons, pov }
+}
+
+/// The connected pads, after taking the host's latest input.
+pub(crate) fn connected_pad(c: &mut Ctx, i: u32) -> Option<super::PadState> {
+    pad(c, i)
+}
+
+fn joy_pos_impl(c: &mut Ctx, ex: bool) -> ApiResult {
+    let (i, out) = (c.arg(0), c.arg(1));
+    let Some(p) = pad(c, i) else { return ok(2, if i < 16 { JOYERR_UNPLUGGED } else { JOYERR_PARMS }) };
+    let j = joy(&p);
     if ex {
         // JOYINFOEX: size, flags, x, y, z, r, u, v, buttons, button number, pov
-        let vals = [axis(p.thumbs[0], false), axis(p.thumbs[1], true), z, axis(p.thumbs[3], true), axis(p.thumbs[2], false), 0, buttons, buttons.count_ones(), pov];
+        let vals = [j.x, j.y, j.z, j.ry, j.rx, 0, j.buttons, j.buttons.count_ones(), j.pov.unwrap_or(0xFFFF)];
         for (k, v) in vals.iter().enumerate() {
             let _ = c.host.write_u32(out + 8 + 4 * k as u32, *v);
         }
     } else {
-        for (k, v) in [axis(p.thumbs[0], false), axis(p.thumbs[1], true), z, buttons].iter().enumerate() {
+        for (k, v) in [j.x, j.y, j.z, j.buttons].iter().enumerate() {
             let _ = c.host.write_u32(out + 4 * k as u32, *v);
         }
     }
