@@ -71,6 +71,10 @@
         position: absolute; right: 0; top: 0; bottom: 0; width: min(520px, 100%); margin: 0; padding: 10px; overflow: auto;
         background: rgba(10, 10, 12, 0.92); color: #a9a9b3; font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap;
       }
+      #stats {
+        position: absolute; left: 8px; top: 8px; margin: 0; padding: 6px 9px; border-radius: 6px; pointer-events: none;
+        background: rgba(10, 10, 12, 0.8); color: #cfe9cf; font: 12px/1.45 ui-monospace, monospace; white-space: pre;
+      }
       body.fullscreen #bar { display: none; }
     </style>
   </head>
@@ -90,6 +94,7 @@
         <button id="export">Export saves</button>
         <label class="button" title="Load saves exported earlier (restarts the game)">Import saves<input id="import" type="file" accept=".json,application/json" hidden /></label>
         <button id="wipe">Delete saves</button>
+        <button id="statsbtn" title="Frame rate, frame time and input latency">Stats</button>
         <button id="logbtn">Log</button>
         <button id="fs">Fullscreen</button>
       </div>
@@ -98,6 +103,7 @@
         <div id="status">Loading…</div>
         <div id="hint" hidden>Click or press a key to turn on sound</div>
         <pre id="log" hidden></pre>
+        <pre id="stats" hidden></pre>
       </div>
     </div>
 
@@ -105,6 +111,7 @@
       import { deleteSaves, exportSaves, loadSaves, openSaves, parseSaves, storeSaves } from './src/saves.mjs';
 
       // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
+      // &stats (overlay) &pacing=asap (show frames when done instead of on time)
       // &nopace=1 &script=100:Enter:1,105:Enter:0 (or f:mouse:x:y:b) &audio=1 &nosave=1
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
@@ -220,6 +227,15 @@
           requestAnimationFrame(fit);
         });
         document.getElementById('logbtn').onclick = () => (logEl.hidden = !logEl.hidden);
+        // Stats overlay (remembered per browser; ?stats shows it too).
+        const statsEl = document.getElementById('stats');
+        const remember = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+        const recall = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+        statsEl.hidden = !(q.has('stats') || recall('gmr.stats') === '1');
+        document.getElementById('statsbtn').onclick = () => {
+          statsEl.hidden = !statsEl.hidden;
+          remember('gmr.stats', statsEl.hidden ? '0' : '1');
+        };
         if (q.has('log')) logEl.hidden = false;
         fit();
 
@@ -303,6 +319,13 @@
             [gameW, gameH] = [data.w, data.h];
             statusEl.hidden = true;
             fit();
+          } else if (data.type === 'stats') {
+            const f = (v) => v.toFixed(1);
+            statsEl.textContent =
+              `${f(data.fps)} fps   frame ${f(data.interval)} ms (max ${f(data.intervalMax)})\n` +
+              `guest ${f(data.busy)} ms per frame (max ${f(data.busyMax)})   late ${data.late}   wake +${f(data.wake)} ms (max ${f(data.wakeMax)})\n` +
+              (data.inputs ? `input → frame ${f(data.input)} ms (max ${f(data.inputMax)}, ${data.inputs})` : 'input → frame —');
+            if (report && q.has('stats')) send('/log', 'stats: ' + statsEl.textContent.replace(/\n/g, ' | '));
           } else if (data.type === 'capture') {
             if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
           } else if (data.type === 'done') {
@@ -321,7 +344,8 @@
         };
         statusEl.textContent = 'Downloading…';
         const offscreen = screen.transferControlToOffscreen();
-        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, script, persist }, [offscreen]);
+        const pacing = q.get('pacing') === 'asap' ? 'asap' : 'jit';
+        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, script, persist }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.
@@ -331,7 +355,7 @@
             if (e.target instanceof HTMLInputElement) return;
             if (gameKeys.test(e.code) && !e.metaKey && e.code !== 'F11') e.preventDefault();
             if (e.repeat) return;
-            w.postMessage({ type: 'key', code: e.code, down: type === 'keydown' });
+            w.postMessage({ type: 'key', code: e.code, down: type === 'keydown', t: performance.timeOrigin + e.timeStamp });
           });
         }
         window.addEventListener('blur', () => {
@@ -342,7 +366,8 @@
         const mouse = (e) => {
           const r = screen.getBoundingClientRect();
           const buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
-          w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons });
+          const t = e.type === 'mousemove' ? undefined : performance.timeOrigin + e.timeStamp;
+          w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons, t });
         };
         for (const t of ['mousemove', 'mousedown', 'mouseup']) screen.addEventListener(t, mouse);
 

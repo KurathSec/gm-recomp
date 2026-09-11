@@ -11,9 +11,9 @@ function handleInput(data) {
   if (!input) return early.push(data);
   if (data.type === 'key') {
     const k = KEYS[data.code];
-    if (k) input.key(k[0], k[1], data.down);
+    if (k) input.key(k[0], k[1], data.down, data.t);
   } else if (data.type === 'mouse') {
-    input.mouse(data.x, data.y, data.buttons);
+    input.mouse(data.x, data.y, data.buttons, data.t);
   } else if (data.type === 'pad') {
     input.pad(data.index, data.connected, data.buttons, data.lt, data.rt, data.lx, data.ly, data.rx, data.ry);
   }
@@ -21,7 +21,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, script = [], persist = true } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'jit', script = [], persist = true } = data;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
     const base = `/games/${encodeURIComponent(game)}/`;
@@ -75,7 +75,8 @@ self.onmessage = async ({ data }) => {
     const ringFrames = 48000;
     const audioRing = { sab: new SharedArrayBuffer(8 + ringFrames * 8), frames: ringFrames };
     self.postMessage({ type: 'audio', sab: audioRing.sab, frames: ringFrames, rate: 48000 });
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, onFrame, onReady, onResize, audioRing, onSave });
+    const onStats = (stats) => self.postMessage({ type: 'stats', ...stats });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, pacing, onFrame, onReady, onResize, audioRing, onSave, onStats });
     await saving;
     self.postMessage({ type: 'done', status });
   } catch (e) {

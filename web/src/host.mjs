@@ -19,6 +19,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(state: {guestMemory: WebAssembly.Memory}) => void} [o.onExit]  inspection after the run
  * @param {OffscreenCanvas} [o.canvas]  render target; without it nothing is drawn
  * @param {boolean} [o.pace]  hold frames to the game's own timing (needs JSPI)
+ * @param {'jit'|'asap'} [o.pacing]  when frames are shown and the guest resumes (see `due`)
  * @param {(frame: number, gpu: D3DGL|null) => void|Promise<void>} [o.onFrame]  after each Present
  * @param {(input: {key: Function, mouse: Function, pad: Function}) => void} [o.onReady]  input entry points,
  *   usable while the guest is suspended in Present
@@ -27,8 +28,11 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(changes: {path: string, data: Uint8Array|null, mtime: number}[]) => void} [o.onSave]
  *   files the game wrote or removed (its saves; not the temp directory)
  * @param {string} [o.soundfontUrl]  a General MIDI SoundFont, fetched when a game first plays MIDI
+ * @param {(stats: object) => void} [o.onStats]  twice a second while rendering: frame rate, real frame
+ *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
+ *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2' }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'jit', onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -48,21 +52,78 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   let lastPresent = 0;
   let resumed = 0;
   let headlessFrames = 0;
-  const present = (clockMs, x, y, w, h, dw, dh) => {
-    const t = performance.now();
-    if (resumed) frameMs.push(t - resumed);
-    else if (lastPresent) frameMs.push(t - lastPresent);
+  // Live statistics (onStats): this window's samples.
+  const epochNow = () => performance.timeOrigin + performance.now();
+  let pendingInputs = [];
+  let win = { start: performance.now(), frames: 0, intervals: [], busy: [], late: 0, inputs: [], wake: [] };
+  let lastPresentReal = 0;
+  let lastClockMs = 0;
+  const collect = (t, clockMs, busy) => {
+    if (!onStats) return;
+    if (lastPresentReal) {
+      const interval = t - lastPresentReal;
+      win.intervals.push(interval);
+      // later than half a frame beyond the guest's own frame time
+      const target = clockMs - lastClockMs;
+      if (target > 0 && interval > target * 1.5) win.late++;
+    }
+    lastPresentReal = t;
+    lastClockMs = clockMs;
+    if (busy !== undefined) win.busy.push(busy);
+    win.frames++;
+    // Input that arrived while the guest was suspended was read by this frame.
+    const now = epochNow();
+    for (const when of pendingInputs) win.inputs.push(now - when);
+    pendingInputs = [];
+    const elapsed = t - win.start;
+    if (elapsed < 500) return;
+    const sorted = (a) => [...a].sort((x, y) => x - y);
+    const med = (a) => (a.length ? sorted(a)[a.length >> 1] : 0);
+    const max = (a) => (a.length ? Math.max(...a) : 0);
+    const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+    onStats({
+      fps: (win.frames * 1000) / elapsed,
+      interval: avg(win.intervals),
+      intervalMax: max(win.intervals),
+      busy: med(win.busy),
+      busyMax: max(win.busy),
+      late: win.late,
+      input: avg(win.inputs),
+      inputMax: max(win.inputs),
+      inputs: win.inputs.length,
+      wake: avg(win.wake),
+      wakeMax: max(win.wake),
+    });
+    win = { start: t, frames: 0, intervals: [], busy: [], late: 0, inputs: [], wake: [] };
+  };
+  // Frame timing. The guest runs on virtual time: a frame belongs on screen at real time
+  // startReal + its clock. 'jit' pacing holds a finished frame until then and resumes the
+  // guest just early enough to finish the next one on time, so input is read as late as
+  // possible and frames reach the screen evenly; 'asap' shows each frame when it is done
+  // and resumes the guest at the frame's time.
+  const due = (clockMs) => {
+    const now = performance.now();
+    // more than 250 ms behind (a long load, a hidden tab): start over from now
+    if (startReal === undefined || now - (startReal + clockMs) > 250) startReal = now - clockMs;
+    return startReal + clockMs;
+  };
+  const show = (clockMs, x, y, w, h, dw, dh, busy) => {
+    collect(performance.now(), clockMs, busy);
     const resized = canvas.width !== dw || canvas.height !== dh;
     gpu.present(x, y, w, h, dw, dh);
     if (resized && onResize) onResize(dw, dh);
-    const frame = gpu.frames;
-    // The guest runs on virtual time; hold each frame until real time catches up.
-    const now = performance.now();
-    if (startReal === undefined || now - (startReal + clockMs) > 250) startReal = now - clockMs;
-    const wait = startReal + clockMs - now;
-    lastPresent = performance.now() + Math.max(0, pace ? wait : 0);
-    return { frame, wait };
+    return gpu.frames;
   };
+  // Recent guest time per frame, for the next frame's start.
+  const recent = [];
+  const estimate = () => {
+    if (!recent.length) return 4;
+    const s = [...recent].sort((a, b) => a - b);
+    return s[Math.floor(s.length * 0.9)];
+  };
+  const MARGIN_MS = 2;
+  let prevClock;
+  const sleepUntil = (t) => new Promise((r) => setTimeout(r, Math.max(0, t - performance.now())));
   const gpuImports = {
     gpu_resize: (w, h) => gpu?.resize(w, h),
     gpu_texture_create: (id, w, h, levels, fmt, rt) => gpu?.textureCreate(id, w, h, levels, fmt, rt),
@@ -83,7 +144,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         if (onFrame) onFrame(headlessFrames, null);
         return;
       }
-      const { frame } = present(clockMs, x, y, w, h, dw, dh);
+      // Without JSPI the guest cannot wait: frames show as they come.
+      const t = performance.now();
+      if (lastPresent) frameMs.push(t - lastPresent);
+      lastPresent = t;
+      const frame = show(clockMs, x, y, w, h, dw, dh);
       if (onFrame) onFrame(frame, gpu);
     },
   };
@@ -91,9 +156,27 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     // Present suspends the guest: the worker's event loop runs, the canvas shows the
     // frame, and input messages arrive.
     gpuImports.gpu_present = new WebAssembly.Suspending(async (clockMs, x, y, w, h, dw, dh) => {
-      const { frame, wait } = present(clockMs, x, y, w, h, dw, dh);
+      const busy = resumed ? performance.now() - resumed : undefined;
+      if (busy !== undefined) {
+        frameMs.push(busy);
+        recent.push(busy);
+        if (recent.length > 60) recent.shift();
+      }
+      const step = prevClock === undefined ? 20 : Math.max(1, clockMs - prevClock);
+      prevClock = clockMs;
+      // How late a wait ended (timer precision), when there was one.
+      const wake = async (t) => {
+        const before = performance.now();
+        await sleepUntil(t);
+        if (onStats && t > before) win.wake.push(performance.now() - t);
+      };
+      const at = pace ? due(clockMs) : 0;
+      if (pace && pacing === 'jit') await wake(at);
+      const frame = show(clockMs, x, y, w, h, dw, dh, busy);
       if (onFrame) await onFrame(frame, gpu);
-      await new Promise((r) => setTimeout(r, pace ? Math.max(0, wait) : 0));
+      // Yield even when not waiting: the canvas shows the frame and input arrives.
+      const resumeAt = !pace ? 0 : pacing === 'jit' ? at + step - Math.min(step, estimate() + MARGIN_MS) : at;
+      await wake(resumeAt);
       resumed = performance.now();
     });
   }
@@ -224,8 +307,14 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   if (canvas) gpu = new D3DGL(canvas, () => glue.exports.mem.buffer, () => x.memory.buffer, print);
   if (onReady) {
     onReady({
-      key: (vk, scan, down) => x.input_key(vk, scan, down ? 1 : 0),
-      mouse: (mx, my, buttons) => x.input_mouse(mx | 0, my | 0, buttons),
+      key: (vk, scan, down, when) => {
+        if (when && down) pendingInputs.push(when);
+        x.input_key(vk, scan, down ? 1 : 0);
+      },
+      mouse: (mx, my, buttons, when) => {
+        if (when) pendingInputs.push(when);
+        x.input_mouse(mx | 0, my | 0, buttons);
+      },
       pad: (i, connected, buttons, lt, rt, lx, ly, rx, ry) => x.input_pad(i, connected ? 1 : 0, buttons, lt | (rt << 8), lx, ly, rx, ry),
     });
   }
