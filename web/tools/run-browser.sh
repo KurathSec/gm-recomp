@@ -25,7 +25,16 @@ esac
 browser_pid=$!
 wait $server || true
 kill $browser_pid 2>/dev/null || true
-[ "$browser" = chrome ] && flatpak kill com.google.Chrome 2>/dev/null || true
-pkill -f "profile ${PROFILE:-$tmp}" 2>/dev/null || true
+# Only this run's browser (its profile is in the command line), so runs can overlap.
+# Chrome may ignore SIGTERM while the page is busy; the page has stored its saves
+# before reporting, so it is killed after a grace period.
+case $browser in
+  chrome) pat="^/app/extra/chrome .*user-data-dir=${PROFILE:-$tmp/profile}" ;;
+  *) pat="profile ${PROFILE:-$tmp}" ;;
+esac
+pkill -f "$pat" 2>/dev/null || true
+n=0
+while pgrep -f "$pat" > /dev/null && [ $n -lt 5 ]; do sleep 1; n=$((n + 1)); done
+pkill -KILL -f "$pat" 2>/dev/null || true
 cat "$tmp/out"
 rm -rf "$tmp"

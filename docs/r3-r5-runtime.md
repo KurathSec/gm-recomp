@@ -7,15 +7,15 @@ code anywhere.
 
 ## Status
 
-| Game | Engine | Verified |
+| Game | Engine | Verified (scripted input in Chrome, frames captured) |
 |---|---|---|
-| Not Another Needle Game | GM 8.1 | title screen in Chrome and Firefox; music through the recompiled supersound.dll |
-| i wanna uhuhu spike | GM 8.0 | title screen; MP3 music via MCI (correlation 0.9999 with ffmpeg's decode); DirectMusic sound effects |
-| I wanna run the Marathon | GMS 1.4 VM | title screen; title music from the GMS audio thread (correlation 0.999 with mus_Title.ogg) |
-| Crimson Needle 3 | GMS 1.4 VM | title screen |
-| indigo needle | GMS 1.4 VM | title screen; GMFile.dll runs on Wine's msvcp100 |
+| Not Another Needle Game | GM 8.1 | mouse menus, New Game starts the game; music through the recompiled supersound.dll |
+| i wanna uhuhu spike | GM 8.0 | hub room: run, jump, double jump, warp to the first stage; MP3 music via MCI (correlation 0.9999 with ffmpeg's decode); DirectMusic sound effects |
+| I wanna run the Marathon | GMS 1.4 VM | file select, hub, warp, the marathon starts ("On your mark... Go!!"); title music from the GMS audio thread (correlation 0.999 with mus_Title.ogg) |
+| Crimson Needle 3 | GMS 1.4 VM | title screen; key messages reach its window procedure, but the title does not react to Shift, Enter, Z, Space, J, Esc or a click (open) |
+| indigo needle | GMS 1.4 VM | title room, the player walks and falls; GMFile.dll runs on Wine's msvcp100 |
 | untitled needle game | GMS 1.4 YYC | intro cutscene, tutorial: runs, jumps, falls into and climbs out of a pit; its shaders compile |
-| RNG Dungeon | GMS 1.4 YYC | title screen; all 22 shaders translate and compile as GLSL in Chrome |
+| RNG Dungeon | GMS 1.4 YYC | intro, title, file select, a save chosen; all 22 shaders translate and compile as GLSL in Chrome |
 
 - All seven run 200 frames in the harness; the held-out games (Vandal, Bread) have not
   been run (that is R6).
