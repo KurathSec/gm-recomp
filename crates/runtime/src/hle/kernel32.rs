@@ -2911,6 +2911,81 @@ pub fn register_paths(r: &mut Registry) {
 pub fn register_extra(r: &mut Registry) {
     let k = "kernel32.dll";
     r.add(k, "DisableThreadLibraryCalls", |_c| ok(1, 1));
+    r.add(k, "GetModuleHandleExA", |c| {
+        let name = if c.arg(0) & 4 != 0 { String::new() } else { c.str_arg(1) };
+        let base = module_handle(c, &name);
+        write_out(c, c.arg(2), base);
+        ok(3, (base != 0) as u32)
+    });
+    r.alias(k, "GetSystemTimePreciseAsFileTime", k, "GetSystemTimeAsFileTime");
+    // There is no win.ini: every key has its default.
+    r.add(k, "GetProfileStringA", |c| {
+        let default = if c.arg(2) != 0 { c.str_arg(2).into_bytes() } else { Vec::new() };
+        let n = copy_str_out(c, c.arg(3), c.arg(4), &default);
+        ok(5, n.min(c.arg(4).saturating_sub(1)))
+    });
+    r.add(k, "CreateDirectoryExW", |c| {
+        let p = wstr(c, c.arg(1));
+        let r = create_dir(c, &p);
+        ok(3, r as u32)
+    });
+    r.add(k, "CreateDirectoryExA", |c| {
+        let p = c.str_arg(1);
+        let r = create_dir(c, &p);
+        ok(3, r as u32)
+    });
+    r.add(k, "SetThreadDescription", |_c| ok(2, 0));
+    // Interlocked singly linked lists. SLIST_HEADER: Next, Depth (u16), Sequence (u16).
+    r.add(k, "InitializeSListHead", |c| {
+        let _ = c.host.write_u64(c.arg(0), 0);
+        ok(1, 0)
+    });
+    r.add(k, "InterlockedPushEntrySList", |c| {
+        let (head, entry) = (c.arg(0), c.arg(1));
+        let first = c.host.read_u32(head).unwrap_or(0);
+        let depth = c.host.read_u16(head + 4).unwrap_or(0);
+        let seq = c.host.read_u16(head + 6).unwrap_or(0);
+        let _ = c.host.write_u32(entry, first);
+        let _ = c.host.write_u32(head, entry);
+        let _ = c.host.write_u16(head + 4, depth.wrapping_add(1));
+        let _ = c.host.write_u16(head + 6, seq.wrapping_add(1));
+        ok(2, first)
+    });
+    r.add(k, "InterlockedPopEntrySList", |c| {
+        let head = c.arg(0);
+        let first = c.host.read_u32(head).unwrap_or(0);
+        if first != 0 {
+            let next = c.host.read_u32(first).unwrap_or(0);
+            let depth = c.host.read_u16(head + 4).unwrap_or(1);
+            let seq = c.host.read_u16(head + 6).unwrap_or(0);
+            let _ = c.host.write_u32(head, next);
+            let _ = c.host.write_u16(head + 4, depth.wrapping_sub(1));
+            let _ = c.host.write_u16(head + 6, seq.wrapping_add(1));
+        }
+        ok(1, first)
+    });
+    r.add(k, "InterlockedFlushSList", |c| {
+        let head = c.arg(0);
+        let first = c.host.read_u32(head).unwrap_or(0);
+        let _ = c.host.write_u32(head, 0);
+        let _ = c.host.write_u16(head + 4, 0);
+        ok(1, first)
+    });
+    r.add(k, "QueryDepthSList", |c| {
+        let d = c.host.read_u16(c.arg(0) + 4).unwrap_or(0);
+        ok(1, d as u32)
+    });
+    r.alias("ntdll.dll", "RtlInitializeSListHead", k, "InitializeSListHead");
+    r.alias("ntdll.dll", "RtlInterlockedPushEntrySList", k, "InterlockedPushEntrySList");
+    r.alias("ntdll.dll", "RtlInterlockedPopEntrySList", k, "InterlockedPopEntrySList");
+    r.alias("ntdll.dll", "RtlInterlockedFlushSList", k, "InterlockedFlushSList");
+    r.alias("ntdll.dll", "RtlQueryDepthSList", k, "QueryDepthSList");
+    r.alias("ntdll.dll", "_vsnprintf", "msvcrt.dll", "_vsnprintf");
+    r.add("advapi32.dll", "AllocateLocallyUniqueId", |c| {
+        c.p.next_luid += 1;
+        let _ = c.host.write_u64(c.arg(0), 0x1000 + c.p.next_luid);
+        ok(1, 1)
+    });
     // Not a packaged (Store) app.
     r.add(k, "GetCurrentPackageId", |_c| ok(2, 15700));
     r.add(k, "GetCurrentPackageFullName", |_c| ok(2, 15700));

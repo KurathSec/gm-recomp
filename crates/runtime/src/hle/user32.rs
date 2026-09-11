@@ -2,7 +2,7 @@
 //! timers, keyboard state and the small set of queries a VCL application makes.
 
 use super::{ApiResult, Ctx, Registry, Ret};
-use crate::process::{Handle, Msg, Window, WndClass};
+use crate::process::{GdiObject, Handle, Msg, Window, WndClass};
 
 fn ok(nargs: u32, v: u32) -> ApiResult {
     Ok(Ret::stdcall(nargs, v))
@@ -2223,6 +2223,13 @@ pub fn register_more(r: &mut Registry) {
 /// Wide variants and newer entry points (GameMaker: Studio runners).
 pub fn register_extra(r: &mut Registry) {
     let u = "user32.dll";
+    r.add(u, "WindowFromDC", |c| {
+        let hwnd = match c.p.handles.get(&c.arg(0)) {
+            Some(Handle::Gdi(GdiObject::Dc { hwnd, .. })) => *hwnd,
+            _ => 0,
+        };
+        ok(1, hwnd)
+    });
     r.alias(u, "LoadImageW", u, "LoadImageA");
     r.alias(u, "PostThreadMessageW", u, "PostThreadMessageA");
     r.add(u, "DialogBoxParamW", |_c| ok(5, 0xFFFF_FFFF));

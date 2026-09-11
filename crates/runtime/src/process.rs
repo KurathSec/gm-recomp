@@ -369,6 +369,8 @@ pub struct Process {
     pub crt_rand: u32,
     /// setlocale's "C" string.
     pub crt_locale: u32,
+    /// AllocateLocallyUniqueId's counter.
+    pub next_luid: u64,
     /// The MIDI SoundFont, once the host supplied it (or failed to).
     pub soundfont: Option<std::sync::Arc<rustysynth::SoundFont>>,
     pub soundfont_failed: bool,
@@ -487,6 +489,7 @@ impl Process {
             crt_files: HashMap::default(),
             crt_rand: 1,
             crt_locale: 0,
+            next_luid: 0,
             timers_due: Vec::new(),
             pads: Default::default(),
             soundfont: None,

@@ -163,6 +163,16 @@ fn main_wait(c: &mut Ctx, until: Option<u64>, mut done: impl FnMut(&mut Process)
     }
 }
 
+/// An NT timeout (LARGE_INTEGER*, NULL = infinite; negative = relative, in 100 ns
+/// units; an absolute time counts as already due) in milliseconds.
+fn nt_timeout_ms(c: &Ctx, p: u32) -> u32 {
+    if p == 0 {
+        return INFINITE;
+    }
+    let t = c.host.read_u64(p).unwrap_or(0) as i64;
+    if t >= 0 { 0 } else { ((-t) / 10_000).min(INFINITE as i64 - 1) as u32 }
+}
+
 fn timeout_until(c: &Ctx, ms: u32) -> Option<u64> {
     (ms != INFINITE).then(|| c.p.clock_us + ms as u64 * 1000)
 }
@@ -384,6 +394,17 @@ pub fn register(r: &mut Registry) {
         }
         ok(1, 0)
     });
+    r.add(k, "FreeLibraryAndExitThread", |c| {
+        // FreeLibrary does nothing here (modules stay loaded).
+        let code = c.arg(1);
+        if c.p.current == 0 {
+            c.p.exit_code = Some(code);
+            c.host.request_exit(code);
+        } else {
+            block(c, ThreadState::Exited(code));
+        }
+        ok(2, 0)
+    });
     r.add(k, "TerminateThread", |c| {
         let (h, code) = (c.arg(0), c.arg(1));
         if let Some(i) = thread_index(c.p, h) {
@@ -464,6 +485,16 @@ pub fn register(r: &mut Registry) {
         let r = wait(c, vec![h], false, ms);
         ok(2, r)
     });
+    r.add("ntdll.dll", "NtDelayExecution", |c| {
+        let ms = nt_timeout_ms(c, c.arg(1));
+        sleep(c, if ms == INFINITE { 0 } else { ms });
+        ok(2, 0)
+    });
+    r.add("ntdll.dll", "NtWaitForSingleObject", |c| {
+        let (h, ms) = (c.arg(0), nt_timeout_ms(c, c.arg(2)));
+        let r = wait(c, vec![h], false, ms);
+        ok(3, r) // STATUS_WAIT_0 / STATUS_TIMEOUT have the Win32 values
+    });
     r.add(k, "WaitForSingleObjectEx", |c| {
         let (h, ms) = (c.arg(0), c.arg(1));
         let r = wait(c, vec![h], false, ms);
@@ -496,6 +527,28 @@ pub fn register(r: &mut Registry) {
         leave_cs(c, cs);
         ok(1, 0)
     });
+    r.add("ntdll.dll", "RtlIsCriticalSectionLockedByThread", |c| {
+        let tid = c.p.current_thread_id();
+        ok(1, (cs_owner(c.p, c.arg(0)) == tid) as u32)
+    });
+    // Condition variables: a sleep releases the critical section, lets the other
+    // threads run, and takes it back. Wakeups may be spurious (callers re-check their
+    // predicate), so Wake* have nothing to do.
+    r.add(k, "InitializeConditionVariable", |c| {
+        let _ = c.host.write_u32(c.arg(0), 0);
+        ok(1, 0)
+    });
+    r.add(k, "SleepConditionVariableCS", |c| {
+        let (cs, ms) = (c.arg(1), c.arg(2));
+        leave_cs(c, cs);
+        if c.p.current == 0 {
+            sleep(c, ms.min(1));
+        }
+        enter_cs(c, cs, false);
+        ok(3, 1)
+    });
+    r.add(k, "WakeConditionVariable", |_c| ok(1, 0));
+    r.add(k, "WakeAllConditionVariable", |_c| ok(1, 0));
     r.alias("ntdll.dll", "RtlEnterCriticalSection", k, "EnterCriticalSection");
     r.alias("ntdll.dll", "RtlLeaveCriticalSection", k, "LeaveCriticalSection");
     r.alias("ntdll.dll", "RtlTryEnterCriticalSection", k, "TryEnterCriticalSection");

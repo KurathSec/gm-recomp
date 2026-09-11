@@ -396,6 +396,13 @@ pub fn run(opts: RunOpts) -> Result<()> {
             .modules
             .iter()
             .flat_map(|md| md.imports.iter())
+            // imports bound to a loaded DLL's exports are guest code, not HLE
+            .filter(|(dll, name, _)| !p.modules.iter().any(|m| m.name.eq_ignore_ascii_case(dll) && m.exports.contains_key(name)))
+            .filter(|(dll, name, _)| {
+                let d = dll.to_lowercase();
+                let d = if d.ends_with(".dll") { d } else { format!("{d}.dll") };
+                !p.registry.data.contains_key(&(d, name.clone()))
+            })
             .filter(|(dll, name, _)| p.registry.lookup(dll, name).map(|id| p.registry.func(id).is_none()).unwrap_or(true))
             .map(|(dll, name, _)| format!("{dll}!{name}"))
             .collect();
