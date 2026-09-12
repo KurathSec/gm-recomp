@@ -21,7 +21,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'jit', script = [], persist = true } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', script = [], persist = true } = data;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
     const base = `/games/${encodeURIComponent(game)}/`;

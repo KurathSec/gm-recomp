@@ -19,7 +19,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(state: {guestMemory: WebAssembly.Memory}) => void} [o.onExit]  inspection after the run
  * @param {OffscreenCanvas} [o.canvas]  render target; without it nothing is drawn
  * @param {boolean} [o.pace]  hold frames to the game's own timing (needs JSPI)
- * @param {'jit'|'asap'} [o.pacing]  when frames are shown and the guest resumes (see `due`)
+ * @param {'clock'|'jit'|'asap'} [o.pacing]  when the guest waits and frames are shown (see `due`)
  * @param {(frame: number, gpu: D3DGL|null) => void|Promise<void>} [o.onFrame]  after each Present
  * @param {(input: {key: Function, mouse: Function, pad: Function}) => void} [o.onReady]  input entry points,
  *   usable while the guest is suspended in Present
@@ -32,7 +32,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
  *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'jit', onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -96,11 +96,13 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     });
     win = { start: t, frames: 0, intervals: [], busy: [], late: 0, inputs: [], wake: [] };
   };
-  // Frame timing. The guest runs on virtual time: a frame belongs on screen at real time
-  // startReal + its clock. 'jit' pacing holds a finished frame until then and resumes the
-  // guest just early enough to finish the next one on time, so input is read as late as
-  // possible and frames reach the screen evenly; 'asap' shows each frame when it is done
-  // and resumes the guest at the frame's time.
+  // Frame timing. The guest runs on virtual time, which real time follows from startReal.
+  // 'clock' pacing holds the guest wherever its clock moves on (sleeps, waits, timer
+  // polls) until real time gets there, and shows each frame as soon as it is presented:
+  // threads that wake while the main thread sleeps run in that idle time, and input is
+  // read right after the wait. 'jit' holds a finished frame until its time and resumes
+  // the guest just early enough for the next one; 'asap' shows each frame when it is
+  // done and resumes the guest at the frame's time.
   const due = (clockMs) => {
     const now = performance.now();
     // more than 250 ms behind (a long load, a hidden tab): start over from now
@@ -123,7 +125,17 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   };
   const MARGIN_MS = 2;
   let prevClock;
-  const sleepUntil = (t) => new Promise((r) => setTimeout(r, Math.max(0, t - performance.now())));
+  // Nested setTimeout chains are clamped to 4 ms; Atomics.waitAsync on a word nobody
+  // notifies is not, so short waits end on time where it exists.
+  const never = typeof Atomics.waitAsync === 'function' && typeof SharedArrayBuffer === 'function' ? new Int32Array(new SharedArrayBuffer(4)) : null;
+  const sleepUntil = (t) => {
+    const ms = Math.max(0, t - performance.now());
+    if (never && ms > 0) {
+      const w = Atomics.waitAsync(never, 0, 0, ms);
+      if (w.async) return w.value;
+    }
+    return new Promise((r) => setTimeout(r, ms));
+  };
   const gpuImports = {
     gpu_resize: (w, h) => gpu?.resize(w, h),
     gpu_texture_create: (id, w, h, levels, fmt, rt) => gpu?.textureCreate(id, w, h, levels, fmt, rt),
@@ -137,6 +149,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_shader_delete: (id) => gpu?.shaderDelete(id),
     gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
     gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst, pitch),
+    gpu_pace: () => {},
     gpu_present: (clockMs, x, y, w, h, dw, dh) => {
       if (!gpu) {
         // Headless (Node): frames are only counted.
@@ -153,32 +166,53 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
   };
   if (canvas && jspi) {
-    // Present suspends the guest: the worker's event loop runs, the canvas shows the
-    // frame, and input messages arrive.
-    gpuImports.gpu_present = new WebAssembly.Suspending(async (clockMs, x, y, w, h, dw, dh) => {
+    // While the guest is suspended in these imports the worker's event loop runs: the
+    // canvas shows the last frame and input messages arrive.
+    // How late a wait ended (timer precision), when there was one.
+    const wake = async (t) => {
+      const before = performance.now();
+      await sleepUntil(t);
+      if (onStats && t > before) win.wake.push(performance.now() - t);
+    };
+    const guestTime = () => {
       const busy = resumed ? performance.now() - resumed : undefined;
       if (busy !== undefined) {
         frameMs.push(busy);
         recent.push(busy);
         if (recent.length > 60) recent.shift();
       }
-      const step = prevClock === undefined ? 20 : Math.max(1, clockMs - prevClock);
-      prevClock = clockMs;
-      // How late a wait ended (timer precision), when there was one.
-      const wake = async (t) => {
-        const before = performance.now();
-        await sleepUntil(t);
-        if (onStats && t > before) win.wake.push(performance.now() - t);
-      };
-      const at = pace ? due(clockMs) : 0;
-      if (pace && pacing === 'jit') await wake(at);
-      const frame = show(clockMs, x, y, w, h, dw, dh, busy);
-      if (onFrame) await onFrame(frame, gpu);
-      // Yield even when not waiting: the canvas shows the frame and input arrives.
-      const resumeAt = !pace ? 0 : pacing === 'jit' ? at + step - Math.min(step, estimate() + MARGIN_MS) : at;
-      await wake(resumeAt);
-      resumed = performance.now();
-    });
+      return busy;
+    };
+    if (pace && pacing === 'clock') {
+      gpuImports.gpu_pace = new WebAssembly.Suspending((clockMs) => {
+        const at = due(clockMs);
+        // within a millisecond: carry on without suspending
+        if (at - performance.now() < 1) return undefined;
+        return wake(at).then(() => {
+          resumed = performance.now();
+        });
+      });
+      gpuImports.gpu_present = new WebAssembly.Suspending((clockMs, x, y, w, h, dw, dh) => {
+        const frame = show(clockMs, x, y, w, h, dw, dh, guestTime());
+        // the frame reaches the screen at the next wait; captures (tests) are awaited
+        const r = onFrame ? onFrame(frame, gpu) : undefined;
+        return r && typeof r.then === 'function' ? r.then(() => (resumed = performance.now(), undefined)) : undefined;
+      });
+    } else {
+      gpuImports.gpu_present = new WebAssembly.Suspending(async (clockMs, x, y, w, h, dw, dh) => {
+        const busy = guestTime();
+        const step = prevClock === undefined ? 20 : Math.max(1, clockMs - prevClock);
+        prevClock = clockMs;
+        const at = pace ? due(clockMs) : 0;
+        if (pace && pacing === 'jit') await wake(at);
+        const frame = show(clockMs, x, y, w, h, dw, dh, busy);
+        if (onFrame) await onFrame(frame, gpu);
+        // Yield even when not waiting: the canvas shows the frame and input arrives.
+        const resumeAt = !pace ? 0 : pacing === 'jit' ? at + step - Math.min(step, estimate() + MARGIN_MS) : at;
+        await wake(resumeAt);
+        resumed = performance.now();
+      });
+    }
   }
 
   const host = {

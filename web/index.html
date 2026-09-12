@@ -111,7 +111,7 @@
       import { deleteSaves, exportSaves, loadSaves, openSaves, parseSaves, storeSaves } from './src/saves.mjs';
 
       // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
-      // &stats (overlay) &pacing=asap (show frames when done instead of on time)
+      // &stats (overlay) &pacing=jit|asap (other frame pacing; the default follows the guest's clock)
       // &nopace=1 &script=100:Enter:1,105:Enter:0 (or f:mouse:x:y:b) &audio=1 &nosave=1
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
@@ -344,7 +344,7 @@
         };
         statusEl.textContent = 'Downloading…';
         const offscreen = screen.transferControlToOffscreen();
-        const pacing = q.get('pacing') === 'asap' ? 'asap' : 'jit';
+        const pacing = ['asap', 'jit'].includes(q.get('pacing')) ? q.get('pacing') : 'clock';
         w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, script, persist }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's

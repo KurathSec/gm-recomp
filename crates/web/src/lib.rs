@@ -39,6 +39,8 @@ unsafe extern "C" {
     fn gpu_read_target(id: u32, w: u32, h: u32, dst: u32, pitch: u32);
     /// Shows the frame; may suspend the guest until it is time for the next one.
     fn gpu_present(clock_ms: f64, x: i32, y: i32, w: i32, h: i32, dst_w: u32, dst_h: u32);
+    /// Holds the guest until real time reaches its clock (may suspend it).
+    fn gpu_pace(clock_ms: f64);
 }
 
 #[link(wasm_import_module = "audio")]
@@ -286,6 +288,9 @@ impl Machine for Web {
     }
     fn take_input(&mut self, _frame: u64) -> Vec<runtime::InputEvent> {
         Web::take_input()
+    }
+    fn pace(&mut self, clock_us: u64) {
+        unsafe { gpu_pace(clock_us as f64 / 1000.0) }
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         let st = state();

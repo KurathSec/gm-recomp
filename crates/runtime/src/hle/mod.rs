@@ -99,6 +99,9 @@ pub trait Host: Guest {
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         None
     }
+    /// The main thread's clock moved on to `clock_us`: a host that plays in real time
+    /// holds it there until real time catches up.
+    fn pace(&mut self, _clock_us: u64) {}
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far.
     fn poll_input(&mut self, _frame: u64) -> Vec<InputEvent> {
@@ -172,6 +175,13 @@ impl Ctx<'_> {
     /// Advances the virtual clock (sleeps, idle waits) and everything driven by it.
     pub fn advance_clock(&mut self, us: u64) {
         self.p.clock_us += us;
+        // Real time is kept where the main thread's clock moves on (at most once a
+        // millisecond), so threads waking meanwhile run in that idle time, not within
+        // the next frame.
+        if self.p.current == 0 && self.p.clock_us / 1000 != self.p.paced_ms {
+            self.p.paced_ms = self.p.clock_us / 1000;
+            self.host.pace(self.p.clock_us);
+        }
         dsound::tick(self);
         // Time passed for the main thread: threads whose wait ended run now.
         if self.p.current == 0 && self.p.threads.len() > 1 {

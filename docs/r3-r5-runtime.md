@@ -33,11 +33,21 @@ code anywhere.
   (`web/src/worker.mjs`) that draws into an OffscreenCanvas through WebGL2.
 - `web/dev/server.mjs` serves the page with COOP/COEP (SharedArrayBuffer needs them)
   and the runtime from `target/wasm/wasm32-unknown-unknown/release/`.
-- Pacing: the guest runs on the virtual clock; `Present` suspends the wasm stack
-  (JSPI, `WebAssembly.Suspending`) until real time reaches the frame's virtual time,
-  so the game's own frame limiter decides the rate (50 fps games run at 50 fps,
-  rooms with another speed at theirs). More than 250 ms behind (a slow frame, a
-  hidden tab) re-bases instead of fast-forwarding.
+- Pacing: the guest runs on the virtual clock, and real time follows it. Wherever the
+  main thread's clock moves on (Sleep, waits, waitable timers, clock polls; checked
+  once per millisecond), `pace` suspends the wasm stack (JSPI) until real time gets
+  there, and Present shows each frame at once. So the game's own frame limiter sets
+  the rate (50 fps games at 50, rooms with another speed at theirs), secondary
+  threads that wake while the main thread sleeps (GMS's audio decoder) run in that
+  idle time instead of inside a frame, and input is read right after the wait. More
+  than 250 ms behind (a long load, a hidden tab) re-bases instead of fast-forwarding.
+  Waits use `Atomics.waitAsync` (nested `setTimeout`s are clamped to 4 ms).
+  `?pacing=jit` (hold each frame until its time, resume the guest just in time) and
+  `?pacing=asap` remain for comparison. Marathon in Chrome: 50.0 fps, frame interval
+  20.0 ms (longest 21–27 ms), no late frames; waits end 0.4 ms late on average.
+- Stats (the Stats button, or `?stats`): frame rate, real frame interval, guest time
+  per frame, late frames, timer lateness, and input latency from the key event to the
+  Present of the frame that read it (the display adds up to one refresh).
 - Input: key and mouse events go to the worker as they happen (`event.code` → VK and
   scan code, `web/src/keys.mjs`) and are applied at the next API that reads input;
   keys the browser would act on (F1–F12, Tab, arrows, Backspace, ...) are

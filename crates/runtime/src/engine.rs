@@ -144,6 +144,8 @@ pub trait Machine: Guest {
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         None
     }
+    /// See `Host::pace`.
+    fn pace(&mut self, _clock_us: u64) {}
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -310,6 +312,10 @@ impl<M: Machine> Host for M {
 
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         Machine::soundfont(self)
+    }
+
+    fn pace(&mut self, clock_us: u64) {
+        Machine::pace(self, clock_us)
     }
 
     fn set_fpu_state(&mut self, f: &fpu::Fpu) {
