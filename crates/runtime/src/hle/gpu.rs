@@ -196,6 +196,10 @@ pub struct DeviceState {
     pub backbuffer: (u32, u32),
     /// The device window (where the frame is shown and mouse input goes).
     pub window: u32,
+    /// Direct3D 8: the surfaces bound as render target and depth buffer (the device
+    /// holds a reference to each).
+    pub rt_surface: u32,
+    pub depth_surface: u32,
 }
 
 pub const IDENTITY: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
@@ -256,6 +260,8 @@ impl Default for DeviceState {
             target: (0, 0, 0),
             backbuffer: (0, 0),
             window: 0,
+            rt_surface: 0,
+            depth_surface: 0,
         }
     }
 }

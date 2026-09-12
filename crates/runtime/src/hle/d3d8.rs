@@ -196,6 +196,25 @@ fn add_ref(c: &mut Ctx) -> ApiResult {
 
 fn release(c: &mut Ctx) -> ApiResult {
     let t = this(c);
+    let n = release_obj(c, t);
+    ret(c, n)
+}
+
+/// The device's reference moves from `old` to `new` (Direct3D holds a reference to
+/// what is bound to it).
+fn rebind(c: &mut Ctx, old: u32, new: u32) {
+    if new != 0 {
+        if let Some(o) = c.p.d3d_objects.get_mut(&new) {
+            o.refcount += 1;
+        }
+    }
+    if old != 0 {
+        release_obj(c, old);
+    }
+}
+
+/// Drops a reference, destroying the object at zero; returns the count left.
+fn release_obj(c: &mut Ctx, t: u32) -> u32 {
     let n = match c.p.d3d_objects.get_mut(&t) {
         Some(o) => {
             o.refcount = o.refcount.saturating_sub(1);
@@ -227,7 +246,7 @@ fn release(c: &mut Ctx) -> ApiResult {
             c.trace(format!(": freed {}", o.kind));
         }
     }
-    ret(c, n)
+    n
 }
 
 // ---- IDirect3D8 ---------------------------------------------------------------------
@@ -490,6 +509,13 @@ fn dev_set_render_target(c: &mut Ctx) -> ApiResult {
         c.p.gpu.texture_create(id, w, h, 1, fmt, true);
         set_field(c, id, "gpu", 1);
     }
+    let old = c.p.d3d.rt_surface;
+    rebind(c, old, surf);
+    c.p.d3d.rt_surface = surf;
+    // SetRenderTarget(surface, depth): NULL depth means none
+    let (old_depth, depth) = (c.p.d3d.depth_surface, c.arg(2));
+    rebind(c, old_depth, depth);
+    c.p.d3d.depth_surface = depth;
     c.p.d3d.target = (id, w, h);
     c.p.d3d.viewport = [0.0, 0.0, w as f32, h as f32, 0.0, 1.0];
     c.p.gpu.set_target(id, w, h);
@@ -664,6 +690,8 @@ fn dev_get_texture_stage_state(c: &mut Ctx) -> ApiResult {
 fn dev_set_texture(c: &mut Ctx) -> ApiResult {
     let (stage, tex) = (c.arg(1) as usize, c.arg(2));
     if stage < gpu::STAGES {
+        let old = c.p.d3d.textures[stage];
+        rebind(c, old, tex);
         c.p.d3d.textures[stage] = tex;
     }
     ret(c, D3D_OK)
@@ -698,6 +726,8 @@ fn dev_get_vertex_shader(c: &mut Ctx) -> ApiResult {
 fn dev_set_stream_source(c: &mut Ctx) -> ApiResult {
     let (stream, vb, stride) = (c.arg(1), c.arg(2), c.arg(3));
     if stream == 0 {
+        let old = c.p.d3d.stream.0;
+        rebind(c, old, vb);
         c.p.d3d.stream = (vb, stride);
     }
     ret(c, D3D_OK)
@@ -705,6 +735,8 @@ fn dev_set_stream_source(c: &mut Ctx) -> ApiResult {
 
 fn dev_set_indices(c: &mut Ctx) -> ApiResult {
     let (ib, base) = (c.arg(1), c.arg(2));
+    let old = c.p.d3d.indices.0;
+    rebind(c, old, ib);
     c.p.d3d.indices = (ib, base);
     ret(c, D3D_OK)
 }
