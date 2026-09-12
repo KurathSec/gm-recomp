@@ -470,17 +470,34 @@ pub fn register(r: &mut Registry) {
     r.add(d, "DirectSoundCreate8", |c| create_device(c, 3));
     let enumerate: ApiFn = |c| {
         let (cb, ctx) = (c.arg(0), c.arg(1));
-        // One device: the primary sound driver (NULL GUID).
+        // As Windows lists them: the primary sound driver (NULL GUID), then the device
+        // itself with its GUID (OpenAL Soft's backend, in GMS 1.4 runners, skips the
+        // first and would find no device).
         let heap = c.p.process_heap;
         let g: &mut dyn Guest = &mut *c.host;
-        let s = c.p.heap_alloc(g, heap, 64, true);
+        let block = c.p.heap_alloc(g, heap, 0x200, true);
         let wide = c.name().ends_with('W');
-        if wide {
-            let _ = c.host.write_wstr(s, "Primary Sound Driver");
-        } else {
-            let _ = c.host.write_cstr(s, b"Primary Sound Driver");
+        let guid = block;
+        let _ = c.host.write(guid, &com::parse_iid("{BD6DD71A-3DEB-11D1-B171-00C04FC20000}"));
+        let entries = [
+            (0, "Primary Sound Driver", ""),
+            (guid, "Speakers (gmrecomp audio)", "{0.0.0.00000000}.{bd6dd71a-3deb-11d1-b171-00c04fc20000}"),
+        ];
+        for (k, (g, desc, module)) in entries.iter().enumerate() {
+            let at = block + 0x20 + k as u32 * 0xF0;
+            let (d, m) = (at, at + 0x80);
+            if wide {
+                let _ = c.host.write_wstr(d, desc);
+                let _ = c.host.write_wstr(m, module);
+            } else {
+                let _ = c.host.write_cstr(d, desc.as_bytes());
+                let _ = c.host.write_cstr(m, module.as_bytes());
+            }
+            if c.call_guest(cb, &[*g, d, m, ctx])? == 0 {
+                break;
+            }
         }
-        let _ = c.call_guest(cb, &[0, s, s + 48, ctx])?;
+        c.p.heap_free(block);
         Ok(Ret::stdcall(2, S_OK))
     };
     r.add(d, "DirectSoundEnumerateA", enumerate);

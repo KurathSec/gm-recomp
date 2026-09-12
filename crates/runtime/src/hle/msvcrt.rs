@@ -1276,9 +1276,150 @@ fn badioinfo_init(_base: u32) -> Vec<u8> {
     v
 }
 
+/// One of msvcrt's exported variables, allocated (and initialized) on first use.
+fn crt_var(c: &mut Ctx, name: &str) -> u32 {
+    let a = c.p.registry.data_export("msvcrt.dll", name).unwrap_or(0);
+    let g: &mut dyn Guest = &mut *c.host;
+    c.p.registry.flush_data(g);
+    a
+}
+
+/// __initenv: a pointer to an empty environment block that follows it.
+fn initenv_init(base: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 8];
+    v[..4].copy_from_slice(&(base + 4).to_le_bytes());
+    v
+}
+
+/// struct lconv of the "C" locale: ten string pointers, eight CHAR_MAX fields, then
+/// the strings "." and "".
+fn lconv_init(base: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 52];
+    for i in 0..10u32 {
+        let s = if i == 0 { base + 48 } else { base + 50 };
+        v[4 * i as usize..4 * i as usize + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    v[40..48].fill(127);
+    v[48] = b'.';
+    v
+}
+
+fn strerror_text(e: u32) -> &'static str {
+    match e {
+        0 => "No error",
+        1 => "Operation not permitted",
+        2 => "No such file or directory",
+        5 => "Input/output error",
+        9 => "Bad file descriptor",
+        12 => "Not enough space",
+        13 => "Permission denied",
+        17 => "File exists",
+        22 => "Invalid argument",
+        24 => "Too many open files",
+        28 => "No space left on device",
+        33 => "Domain error",
+        34 => "Result too large",
+        _ => "Unknown error",
+    }
+}
+
 pub fn register_more(r: &mut Registry) {
     let m = "msvcrt.dll";
     r.add_data(m, "_iob", 20 * 32, iob_init);
+    // What mingw's (and old MSVC's) startup code asks of msvcrt.
+    r.add_data(m, "__initenv", 8, initenv_init);
+    r.add_data(m, "_commode", 4, |_| vec![0; 4]);
+    r.add_data(m, "_fmode", 4, |_| vec![0; 4]);
+    r.add_data(m, "__mb_cur_max", 4, |_| 1u32.to_le_bytes().to_vec());
+    r.add_data(m, "__lconv", 52, lconv_init);
+    r.add_data(m, "__strerror_buf", 64, |_| vec![0; 64]);
+    r.add(m, "__set_app_type", |_c| ok(0));
+    r.add(m, "__setusermatherr", |_c| ok(0));
+    r.add(m, "_cexit", |_c| ok(0));
+    r.add(m, "__p___initenv", |c| ok(crt_var(c, "__initenv")));
+    r.add(m, "__p__commode", |c| ok(crt_var(c, "_commode")));
+    r.add(m, "__p__fmode", |c| ok(crt_var(c, "_fmode")));
+    r.add(m, "__p___mb_cur_max", |c| ok(crt_var(c, "__mb_cur_max")));
+    r.add(m, "__p__iob", |c| ok(crt_var(c, "_iob")));
+    r.add(m, "__iob_func", |c| ok(crt_var(c, "_iob")));
+    r.add(m, "localeconv", |c| ok(crt_var(c, "__lconv")));
+    r.add(m, "__getmainargs", |c| {
+        // argc, argv = { the exe's path }, envp = the empty environment
+        let (pargc, pargv, penv) = (c.arg(0), c.arg(1), c.arg(2));
+        let path = c.p.exe_path.clone();
+        let s = strdup(c, path.as_bytes());
+        let argv = alloc(c, 8, true);
+        let _ = c.host.write_u32(argv, s);
+        let env = crt_var(c, "__initenv");
+        let envp = c.host.read_u32(env).unwrap_or(0);
+        let _ = c.host.write_u32(pargc, 1);
+        let _ = c.host.write_u32(pargv, argv);
+        let _ = c.host.write_u32(penv, envp);
+        ok(0)
+    });
+    r.add(m, "signal", |_c| ok(0)); // SIG_DFL
+    r.add(m, "strerror", |c| {
+        let buf = crt_var(c, "__strerror_buf");
+        let text = strerror_text(c.arg(0));
+        write_cstr(c, buf, text.as_bytes());
+        ok(buf)
+    });
+    r.add(m, "strncmp", |c| {
+        let (a, b, n) = (c.arg(0), c.arg(1), c.arg(2));
+        for i in 0..n {
+            let (x, y) = (c.host.read_u8(a + i).unwrap_or(0), c.host.read_u8(b + i).unwrap_or(0));
+            if x != y {
+                return ok(if x < y { u32::MAX } else { 1 });
+            }
+            if x == 0 {
+                break;
+            }
+        }
+        ok(0)
+    });
+    r.add(m, "wcslen", |c| {
+        let p = c.arg(0);
+        let mut n = 0;
+        while c.host.read_u16(p + 2 * n).unwrap_or(0) != 0 {
+            n += 1;
+        }
+        ok(n)
+    });
+    r.add(m, "puts", |c| {
+        let s = c.str_arg(0);
+        c.p.log(format!("puts: {s}"));
+        ok(0)
+    });
+    r.add(m, "fputc", |c| {
+        let (ch, f) = (c.arg(0), c.arg(1));
+        match file_handle(c, f) {
+            Some(h) => {
+                super::kernel32::write_file(c, h, &[ch as u8]);
+            }
+            None => {
+                // stdout/stderr: logged a line at a time
+                if ch as u8 == b'\n' {
+                    let line = String::from_utf8_lossy(&std::mem::take(&mut c.p.crt_line)).into_owned();
+                    c.p.log(format!("stdout: {line}"));
+                } else {
+                    c.p.crt_line.push(ch as u8);
+                }
+            }
+        }
+        ok(ch & 0xFF)
+    });
+    r.add(m, "vfprintf", |c| {
+        let (f, fmt, va) = (c.arg(0), c.host.read_cstr(c.arg(1)).unwrap_or_default(), c.arg(2));
+        let mut va = VaList { p: va };
+        let out = format(c, &fmt, &mut va, false);
+        match file_handle(c, f) {
+            Some(h) => {
+                super::kernel32::write_file(c, h, &out);
+            }
+            None => c.p.log(format!("fprintf: {}", String::from_utf8_lossy(&out).trim_end())),
+        }
+        ok(out.len() as u32)
+    });
     r.add_data(m, "__pioinfo", 256 + 32 * 64, pioinfo_init);
     r.add_data(m, "__badioinfo", 64, badioinfo_init);
 

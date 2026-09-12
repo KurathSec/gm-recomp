@@ -1264,7 +1264,9 @@ impl<'a> FuncEmit<'a> {
                 self.set(L_REG + 4);
             }
             Bt | Bts | Btr | Btc => self.bit_test(instr),
-            Bsf | Bsr => {
+            // The CPUID we report has neither BMI1 nor LZCNT, so TZCNT/LZCNT (F3 0F BC/BD)
+            // run as BSF/BSR, as on the CPUs before them (compilers emit `rep bsf` for that).
+            Bsf | Bsr | Tzcnt | Lzcnt => {
                 let w = Self::op_width(instr, 0);
                 let r = instr.op0_register();
                 self.read_op(instr, 1, false);
@@ -1276,7 +1278,7 @@ impl<'a> FuncEmit<'a> {
                 self.get(L_T1);
                 self.i(W::If(BlockType::Empty));
                 self.depth += 1;
-                if instr.mnemonic() == Bsf {
+                if matches!(instr.mnemonic(), Bsf | Tzcnt) {
                     self.get(L_T1);
                     self.i(W::I32Ctz);
                 } else {

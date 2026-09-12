@@ -421,6 +421,9 @@ pub fn register(r: &mut Registry) {
     });
     r.add(u, "SetWindowTextA", |c| {
         let (hwnd, t) = (c.arg(0), c.str_arg(1));
+        if c.p.trace {
+            c.trace(format!("({t:?})"));
+        }
         if let Some(w) = c.p.windows.get_mut(&hwnd) { w.title = t; }
         ok(2, 1)
     });
@@ -1953,6 +1956,9 @@ pub fn register_more(r: &mut Registry) {
     r.add(u, "SetWindowTextW", |c| {
         let hwnd = c.arg(0);
         let t = wstr(c, c.arg(1));
+        if c.p.trace {
+            c.trace(format!("({t:?})"));
+        }
         if let Some(w) = c.p.windows.get_mut(&hwnd) {
             w.title = t;
         }

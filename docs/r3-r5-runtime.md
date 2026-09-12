@@ -30,6 +30,37 @@ code anywhere.
 - No shaded draw has been seen yet in the frames tested (the games draw their title
   screens fixed-function); the translator is checked by compiling every shader.
 
+## The R5 items that need a game situation
+
+Reached with test copies of the games (`tests/gms/testcopy.py`: the imported files
+symlinked, one bytecode word of `data.win` changed; recipes in the script) or a test
+program, rather than by playing there:
+
+- Box2D (Marathon's golf rooms, physics worlds with gravity 50 at 0.1 m/px): a copy
+  whose `startRoom` is `rGolfWond` (the golf autosave skipped; it needs state from
+  the stages before). In Chrome the hole loads, the power bar charges, the shot
+  counts, the ball flies in a spinning arc, lands on the hill and rolls back down
+  the slope.
+- Room speed changes: Crimson Needle 3's opening rooms say 30 fps, but its
+  `objWorld` sets `room_speed = 50` at every room start, so the game itself runs at
+  50 throughout (on Windows too). A copy that skips that assignment walks from the
+  50 fps menu into the 30 fps opening: frames go from 20 ms to 33/34 ms at the room
+  change, the game's timer ticks every 30 frames, and the browser paces it at 30.0
+  fps. A copy that sets 30 everywhere runs at 33.36 ms per frame.
+- Shaded draws: neither shader game uses one before you play some way in, so
+  `tests/d3d9/shader_test.c` (built and laid out as a game by
+  `tests/d3d9/make-test-game.sh`) compiles HLSL at run time with Wine's d3dcompiler,
+  draws through vs/ps 2.0 and 3.0 shaders (a mirroring matrix in constants, vertex
+  colour, point-sampled texture, dot, lerp, frac, a branch) into a render target,
+  reads it back and compares 16 pixels per pair with the CPU: PASS in Chrome and
+  Firefox. With a wrong expectation it reports FAIL (the check is live).
+
+Found on the way: GMS runners with OpenAL Soft's DirectSound backend (Crimson Needle
+3) found no sound device, since DirectSoundEnumerate listed only the primary driver
+(NULL GUID), which that backend skips; Windows lists the device itself too, and so do
+we now. mingw-built programs needed msvcrt's startup functions and run TZCNT/LZCNT as
+BSF/BSR (our CPUID has neither BMI1 nor LZCNT).
+
 ## Browser host
 
 - The page (`web/index.html`) lists the games from `games/index.json` (written by
@@ -201,8 +232,7 @@ the new room's code is translated then).
 
 ## Known gaps
 
-- Shaded draws are translated and compiled but not yet verified against Windows
-  output in a scene that uses them.
+- Shaded draws are verified with the test program above, not yet in a game scene.
 - CPUID does not report MMX (MMX is not lifted); code with an SSE or scalar fallback
   takes it.
 - x87 deviations in rare edges: fsqrt of extended-precision denormals, fidivr with

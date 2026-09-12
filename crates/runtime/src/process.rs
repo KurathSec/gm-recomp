@@ -371,6 +371,8 @@ pub struct Process {
     pub crt_locale: u32,
     /// AllocateLocallyUniqueId's counter.
     pub next_luid: u64,
+    /// Characters written to stdout one at a time (fputc), until the line ends.
+    pub crt_line: Vec<u8>,
     /// The millisecond of the clock the host was last asked to pace to.
     pub paced_ms: u64,
     /// The MIDI SoundFont, once the host supplied it (or failed to).
@@ -494,6 +496,7 @@ impl Process {
             crt_rand: 1,
             crt_locale: 0,
             next_luid: 0,
+            crt_line: Vec::new(),
             paced_ms: 0,
             timers_due: Vec::new(),
             pads: Default::default(),

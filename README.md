@@ -69,8 +69,8 @@ and the same input gives the same state hash in the harness, Node, Chrome and Fi
 |---|---|---|
 | Not Another Needle Game | GM 8.1 | mouse menus; New Game starts the game; music (supersound.dll on DirectSound) |
 | i wanna uhuhu spike | GM 8.0 | the kid runs and jumps in the hub; first stage; MP3 music (MCI), sound effects (DirectMusic) |
-| I wanna run the Marathon | GMS 1.4 VM | file select, hub, the marathon starts; title music from the GMS audio thread |
-| Crimson Needle 3 | GMS 1.4 VM | title, Shift to the save-file screen |
+| I wanna run the Marathon | GMS 1.4 VM | file select, hub, the marathon starts; title music from the GMS audio thread; Box2D golf (via a test copy) |
+| Crimson Needle 3 | GMS 1.4 VM | title, save select, new game (walk right into the opening); music |
 | indigo needle | GMS 1.4 VM + GMFile.dll | title room, the player moves (extension runs on Wine's msvcp100) |
 | untitled needle game | GMS 1.4 YYC | intro and tutorial: run, jump; shaders compiled by Wine's d3dcompiler |
 | RNG Dungeon | GMS 1.4 YYC | intro, file select, a save chosen; all 22 shaders translate to GLSL |
@@ -82,6 +82,10 @@ the native harness, `r3-r5-runtime.md` the browser runtime, audio, threads,
 Direct3D 9 and shaders).
 
 ## Tests
+
+`tests/d3d9/make-test-game.sh` builds a Direct3D 9 shader test that runs like a game
+(`game=zz-test-d3d9-shaders`); `tests/gms/` has tools for GMS `data.win` files (rooms,
+a rough GML bytecode lister, test copies with patched bytecode).
 
 ```sh
 cargo test --release                                   # unit tests

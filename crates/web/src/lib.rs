@@ -573,6 +573,14 @@ pub extern "C" fn run() -> i32 {
     ];
     let presents: Vec<&String> = p.log.iter().filter(|l| l.starts_with("Present #")).collect();
     lines.extend(presents.iter().skip(presents.len().saturating_sub(2)).map(|s| s.to_string()));
+    // What the guest printed and what the HLE flagged, as the harness shows them.
+    let mut seen = std::collections::HashSet::new();
+    let notable = p.log.iter().filter(|l| {
+        ["stdout:", "printf:", "puts:", "[", "exception", "MessageBox", "MCI", "DirectMusic"].iter().any(|k| l.starts_with(k))
+            || l.contains("not implemented")
+            || l.contains("not registered")
+    });
+    lines.extend(notable.filter(|l| seen.insert(l.as_str())).take(200).map(|s| s.to_string()));
     for l in lines {
         log(&l);
     }
