@@ -17,8 +17,12 @@ code anywhere.
 | untitled needle game | GMS 1.4 YYC | intro cutscene, tutorial: runs, jumps, falls into and climbs out of a pit; its shaders compile |
 | RNG Dungeon | GMS 1.4 YYC | intro, title, file select, a save chosen; all 22 shaders translate and compile as GLSL in Chrome |
 
-- All seven run 200 frames in the harness; the held-out games (Vandal, Bread) have not
-  been run (that is R6).
+- All seven run 300 frames in the harness.
+- R6, the held-out games, run for the first time after everything above was done and
+  with no change for them: I Wanna be the Vandal (GMS 1.4.9999) goes from its title to
+  the save select and a new game, I wanna Bread (GM 8.1, a Release Candidate runner)
+  from its title to the data select and its hub room. Chrome and Firefox end in the
+  same state hash; both hold 50.0 fps with frame intervals within ~1 ms of 20.
 - Harness, Node, Chrome and Firefox end the same run in the same state hash, threads
   and scripted input included. Every map in the runtime uses a fixed hasher, so
   iteration order (timers, windows) is the same in native and wasm builds. Parallel

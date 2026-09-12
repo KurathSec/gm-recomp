@@ -74,6 +74,8 @@ and the same input gives the same state hash in the harness, Node, Chrome and Fi
 | indigo needle | GMS 1.4 VM + GMFile.dll | title room, the player moves (extension runs on Wine's msvcp100) |
 | untitled needle game | GMS 1.4 YYC | intro and tutorial: run, jump; shaders compiled by Wine's d3dcompiler |
 | RNG Dungeon | GMS 1.4 YYC | intro, file select, a save chosen; all 22 shaders translate to GLSL |
+| I Wanna be the Vandal | GMS 1.4 VM | held out until the end: title, save select, new game, out of the box |
+| I wanna Bread | GM 8.1 (Release Candidate runner) | held out until the end: title, data select, the hub room, out of the box |
 
 See `docs/` for each milestone's notes (`r1-cpu.md` CPU and tests, `r2-harness.md`
 the native harness, `r3-r5-runtime.md` the browser runtime, audio, threads,
