@@ -189,10 +189,12 @@ impl Ctx<'_> {
         }
     }
     /// A clock read. Back-to-back reads with no other work in between (a spin-wait on
-    /// the time) advance the clock in doubling steps of 1..128 µs, so polling loops
-    /// end deterministically without skipping far past their deadline.
+    /// the time) advance the clock in doubling steps of 1..4 µs, so polling loops end
+    /// deterministically, close to their deadline: GMS 1.4 spins the last ~11 ms of
+    /// every frame and measures the next frame from where the spin ended, so coarser
+    /// steps slow it down (128 µs steps ran it at 49 fps).
     pub fn poll_clock(&mut self) {
-        let step = 1u64 << self.p.idle_streak.min(7);
+        let step = 1u64 << self.p.idle_streak.min(2);
         self.p.idle_streak += 1;
         self.advance_clock(step);
     }
