@@ -50,8 +50,10 @@ harness run <game dir> [--frames N] [--trace] [--aot] [--seconds S] [--recent K]
 
 All clocks read one virtual clock. `Sleep`, waits and idle message loops advance it.
 Clock reads issued back to back with no other API in between (a spin-wait on the time,
-as GM8's frame limiter does) advance it in doubling steps of 1..128 µs, so polling
-loops end deterministically and overshoot their deadline by at most 128 µs.
+as GM8's frame limiter does) advance it in doubling steps of 1..4 µs, so polling
+loops end deterministically and overshoot their deadline by at most 4 µs (GMS 1.4
+spins the last ~11 ms of each frame and times the next one from where the spin
+ended; 128 µs steps had it running at 49 fps).
 DirectSound play cursors and notification events follow the same clock.
 
 ## Findings worth keeping
