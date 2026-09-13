@@ -373,6 +373,8 @@ pub struct Process {
     pub next_luid: u64,
     /// Characters written to stdout one at a time (fputc), until the line ends.
     pub crt_line: Vec<u8>,
+    /// Each module's resource directory, parsed once (by module base).
+    pub resources: HashMap<u32, std::rc::Rc<Vec<pe::Resource>>>,
     /// Keypad keys held (by VK_NUMPAD0.., VK_DECIMAL last) and the key each was sent as.
     pub numpad_sent: [u8; 11],
     /// Shift keys (bit 0 left, bit 1 right) held but released for the keypad: Windows
@@ -503,6 +505,7 @@ impl Process {
             crt_locale: 0,
             next_luid: 0,
             crt_line: Vec::new(),
+            resources: HashMap::default(),
             numpad_sent: [0; 11],
             numpad_shift: 0,
             paced_ms: 0,

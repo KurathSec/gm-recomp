@@ -2226,9 +2226,18 @@ fn res_match(id: &pe::ResId, a: &ResArg) -> bool {
 /// Locates a resource in a mapped image: (guest address, size).
 pub fn find_resource(c: &mut Ctx, hmod: u32, kind: &ResArg, name: &ResArg) -> Option<(u32, u32)> {
     let base = if hmod == 0 { c.p.modules.first().map(|m| m.base).unwrap_or(0) } else { hmod };
-    let m = c.p.module_by_base(base)?;
-    let pe = pe::Pe::parse(&m.file).ok()?;
-    let res = pe.resources().ok()?;
+    // Delphi programs load resource strings all the time (number formatting): the
+    // directory is parsed once per module.
+    let res = match c.p.resources.get(&base) {
+        Some(r) => r.clone(),
+        None => {
+            let m = c.p.module_by_base(base)?;
+            let list = pe::Pe::parse(&m.file).ok().and_then(|pe| pe.resources().ok()).unwrap_or_default();
+            let list = std::rc::Rc::new(list);
+            c.p.resources.insert(base, list.clone());
+            list
+        }
+    };
     let r = res.iter().find(|r| res_match(&r.kind, kind) && res_match(&r.name, name))?;
     Some((base + r.rva, r.size))
 }

@@ -5,6 +5,7 @@
 
 use super::audio::{self, Pcm, Source};
 use super::{ApiResult, Ctx, Ret};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -71,20 +72,45 @@ pub struct McDevice {
 
 /// Decoded media: a sound, or a MIDI file's length.
 pub struct Media {
-    pub pcm: Pcm,
+    /// Samples decoded so far (all of them for a wave file).
+    pub pcm: RefCell<Pcm>,
+    /// A compressed file's decoder, which runs ahead of playback (decoding a whole
+    /// song at once stalled the frame it started in), and the file's length.
+    stream: RefCell<Option<Stream>>,
+    total: Option<std::cell::Cell<u64>>,
     pub midi_us: Option<u64>,
     pub midi: Option<std::sync::Arc<rustysynth::MidiFile>>,
 }
 
 impl Media {
+    fn new(pcm: Pcm, midi_us: Option<u64>, midi: Option<std::sync::Arc<rustysynth::MidiFile>>) -> Self {
+        Media { pcm: RefCell::new(pcm), stream: RefCell::new(None), total: None, midi_us, midi }
+    }
     /// Frame rate positions count in (MIDI: microseconds as "frames").
     fn rate(&self) -> f64 {
-        if self.midi_us.is_some() { 1e6 } else { self.pcm.rate.max(1) as f64 }
+        if self.midi_us.is_some() { 1e6 } else { self.pcm.borrow().rate.max(1) as f64 }
     }
     fn frames(&self) -> f64 {
         match self.midi_us {
             Some(us) => us as f64,
-            None => self.pcm.frames() as f64,
+            None => self.total.as_ref().map(|t| t.get()).unwrap_or_else(|| self.pcm.borrow().frames()) as f64,
+        }
+    }
+    /// Decodes until the first `frames` frames exist (or the file ends).
+    fn ensure(&self, frames: u64) {
+        let mut stream = self.stream.borrow_mut();
+        let Some(st) = stream.as_mut() else { return };
+        let mut pcm = self.pcm.borrow_mut();
+        while pcm.frames() < frames {
+            if st.decode_next(&mut pcm.samples).is_none() {
+                // the end: the decoded length is the length (it differs from the scan
+                // only if packets inside the file fail to decode)
+                if let Some(t) = &self.total {
+                    t.set(pcm.frames());
+                }
+                *stream = None;
+                break;
+            }
         }
     }
     fn ms(&self, frames: f64) -> u32 {
@@ -92,44 +118,96 @@ impl Media {
     }
 }
 
-/// Decodes an MP3 (or anything else the decoder recognizes).
-pub fn decode_compressed(bytes: Vec<u8>) -> Result<Pcm, String> {
-    use symphonia::core::codecs::audio::AudioDecoderOptions;
-    use symphonia::core::formats::probe::Hint;
-    use symphonia::core::formats::{FormatOptions, TrackType};
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
-    let mut format = symphonia::default::get_probe()
-        .probe(&Hint::new(), mss, FormatOptions::default(), MetadataOptions::default())
-        .map_err(|e| e.to_string())?;
-    let track = format.default_track(TrackType::Audio).ok_or("no audio track")?;
-    let params = track.codec_params.as_ref().and_then(|p| p.audio()).ok_or("no audio parameters")?;
-    let mut rate = params.sample_rate.unwrap_or(0);
-    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default()).map_err(|e| e.to_string())?;
-    let id = track.id;
-    let mut samples = Vec::new();
-    let mut buf: Vec<f32> = Vec::new();
-    while let Ok(Some(packet)) = format.next_packet() {
-        if packet.track_id != id {
-            continue;
+/// A compressed file (MP3, or anything else the decoder recognizes) being decoded.
+struct Stream {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+    track: u32,
+    buf: Vec<f32>,
+}
+
+impl Stream {
+    /// The decoder and the stream's sample rate, from the file's first packets.
+    fn open(bytes: Vec<u8>) -> Result<(Stream, u32), String> {
+        use symphonia::core::codecs::audio::AudioDecoderOptions;
+        use symphonia::core::formats::probe::Hint;
+        use symphonia::core::formats::{FormatOptions, TrackType};
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
+        let format = symphonia::default::get_probe()
+            .probe(&Hint::new(), mss, FormatOptions::default(), MetadataOptions::default())
+            .map_err(|e| e.to_string())?;
+        let track = format.default_track(TrackType::Audio).ok_or("no audio track")?;
+        let params = track.codec_params.as_ref().and_then(|p| p.audio()).ok_or("no audio parameters")?;
+        let rate = params.sample_rate.unwrap_or(0);
+        let decoder = symphonia::default::get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default()).map_err(|e| e.to_string())?;
+        let track = track.id;
+        Ok((Stream { format, decoder, track, buf: Vec::new() }, rate))
+    }
+
+    /// Appends the next packet's frames (stereo) to `out`; the frames the packet
+    /// stands for (its duration less the encoder delay and padding trimmed from it;
+    /// a packet that fails to decode adds nothing), or None at the end.
+    fn decode_next(&mut self, out: &mut Vec<f32>) -> Option<u64> {
+        loop {
+            let Ok(Some(packet)) = self.format.next_packet() else { return None };
+            if packet.track_id != self.track {
+                continue;
+            }
+            let dur = frames_of(&packet);
+            let Ok(decoded) = self.decoder.decode(&packet) else { return Some(dur) };
+            let channels = decoded.spec().channels().count().max(1);
+            self.buf.resize(decoded.samples_interleaved(), 0.0);
+            decoded.copy_to_slice_interleaved(&mut self.buf);
+            for f in self.buf.chunks_exact(channels) {
+                let l = f[0];
+                out.push(l);
+                out.push(if channels >= 2 { f[1] } else { l });
+            }
+            return Some(dur);
         }
-        let Ok(decoded) = decoder.decode(&packet) else { continue };
-        let channels = decoded.spec().channels().count().max(1);
-        rate = decoded.spec().rate();
-        buf.resize(decoded.samples_interleaved(), 0.0);
-        decoded.copy_to_slice_interleaved(&mut buf);
-        for f in buf.chunks_exact(channels) {
-            let l = f[0];
-            let r = if channels >= 2 { f[1] } else { l };
-            samples.push(l);
-            samples.push(r);
+    }
+}
+
+/// What a packet decodes to: its duration less the trimmed encoder delay/padding.
+fn frames_of(p: &symphonia::core::packet::Packet) -> u64 {
+    p.dur.get().saturating_sub(p.trim_start.get() + p.trim_end.get())
+}
+
+/// Opens a compressed file for decoding as it plays: its rate, and its length in
+/// frames from a scan of its packets (no decoding).
+fn open_compressed(bytes: Vec<u8>) -> Result<Media, String> {
+    let (mut scan, rate) = Stream::open(bytes.clone())?;
+    let mut total = 0u64;
+    while let Ok(Some(packet)) = scan.format.next_packet() {
+        if packet.track_id == scan.track {
+            total += frames_of(&packet);
         }
     }
     if rate == 0 {
         return Err("no sample rate".into());
     }
-    Ok(Pcm { samples, rate })
+    // A packet at the start can fail to decode (an MP3 frame whose bit reservoir
+    // starts before the file does): decode the first few now and count those out.
+    let (mut stream, _) = Stream::open(bytes)?;
+    let mut samples = Vec::new();
+    let mut ended = false;
+    for _ in 0..8 {
+        let before = samples.len() / 2;
+        match stream.decode_next(&mut samples) {
+            Some(dur) => total -= dur.saturating_sub((samples.len() / 2 - before) as u64).min(total),
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    if ended {
+        total = (samples.len() / 2) as u64;
+    }
+    let stream = if ended { None } else { Some(stream) };
+    Ok(Media { pcm: RefCell::new(Pcm { samples, rate }), stream: RefCell::new(stream), total: Some(std::cell::Cell::new(total)), midi_us: None, midi: None })
 }
 
 /// Opens (and decodes, once per file) an element.
@@ -141,21 +219,21 @@ fn load_media(c: &mut Ctx, element: &str) -> Option<Rc<Media>> {
     let bytes = c.p.fs.read_all(&key)?;
     let media = if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
         match audio::parse_wav(&bytes) {
-            Ok(pcm) => Media { pcm, midi_us: None, midi: None },
+            Ok(pcm) => Media::new(pcm, None, None),
             Err(e) => {
                 c.p.log(format!("MCI: {element}: {e}"));
-                Media { pcm: Pcm::default(), midi_us: Some(0), midi: None }
+                Media::new(Pcm::default(), Some(0), None)
             }
         }
     } else if bytes.starts_with(b"MThd") || bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"RMID") {
         let smf = if bytes.starts_with(b"RIFF") { bytes.get(20..).unwrap_or(&[]).to_vec() } else { bytes };
-        Media { pcm: Pcm::default(), midi_us: Some(super::dmusic::midi_length_us(&smf).unwrap_or(0)), midi: super::midi::parse(&smf) }
+        Media::new(Pcm::default(), Some(super::dmusic::midi_length_us(&smf).unwrap_or(0)), super::midi::parse(&smf))
     } else {
-        match decode_compressed(bytes) {
-            Ok(pcm) => Media { pcm, midi_us: None, midi: None },
+        match open_compressed(bytes) {
+            Ok(m) => m,
             Err(e) => {
                 c.p.log(format!("MCI: {element}: cannot decode ({e})"));
-                Media { pcm: Pcm::default(), midi_us: Some(0), midi: None }
+                Media::new(Pcm::default(), Some(0), None)
             }
         }
     };
@@ -165,7 +243,7 @@ fn load_media(c: &mut Ctx, element: &str) -> Option<Rc<Media>> {
 }
 
 fn open(c: &mut Ctx, element: &str, alias: &str) -> Result<u32, u32> {
-    let media = if element.is_empty() { Rc::new(Media { pcm: Pcm::default(), midi_us: Some(0), midi: None }) } else { load_media(c, element).ok_or(MCIERR_FILE_NOT_FOUND)? };
+    let media = if element.is_empty() { Rc::new(Media::new(Pcm::default(), Some(0), None)) } else { load_media(c, element).ok_or(MCIERR_FILE_NOT_FOUND)? };
     c.p.next_mci += 1;
     let id = c.p.next_mci;
     let to = media.frames();
@@ -254,7 +332,11 @@ pub fn tick(c: &mut Ctx) {
             super::midi::render(&mut p.mixer, player, t0, now, volume);
         }
         if d.media.midi_us.is_none() && total > 0.0 {
-            let pcm = &d.media.pcm;
+            // decoded half a second past where this mix ends
+            let ahead = d.pos + (now - t0) as f64 * rate / 1e6 + rate / 2.0;
+            d.media.ensure((ahead.ceil() as u64).min(total as u64));
+            let pcm = d.media.pcm.borrow();
+            let pcm = &*pcm;
             let read = |i: u64| pcm.frame(i);
             let src = Source { frame: &read, frames: d.to.ceil() as u64, freq: pcm.rate, looping: d.repeat, volume, pan: 0 };
             audio::mix_source(&mut p.mixer, &src, d.pos, t0, now);
