@@ -281,9 +281,11 @@
           if (audioStarted || !audio) return;
           audioStarted = true;
           try {
-            const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 'interactive' });
+            const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 0.005 }); // as low as the system allows
             await ctx.audioWorklet.addModule('src/audio-worklet.js');
-            const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames } });
+            // the queue starts at what the system's audio period needs (see the worklet)
+            const latency = Math.max(0.015, (ctx.baseLatency || 0) + 0.01);
+            const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames, latency } });
             node.connect(ctx.destination);
             audioNode = node;
             // Skip what piled up before the user enabled sound.
@@ -300,7 +302,7 @@
           audioNode.port.onmessage = ({ data: a }) => {
             const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
             const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
-            res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
+            res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms, base latency ${((audioNode.context.baseLatency ?? 0) * 1000).toFixed(1)} ms, target ${(a.target * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
           };
           audioNode.port.postMessage(0);
         });

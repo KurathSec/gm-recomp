@@ -181,6 +181,9 @@ impl Ctx<'_> {
         // the next frame.
         if self.p.current == 0 && self.p.clock_us / 1000 != self.p.paced_ms {
             self.p.paced_ms = self.p.clock_us / 1000;
+            // The sound mixed so far goes out now, not only at the next Present: the
+            // host's buffer can stay small and a sound starts sooner after its frame.
+            dsound::flush_audio(self);
             self.host.pace(self.p.clock_us);
         }
         dsound::tick(self);
