@@ -111,7 +111,8 @@ pub trait Host: Guest {
 
 #[derive(Debug, Clone, Copy)]
 pub enum InputEvent {
-    /// Virtual-key code, scan code (with 0x100 for extended keys), pressed.
+    /// Virtual-key code, scan code (with 0x100 for extended keys; 0x200 when the
+    /// host's NumLock is on, which decides what the numeric keypad sends), pressed.
     Key { vk: u8, scan: u16, down: bool },
     /// Client coordinates of the game window and the button state (bit 0 left,
     /// bit 1 right, bit 2 middle).

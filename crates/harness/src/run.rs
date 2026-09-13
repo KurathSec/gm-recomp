@@ -38,7 +38,7 @@ pub struct RunOpts {
     /// Write the whole guest memory to this file when the run stops.
     pub dump_mem: Option<PathBuf>,
     /// Scripted key events: (after frame, virtual-key code, pressed).
-    pub keys: Vec<(u64, u8, bool)>,
+    pub keys: Vec<(u64, u8, bool, u16)>,
     /// Scripted mouse state: (after frame, x, y, buttons).
     pub mouse: Vec<(u64, i32, i32, u32)>,
     /// Write the mixed sound output to this WAV file.
@@ -58,7 +58,7 @@ struct Hd {
     linker: Option<Linker<Hd>>,
     t0: Instant,
     /// Scripted input not delivered yet, by frame.
-    keys: Vec<(u64, u8, bool)>,
+    keys: Vec<(u64, u8, bool, u16)>,
     mouse: Vec<(u64, i32, i32, u32)>,
     /// The MIDI SoundFont was handed over (or there is none).
     soundfont_given: bool,
@@ -183,11 +183,11 @@ impl<C: Cx> Machine for Wt<'_, C> {
     }
     fn take_input(&mut self, frame: u64) -> Vec<runtime::InputEvent> {
         let hd = self.cx.hd();
-        let due: Vec<(u64, u8, bool)> = hd.keys.iter().copied().filter(|k| k.0 <= frame).collect();
+        let due: Vec<(u64, u8, bool, u16)> = hd.keys.iter().copied().filter(|k| k.0 <= frame).collect();
         hd.keys.retain(|k| k.0 > frame);
         let mice: Vec<(u64, i32, i32, u32)> = hd.mouse.iter().copied().filter(|k| k.0 <= frame).collect();
         hd.mouse.retain(|k| k.0 > frame);
-        let mut out: Vec<runtime::InputEvent> = due.into_iter().map(|(_, vk, down)| runtime::InputEvent::Key { vk, scan: 0, down }).collect();
+        let mut out: Vec<runtime::InputEvent> = due.into_iter().map(|(_, vk, down, scan)| runtime::InputEvent::Key { vk, scan, down }).collect();
         out.extend(mice.into_iter().map(|(_, x, y, buttons)| runtime::InputEvent::Mouse { x, y, buttons }));
         out
     }

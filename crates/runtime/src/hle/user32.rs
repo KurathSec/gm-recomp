@@ -1276,46 +1276,112 @@ pub fn send_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> Resul
 
 /// Applies input from the host: key state, key messages to the focus window, mouse
 /// position and button messages.
+/// A key's state change and its message to the focus window.
+fn key_event(c: &mut Ctx, vk: u8, scan: u16, down: bool) {
+    let k = &mut c.p.key_state[vk as usize];
+    let was_down = *k & 0x80 != 0;
+    if down {
+        if !was_down {
+            *k ^= 1;
+        }
+        *k |= 0x80;
+    } else {
+        *k &= !0x80;
+    }
+    // Generic modifiers follow their left/right keys.
+    for (generic, l, r) in [(0x10usize, 0xA0usize, 0xA1usize), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)] {
+        if vk as usize == l || vk as usize == r {
+            let any = (c.p.key_state[l] | c.p.key_state[r]) & 0x80;
+            c.p.key_state[generic] = (c.p.key_state[generic] & 1) | any;
+        }
+    }
+    let target = if c.p.focus != 0 { c.p.focus } else { c.p.active };
+    if target == 0 {
+        return;
+    }
+    let msg_vk = match vk {
+        0xA0 | 0xA1 => 0x10,
+        0xA2 | 0xA3 => 0x11,
+        0xA4 | 0xA5 => 0x12,
+        v => v,
+    } as u32;
+    let ext = if scan & 0x100 != 0 { 1 << 24 } else { 0 };
+    let lp = 1 | ((scan as u32 & 0xFF) << 16) | ext | if down { if was_down { 1 << 30 } else { 0 } } else { 0xC000_0000 };
+    post_message(c, target, if down { WM_KEYDOWN } else { 0x0101 }, msg_vk, lp);
+}
+
+/// Keypad keys: VK_NUMPAD0..9, VK_DECIMAL.
+fn numpad_index(vk: u8) -> Option<usize> {
+    match vk {
+        0x60..=0x69 => Some((vk - 0x60) as usize),
+        0x6E => Some(10),
+        _ => None,
+    }
+}
+
+/// What each keypad key is without NumLock: Insert, End, Down, Page Down, Left,
+/// Clear, Right, Home, Up, Page Up, Delete.
+const NUMPAD_NAV: [u8; 11] = [0x2D, 0x23, 0x28, 0x22, 0x25, 0x0C, 0x27, 0x24, 0x26, 0x21, 0x2E];
+const SHIFTS: [(u8, u8, u16); 2] = [(1, 0xA0, 0x2A), (2, 0xA1, 0x36)];
+
+/// A keypad key as Windows' keyboard layout delivers it: a digit with NumLock on, a
+/// navigation key with it off; with NumLock on and Shift held, a navigation key
+/// with Shift released first and pressed again once the keypad key is let go (I
+/// Wanna players use this for one-frame jump releases and presses).
+fn numpad_key(c: &mut Ctx, i: usize, vk: u8, scan: u16, down: bool, numlock: bool) {
+    if down {
+        let shifts = SHIFTS.iter().filter(|s| c.p.key_state[s.1 as usize] & 0x80 != 0).fold(0, |m, s| m | s.0);
+        if numlock && shifts != 0 {
+            for &(bit, svk, sscan) in &SHIFTS {
+                if shifts & bit != 0 {
+                    key_event(c, svk, sscan, false);
+                }
+            }
+            c.p.numpad_shift |= shifts;
+        }
+        let sent = if !numlock || shifts != 0 { NUMPAD_NAV[i] } else { vk };
+        c.p.numpad_sent[i] = sent;
+        key_event(c, sent, scan, true);
+    } else {
+        let sent = match c.p.numpad_sent[i] {
+            0 => if numlock { vk } else { NUMPAD_NAV[i] },
+            v => v,
+        };
+        c.p.numpad_sent[i] = 0;
+        key_event(c, sent, scan, false);
+        if c.p.numpad_shift != 0 && c.p.numpad_sent.iter().all(|&v| v == 0) {
+            let shifts = std::mem::take(&mut c.p.numpad_shift);
+            for &(bit, svk, sscan) in &SHIFTS {
+                if shifts & bit != 0 {
+                    key_event(c, svk, sscan, true);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn pump_input(c: &mut Ctx) {
     let frame = c.p.frames_presented;
     let events = c.host.poll_input(frame);
     for ev in events {
         match ev {
             super::InputEvent::Key { vk, scan, down } => {
+                let numlock = scan & 0x200 != 0;
+                let scan = scan & 0x1FF;
+                // DirectInput sees the physical key
                 let dik = (scan & 0x7F) as usize | if scan & 0x100 != 0 { 0x80 } else { 0 };
                 if scan & 0xFF != 0 {
                     c.p.dik[dik] = if down { 0x80 } else { 0 };
                 }
-                let k = &mut c.p.key_state[vk as usize];
-                let was_down = *k & 0x80 != 0;
-                if down {
-                    if !was_down {
-                        *k ^= 1;
-                    }
-                    *k |= 0x80;
+                c.p.key_state[0x90] = (c.p.key_state[0x90] & 0x80) | numlock as u8;
+                if let Some(i) = numpad_index(vk).filter(|_| scan & 0x100 == 0) {
+                    numpad_key(c, i, vk, scan, down, numlock);
+                } else if matches!(vk, 0xA0 | 0xA1) && !down && c.p.numpad_shift & (1 << (vk - 0xA0)) != 0 {
+                    // a Shift the keypad already released
+                    c.p.numpad_shift &= !(1 << (vk - 0xA0));
                 } else {
-                    *k &= !0x80;
+                    key_event(c, vk, scan, down);
                 }
-                // Generic modifiers follow their left/right keys.
-                for (generic, l, r) in [(0x10usize, 0xA0usize, 0xA1usize), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)] {
-                    if vk as usize == l || vk as usize == r {
-                        let any = (c.p.key_state[l] | c.p.key_state[r]) & 0x80;
-                        c.p.key_state[generic] = (c.p.key_state[generic] & 1) | any;
-                    }
-                }
-                let target = if c.p.focus != 0 { c.p.focus } else { c.p.active };
-                if target == 0 {
-                    continue;
-                }
-                let msg_vk = match vk {
-                    0xA0 | 0xA1 => 0x10,
-                    0xA2 | 0xA3 => 0x11,
-                    0xA4 | 0xA5 => 0x12,
-                    v => v,
-                } as u32;
-                let ext = if scan & 0x100 != 0 { 1 << 24 } else { 0 };
-                let lp = 1 | ((scan as u32 & 0xFF) << 16) | ext | if down { if was_down { 1 << 30 } else { 0 } } else { 0xC000_0000 };
-                post_message(c, target, if down { WM_KEYDOWN } else { 0x0101 }, msg_vk, lp);
             }
             super::InputEvent::Pad { index, connected, buttons, triggers, thumbs } => {
                 if let Some(pad) = c.p.pads.get_mut(index as usize) {

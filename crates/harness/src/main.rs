@@ -115,7 +115,8 @@ enum Cmd {
         /// Write the guest memory image to this file at the end.
         #[arg(long)]
         dump_mem: Option<PathBuf>,
-        /// Scripted key event after a frame: frame:vk:down (vk in hex, down 1/0), repeatable.
+        /// Scripted key event after a frame: frame:vk:down[:scan] (vk and scan in hex, down
+        /// 1/0; scan 0x200 marks NumLock on), repeatable.
         #[arg(long)]
         key: Vec<String>,
         /// Scripted mouse state after a frame: frame:x:y:buttons, repeatable.
@@ -181,8 +182,9 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|k| {
                     let p: Vec<&str> = k.split(':').collect();
-                    anyhow::ensure!(p.len() == 3, "--key wants frame:vk:down");
-                    Ok((p[0].parse()?, u8::from_str_radix(p[1].trim_start_matches("0x"), 16)?, p[2] == "1"))
+                    anyhow::ensure!(p.len() == 3 || p.len() == 4, "--key wants frame:vk:down[:scan]");
+                    let scan = if p.len() == 4 { u16::from_str_radix(p[3].trim_start_matches("0x"), 16)? } else { 0 };
+                    Ok((p[0].parse()?, u8::from_str_radix(p[1].trim_start_matches("0x"), 16)?, p[2] == "1", scan))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let dump = dump

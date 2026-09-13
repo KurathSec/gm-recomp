@@ -373,6 +373,12 @@ pub struct Process {
     pub next_luid: u64,
     /// Characters written to stdout one at a time (fputc), until the line ends.
     pub crt_line: Vec<u8>,
+    /// Keypad keys held (by VK_NUMPAD0.., VK_DECIMAL last) and the key each was sent as.
+    pub numpad_sent: [u8; 11],
+    /// Shift keys (bit 0 left, bit 1 right) held but released for the keypad: Windows
+    /// lets go of Shift while a keypad key is down with NumLock on (so it arrives as
+    /// an unshifted navigation key) and presses it again afterwards.
+    pub numpad_shift: u8,
     /// The millisecond of the clock the host was last asked to pace to.
     pub paced_ms: u64,
     /// The MIDI SoundFont, once the host supplied it (or failed to).
@@ -497,6 +503,8 @@ impl Process {
             crt_locale: 0,
             next_luid: 0,
             crt_line: Vec::new(),
+            numpad_sent: [0; 11],
+            numpad_shift: 0,
             paced_ms: 0,
             timers_due: Vec::new(),
             pads: Default::default(),

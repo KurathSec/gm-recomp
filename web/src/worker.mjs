@@ -11,7 +11,8 @@ function handleInput(data) {
   if (!input) return early.push(data);
   if (data.type === 'key') {
     const k = KEYS[data.code];
-    if (k) input.key(k[0], k[1], data.down, data.t);
+    // the NumLock state decides what the keypad sends (see the runtime's numpad_key)
+    if (k) input.key(k[0], k[1] | (data.numlock ? 0x200 : 0), data.down, data.t);
   } else if (data.type === 'mouse') {
     input.mouse(data.x, data.y, data.buttons, data.t);
   } else if (data.type === 'pad') {
@@ -60,7 +61,7 @@ self.onmessage = async ({ data }) => {
       for (const [f, code, a, b, c] of script) {
         if (f !== frame) continue;
         if (code === 'mouse') handleInput({ type: 'mouse', x: a, y: b, buttons: c });
-        else handleInput({ type: 'key', code, down: a });
+        else handleInput({ type: 'key', code, down: a, numlock: b });
       }
       if (!want.has(frame)) return;
       const png = await gpu.snapshot();

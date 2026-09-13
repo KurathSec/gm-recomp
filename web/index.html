@@ -184,7 +184,7 @@
         const script = (q.get('script') ?? '').split(',').filter(Boolean).map((s) => {
           const p = s.split(':');
           if (p[1] === 'mouse') return [Number(p[0]), 'mouse', Number(p[2]), Number(p[3]), Number(p[4])];
-          return [Number(p[0]), p[1], p[2] === '1'];
+          return [Number(p[0]), p[1], p[2] === '1', p[3] === 'n']; // frame:code:1|0[:n = NumLock on]
         });
 
         document.getElementById('player').hidden = false;
@@ -355,7 +355,8 @@
             if (e.target instanceof HTMLInputElement) return;
             if (gameKeys.test(e.code) && !e.metaKey && e.code !== 'F11') e.preventDefault();
             if (e.repeat) return;
-            w.postMessage({ type: 'key', code: e.code, down: type === 'keydown', t: performance.timeOrigin + e.timeStamp });
+            const numlock = e.getModifierState ? e.getModifierState('NumLock') : true;
+            w.postMessage({ type: 'key', code: e.code, down: type === 'keydown', numlock, t: performance.timeOrigin + e.timeStamp });
           });
         }
         window.addEventListener('blur', () => {
