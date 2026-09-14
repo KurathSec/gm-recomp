@@ -14,36 +14,19 @@ use wasm_encoder::ValType;
 pub const RESOLVE_CACHE: u32 = 0x7F20_0000;
 pub const RESOLVE_CACHE_BITS: u32 = 16;
 pub const RESOLVE_CACHE_SIZE: u32 = 8 << RESOLVE_CACHE_BITS;
-const RESOLVE_HASH: u32 = 0x9E37_79B1;
+/// Event counters translated code bumps when `Options::count` is on (debugging): u32
+/// each, indexed by `COUNT_*`, right after the resolve cache.
+pub const COUNTERS: u32 = RESOLVE_CACHE + RESOLVE_CACHE_SIZE;
+pub const COUNT_ENTRIES: u32 = 0;
+pub const COUNT_CALLS: u32 = 1;
+pub const COUNT_X87: u32 = 2;
+pub const COUNT_RESOLVES: u32 = 3;
+pub const COUNT_NAMES: [&str; 4] = ["function entries", "calls", "x87 instructions", "resolve probes"];
+pub const RESOLVE_HASH: u32 = 0x9E37_79B1;
 
 /// Byte offset of the cache entry for `addr` (what translated code computes).
 pub fn resolve_slot(addr: u32) -> u32 {
     (addr.wrapping_mul(RESOLVE_HASH) >> (32 - RESOLVE_CACHE_BITS)) << 3
-}
-
-/// The probe: [addr] -> [table index], calling `rt.resolve` (import 0) on a miss.
-/// `a` and `o` are scratch i32 locals.
-pub fn emit_resolve(f: &mut wasm_encoder::Function, a: u32, o: u32) {
-    use wasm_encoder::{BlockType, Instruction as W, MemArg};
-    let at = |off: u32| MemArg { offset: off as u64, align: 2, memory_index: 0 };
-    f.instruction(&W::LocalTee(a));
-    f.instruction(&W::I32Const(RESOLVE_HASH as i32));
-    f.instruction(&W::I32Mul);
-    f.instruction(&W::I32Const((32 - RESOLVE_CACHE_BITS) as i32));
-    f.instruction(&W::I32ShrU);
-    f.instruction(&W::I32Const(3));
-    f.instruction(&W::I32Shl);
-    f.instruction(&W::LocalTee(o));
-    f.instruction(&W::I32Load(at(RESOLVE_CACHE)));
-    f.instruction(&W::LocalGet(a));
-    f.instruction(&W::I32Eq);
-    f.instruction(&W::If(BlockType::Result(ValType::I32)));
-    f.instruction(&W::LocalGet(o));
-    f.instruction(&W::I32Load(at(RESOLVE_CACHE + 4)));
-    f.instruction(&W::Else);
-    f.instruction(&W::LocalGet(a));
-    f.instruction(&W::Call(RtFunc::Resolve as u32));
-    f.instruction(&W::End);
 }
 
 pub const CPU_MODULE: &str = "cpu";
@@ -162,7 +145,8 @@ pub mod trap {
 
 /// Type indices inside every generated module.
 pub mod types {
-    /// `() -> ()`: translated guest functions, cpuid, rdtsc.
+    /// `(eax, ecx, edx, ebx, esp, ebp, esi, edi) -> (the same)`: translated guest
+    /// functions take the registers and return them.
     pub const FUNC: u32 = 0;
     /// `(i32) -> i32`: resolve.
     pub const RESOLVE: u32 = 1;
@@ -172,6 +156,8 @@ pub mod types {
     pub const FPU: u32 = 3;
     /// `(i32, i32) -> i32`: the x87 module's fast paths.
     pub const X87: u32 = 4;
+    /// `() -> ()`: cpuid, rdtsc.
+    pub const VOID: u32 = 5;
 }
 
 pub fn export_name(entry_va: u32) -> String {

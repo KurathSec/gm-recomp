@@ -4,7 +4,7 @@
 
 import { D3DGL } from './gpu.mjs';
 
-const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset'];
+const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call'];
 const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 
 /**
@@ -304,7 +304,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // The cpu glue module: guest memory, CPU-state globals and their accessors.
   const glueLen = x.glue_build(1024);
   const glueBytes = mem().slice(x.glue_ptr(), x.glue_ptr() + glueLen);
-  glue = new WebAssembly.Instance(new WebAssembly.Module(glueBytes), { rt: { memory: x.memory } });
+  glue = new WebAssembly.Instance(new WebAssembly.Module(glueBytes), { rt: { memory: x.memory, table } });
   const glueBase = table.grow(GLUE_FUNCS.length);
   GLUE_FUNCS.forEach((n, i) => table.set(glueBase + i, glue.exports[n]));
   x.glue_install(glueBase);
@@ -316,7 +316,10 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
 
   // The x87 fast paths translated modules import.
   const x87Len = x.x87_build();
-  x87Imports = new WebAssembly.Instance(new WebAssembly.Module(mem().slice(x.glue_ptr(), x.glue_ptr() + x87Len)), { cpu: cpuImports }).exports;
+  x87Imports = new WebAssembly.Instance(new WebAssembly.Module(mem().slice(x.glue_ptr(), x.glue_ptr() + x87Len)), {
+    cpu: cpuImports,
+    rt: { sin: x.x87_sin, cos: x.x87_cos },
+  }).exports;
 
   // The no-op function `resolve` returns after an API call.
   const nopLen = x.nop_build();

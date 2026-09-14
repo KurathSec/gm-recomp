@@ -165,10 +165,13 @@ struct Glue {
     /// XMM register i <-> 16 bytes of runtime memory.
     vget: extern "C" fn(u32, *mut u8),
     vset: extern "C" fn(u32, *const u8),
+    /// Calls the translated function at a table index with the registers in the
+    /// globals, and puts the ones it returns there.
+    call: extern "C" fn(u32),
 }
 
 /// Export order of the glue accessors; JS places them in the table in this order.
-const GLUE_FUNCS: [&str; 9] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset"];
+const GLUE_FUNCS: [&str; 10] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call"];
 
 struct State {
     engine: Option<Engine>,
@@ -271,9 +274,9 @@ impl Machine for Web {
         (glue().vset)(i, b.as_ptr());
     }
     fn call_index(&mut self, idx: u32) -> Result<(), String> {
-        // Table slots hold translated functions of type () -> ().
-        let f: extern "C" fn() = unsafe { std::mem::transmute(idx as usize) };
-        f();
+        // Translated functions take and return the registers: the glue's `call` passes
+        // them from and to the globals.
+        (glue().call)(idx);
         Ok(())
     }
     fn instantiate(&mut self, wasm: &[u8], exports: &[String]) -> Result<Vec<u32>, String> {
@@ -331,8 +334,15 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     types.ty().function([ValType::I32; 2], []); // 2: set
     types.ty().function([], [ValType::I32]); // 3: size
     types.ty().function([ValType::I32; 2], []); // 4: vget / vset
+    types.ty().function([ValType::I32; 8], [ValType::I32; 8]); // 5: a translated function
+    types.ty().function([ValType::I32], []); // 6: call
     let mut imports = ImportSection::new();
     imports.import("rt", "memory", EntityType::Memory(MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None }));
+    imports.import(
+        "rt",
+        "table",
+        EntityType::Table(wasm_encoder::TableType { element_type: wasm_encoder::RefType::FUNCREF, table64: false, minimum: 0, maximum: None, shared: false }),
+    );
     let mut mems = MemorySection::new();
     mems.memory(MemoryType { minimum: initial_pages, maximum: Some(GUEST_MAX_PAGES), memory64: false, shared: false, page_size_log2: None });
     let mut globals = GlobalSection::new();
@@ -431,6 +441,18 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
         f.instruction(&I::End).instruction(&I::End);
         code.function(&f);
     }
+    // call(idx): registers from the globals, through the function, back
+    funcs.function(6);
+    let mut f = Function::new([]);
+    for r in 0..8 {
+        f.instruction(&I::GlobalGet(r));
+    }
+    f.instruction(&I::LocalGet(0)).instruction(&I::CallIndirect { type_index: 5, table_index: 0 });
+    for r in (0..8).rev() {
+        f.instruction(&I::GlobalSet(r));
+    }
+    f.instruction(&I::End);
+    code.function(&f);
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_NAME, ExportKind::Memory, 1);
@@ -499,6 +521,7 @@ pub extern "C" fn glue_install(base: u32) {
             grow: std::mem::transmute(f(6)),
             vget: std::mem::transmute(f(7)),
             vset: std::mem::transmute(f(8)),
+            call: std::mem::transmute(f(9)),
         });
     }
 }
@@ -665,6 +688,17 @@ pub extern "C" fn nop_build() -> usize {
         GLUE_BYTES = engine::nop_module();
         GLUE_BYTES.len()
     }
+}
+
+/// fsin's and fcos's values for the x87 fast-path module (its `rt.sin`, `rt.cos`).
+#[unsafe(no_mangle)]
+pub extern "C" fn x87_sin(x: f64) -> f64 {
+    fpu::sin(x)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn x87_cos(x: f64) -> f64 {
+    fpu::cos(x)
 }
 
 /// The x87 fast-path module's bytes (JS instantiates it once; translated modules import it).

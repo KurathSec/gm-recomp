@@ -1993,6 +1993,7 @@ dependencies = [
 name = "web"
 version = "0.1.0"
 dependencies = [
+ "fpu",
  "recomp",
  "runtime",
  "wasm-encoder 0.262.0",

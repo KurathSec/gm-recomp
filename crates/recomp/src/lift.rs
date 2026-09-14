@@ -35,8 +35,10 @@ pub(crate) const L_V0: u32 = 28;
 pub(crate) const L_V1: u32 = 29;
 pub(crate) const L_MM: u32 = 30; // MMX register access: x87 block address, mantissa
 pub(crate) const L_MQ: u32 = 31;
+/// Locals after the parameters: the eight registers are the function's parameters
+/// (locals 0..7) and its results (`types::FUNC`).
 pub const LOCALS: [(u32, ValType); 6] =
-    [(25, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128), (1, ValType::I32), (1, ValType::I64)];
+    [(17, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128), (1, ValType::I32), (1, ValType::I64)];
 
 pub(crate) fn mem0() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
@@ -62,6 +64,8 @@ pub struct FuncEmit<'a> {
     index: HashMap<u32, u32>,
     order: Vec<u32>,
     live_out: HashMap<u32, u8>,
+    /// Flags the entry block reads before writing (loaded from the globals).
+    entry_flags: u8,
     /// Direct-call targets available in this module: entry -> wasm function index.
     func_index: &'a HashMap<u32, u32>,
     pending: Option<(FlagOp, u8)>,
@@ -70,6 +74,7 @@ pub struct FuncEmit<'a> {
     /// Call the `x87` module's fast paths before `rt.fpu`.
     pub x87_inline: bool,
     pub resolve_cache: bool,
+    pub count: bool,
     /// Flags some later instruction (or a successor) will read after the current one.
     needed: u8,
     ip: u32,
@@ -88,18 +93,21 @@ impl<'a> FuncEmit<'a> {
     pub fn new(cfg: &'a Cfg, func_index: &'a HashMap<u32, u32>) -> Self {
         let order: Vec<u32> = cfg.blocks.keys().copied().collect();
         let index = order.iter().enumerate().map(|(i, &a)| (a, i as u32)).collect();
-        let live_out = liveness(cfg);
+        let (live_in, live_out) = liveness(cfg);
+        let entry_flags = live_in.get(&cfg.entry).copied().unwrap_or(flags::ALL);
         FuncEmit {
             f: Function::new(LOCALS.to_vec()),
             cfg,
             index,
             order,
             live_out,
+            entry_flags,
             func_index,
             pending: None,
             probe: false,
             x87_inline: true,
             resolve_cache: false,
+            count: false,
             needed: 0,
             ip: 0,
             next_ip: 0,
@@ -132,13 +140,13 @@ impl<'a> FuncEmit<'a> {
     // ---- prologue / epilogue -------------------------------------------------
 
     fn load_state(&mut self) {
-        for r in 0..8 {
-            self.i(W::GlobalGet(Global::Eax as u32 + r));
-            self.set(L_REG + r);
-        }
+        // the registers come as parameters; only the flags read before written are
+        // loaded (a call does not hand flags over)
         for fl in 0..6 {
-            self.i(W::GlobalGet(Global::Cf as u32 + fl));
-            self.set(L_FLAG + fl);
+            if self.entry_flags & (1 << fl) != 0 {
+                self.i(W::GlobalGet(Global::Cf as u32 + fl));
+                self.set(L_FLAG + fl);
+            }
         }
     }
 
@@ -182,12 +190,82 @@ impl<'a> FuncEmit<'a> {
         self.reload_flags();
     }
 
-    /// [guest address] -> [table index]
+    /// Pushes the registers: a call's arguments or the function's results.
+    fn push_regs(&mut self) {
+        for r in 0..8 {
+            self.get(L_REG + r);
+        }
+    }
+
+    /// Returns the registers in the locals.
+    fn ret_regs(&mut self) {
+        self.push_regs();
+        self.i(W::Return);
+    }
+
+    /// Returns the registers in the globals (the context the runtime holds).
+    fn ret_globals(&mut self) {
+        for r in 0..8 {
+            self.i(W::GlobalGet(Global::Eax as u32 + r));
+        }
+        self.i(W::Return);
+    }
+
+    /// Takes a call's results into the register locals.
+    fn pop_regs(&mut self) {
+        for r in (0..8).rev() {
+            self.set(L_REG + r);
+        }
+    }
+
+    /// Bumps event counter `k` (`abi::COUNT_*`) when counting.
+    fn count(&mut self, k: u32) {
+        if self.count {
+            let a = crate::abi::COUNTERS + 4 * k;
+            self.c(a);
+            self.c(a);
+            self.i(W::I32Load(mem0()));
+            self.c(1);
+            self.i(W::I32Add);
+            self.i(W::I32Store(mem0()));
+        }
+    }
+
+    /// [guest address] -> [table index]. The runtime is asked only when the resolve
+    /// cache misses; it may run an API there (the target is a stub), which works on
+    /// the registers in the globals, so they go there and come back around it.
     fn resolve(&mut self) {
+        self.count(crate::abi::COUNT_RESOLVES);
         if self.resolve_cache {
-            crate::abi::emit_resolve(&mut self.f, L_R0, L_R1);
-        } else {
+            use crate::abi::{RESOLVE_CACHE, RESOLVE_CACHE_BITS, RESOLVE_HASH};
+            let at = |off: u32| MemArg { offset: off as u64, align: 2, memory_index: 0 };
+            self.set(L_R0);
+            self.get(L_R0);
+            self.i(W::I32Const(RESOLVE_HASH as i32));
+            self.i(W::I32Mul);
+            self.c(32 - RESOLVE_CACHE_BITS);
+            self.i(W::I32ShrU);
+            self.c(3);
+            self.i(W::I32Shl);
+            self.tee(L_R1);
+            self.i(W::I32Load(at(RESOLVE_CACHE)));
+            self.get(L_R0);
+            self.i(W::I32Eq);
+            self.i(W::If(BlockType::Result(ValType::I32)));
+            self.get(L_R1);
+            self.i(W::I32Load(at(RESOLVE_CACHE + 4)));
+            self.i(W::Else);
+            self.spill_regs();
+            self.get(L_R0);
             self.call_rt(RtFunc::Resolve);
+            self.reload_regs();
+            self.i(W::End);
+        } else {
+            self.set(L_R0);
+            self.spill_regs();
+            self.get(L_R0);
+            self.call_rt(RtFunc::Resolve);
+            self.reload_regs();
         }
     }
 
@@ -208,7 +286,8 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// `if (ctl) return;` — the runtime wants control back. `spill` first stores the
-    /// registers held in locals (call sites that did not spill before the call).
+    /// registers held in locals (call sites that did not spill before the call);
+    /// otherwise the globals hold the context to return.
     pub(crate) fn return_if_ctl(&mut self, spill: bool) {
         self.i(W::GlobalGet(Global::Ctl as u32));
         self.i(W::If(BlockType::Empty));
@@ -220,8 +299,10 @@ impl<'a> FuncEmit<'a> {
             self.pending = pending;
             self.c(self.ip);
             self.i(W::GlobalSet(Global::Eip as u32));
+            self.ret_regs();
+        } else {
+            self.ret_globals();
         }
-        self.i(W::Return);
         self.i(W::End);
     }
 
@@ -765,13 +846,18 @@ impl<'a> FuncEmit<'a> {
 
     /// Calls the guest function at a static address.
     fn call_static(&mut self, target: u32) {
+        self.count(crate::abi::COUNT_CALLS);
         self.push32_const(self.next_ip);
-        self.spill_all();
         if let Some(&idx) = self.func_index.get(&target) {
+            self.push_regs();
             self.i(W::Call(idx));
         } else {
+            // resolved before the arguments are taken: an API run there changes them
             self.c(target);
             self.resolve();
+            self.set(L_R0);
+            self.push_regs();
+            self.get(L_R0);
             self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
         }
         self.after_call();
@@ -779,16 +865,28 @@ impl<'a> FuncEmit<'a> {
 
     /// Calls the guest function whose address is in L_T1.
     fn call_dynamic(&mut self) {
+        self.count(crate::abi::COUNT_CALLS);
         self.push32_const(self.next_ip);
-        self.spill_all();
         self.get(L_T1);
         self.resolve();
+        self.set(L_R0);
+        self.push_regs();
+        self.get(L_R0);
         self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
         self.after_call();
     }
 
     fn after_call(&mut self) {
-        self.reload_all();
+        // the callee's registers come back as results; its flags (those read before
+        // written again) in the globals
+        self.pop_regs();
+        for fl in 0..6 {
+            if self.needed & (1 << fl) != 0 {
+                self.i(W::GlobalGet(Global::Cf as u32 + fl));
+                self.set(L_FLAG + fl);
+            }
+        }
+        self.pending = None;
         // The callee's `ret` left the continuation in eip; anything else means the
         // guest unwound past us, so keep returning until a frame matches.
         self.i(W::GlobalGet(Global::Eip as u32));
@@ -797,7 +895,8 @@ impl<'a> FuncEmit<'a> {
         self.i(W::GlobalGet(Global::Ctl as u32));
         self.i(W::I32Or);
         self.i(W::If(BlockType::Empty));
-        self.i(W::Return);
+        self.spill_regs();
+        self.ret_regs();
         self.i(W::End);
     }
 
@@ -827,25 +926,33 @@ impl<'a> FuncEmit<'a> {
         }
         self.get(L_T0);
         self.i(W::GlobalSet(Global::Eip as u32));
-        self.spill_all();
-        self.i(W::Return);
+        // flags in the globals (some callers read them: Delphi's string compares)
+        self.spill_flags();
+        self.ret_regs();
     }
 
-    /// Tail-jumps to the guest address in L_T1.
+    /// Tail-jumps to the guest address in L_T1 (flags may be live into the target).
     fn tail_dynamic(&mut self) {
-        self.spill_all();
+        self.spill_flags();
         self.get(L_T1);
         self.resolve();
+        self.set(L_R0);
+        self.push_regs();
+        self.get(L_R0);
         self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
     }
 
     fn tail_static(&mut self, target: u32) {
-        self.spill_all();
+        self.spill_flags();
         if let Some(&idx) = self.func_index.get(&target) {
+            self.push_regs();
             self.i(W::ReturnCall(idx));
         } else {
             self.c(target);
             self.resolve();
+            self.set(L_R0);
+            self.push_regs();
+            self.get(L_R0);
             self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
         }
     }
@@ -854,6 +961,7 @@ impl<'a> FuncEmit<'a> {
 
     pub fn emit(&mut self) {
         self.load_state();
+        self.count(crate::abi::COUNT_ENTRIES);
         if self.probe {
             self.ip = self.cfg.entry;
             self.trap(trap::PROBE, self.cfg.entry);
@@ -923,7 +1031,7 @@ impl<'a> FuncEmit<'a> {
             self.c(ip);
             self.i(W::GlobalSet(Global::Eip as u32));
             self.spill_all();
-            self.i(W::Return);
+            self.ret_regs();
         }
     }
 
@@ -1025,7 +1133,7 @@ impl<'a> FuncEmit<'a> {
                 self.c(self.next_ip);
                 self.i(W::GlobalSet(Global::Eip as u32));
                 self.spill_all();
-                self.i(W::Return);
+                self.ret_regs();
             }
         }
     }
@@ -2112,6 +2220,7 @@ impl<'a> FuncEmit<'a> {
 
     fn x87(&mut self, instr: &Instruction) {
         use Mnemonic::*;
+        self.count(crate::abi::COUNT_X87);
         let writes_flags = matches!(instr.mnemonic(), Fcomi | Fcomip | Fucomi | Fucomip);
         let writes_ax = instr.mnemonic() == Fnstsw && !(0..instr.op_count()).any(|n| instr.op_kind(n) == OpKind::Memory);
         if writes_flags {
@@ -2223,7 +2332,8 @@ impl<'a> FuncEmit<'a> {
 
 /// Flags live into each block (and out, via successors). Conservatively assumes
 /// returns and tail/indirect jumps need every flag.
-fn liveness(cfg: &Cfg) -> HashMap<u32, u8> {
+/// Flags live into and out of each block.
+fn liveness(cfg: &Cfg) -> (HashMap<u32, u8>, HashMap<u32, u8>) {
     let mut usedef: HashMap<u32, (u8, u8)> = HashMap::new();
     for (&start, b) in &cfg.blocks {
         let (mut used, mut def) = (0u8, 0u8);
@@ -2255,7 +2365,7 @@ fn liveness(cfg: &Cfg) -> HashMap<u32, u8> {
             break;
         }
     }
-    live_out
+    (live_in, live_out)
 }
 
 pub fn global_index(g: Global) -> u32 {

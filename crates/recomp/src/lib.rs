@@ -28,6 +28,8 @@ pub struct Options {
     /// Probe `abi::RESOLVE_CACHE` before calling `rt.resolve` (needs the cache's
     /// memory; the CPU tests run without it).
     pub resolve_cache: bool,
+    /// Count events in `abi::COUNTERS` (debugging).
+    pub count: bool,
 }
 
 pub struct Translator<'m> {
@@ -90,13 +92,14 @@ impl<'m> Translator<'m> {
         let func_index: HashMap<u32, u32> = self.cfgs.keys().enumerate().map(|(i, &e)| (e, n_rt + i as u32)).collect();
 
         let mut types = TypeSection::new();
-        types.ty().function([], []); // FUNC
+        types.ty().function([ValType::I32; 8], [ValType::I32; 8]); // FUNC
         types.ty().function([ValType::I32], [ValType::I32]); // RESOLVE
         types.ty().function([ValType::I32, ValType::I32], []); // TRAP
         types.ty().function([ValType::I32; 5], [ValType::I32]); // FPU
         debug_assert_eq!(types::FPU, 3);
         let (p, r) = x87::form_type();
         types.ty().function(p, r); // X87
+        types.ty().function([], []); // VOID
 
         let mut imports = ImportSection::new();
         imports.import(
@@ -123,7 +126,7 @@ impl<'m> Translator<'m> {
                 abi::RtFunc::Resolve => types::RESOLVE,
                 abi::RtFunc::Trap => types::TRAP,
                 abi::RtFunc::Fpu => types::FPU,
-                _ => types::FUNC,
+                _ => types::VOID,
             };
             imports.import(abi::RT_MODULE, name, EntityType::Function(ty));
         }
@@ -140,6 +143,7 @@ impl<'m> Translator<'m> {
             fe.probe = self.opts.probes.contains(&entry);
             fe.x87_inline = !self.opts.no_x87_inline;
             fe.resolve_cache = self.opts.resolve_cache;
+            fe.count = self.opts.count;
             fe.emit();
             self.unimplemented.extend(fe.unimplemented.drain(..));
             functions.function(types::FUNC);

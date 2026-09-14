@@ -32,6 +32,23 @@ pub fn effects(i: &Instruction) -> (u8, u8) {
     match i.mnemonic() {
         // iced marks these as reading everything; translated code only needs what pushfd/lahf copy.
         Mnemonic::Pushfd | Mnemonic::Pushf | Mnemonic::Lahf => (def, ALL),
+        // To the caller, the flags after a call are the callee's (code reading them,
+        // like Delphi's string compares, reads what the callee set); no calling
+        // convention passes flags in, so translated calls do not hand them over.
+        Mnemonic::Call => (ALL, 0),
+        // a count in CL may be 0, which leaves every flag as it was
+        Mnemonic::Shl | Mnemonic::Sal | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror | Mnemonic::Rcl | Mnemonic::Rcr
+        | Mnemonic::Shld | Mnemonic::Shrd
+            if (0..i.op_count()).any(|n| i.op_kind(n) == iced_x86::OpKind::Register && i.op_register(n) == iced_x86::Register::CL) =>
+        {
+            (def, used | def)
+        }
+        // so may a repeated compare or scan's count in ECX
+        Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd | Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd
+            if i.has_rep_prefix() || i.has_repe_prefix() || i.has_repne_prefix() =>
+        {
+            (def, used | def)
+        }
         _ => (def, used),
     }
 }

@@ -1449,16 +1449,16 @@ impl Fpu {
                     return;
                 }
                 let r = match mn {
-                    Fsin => from_f64(libm::sin(xf)),
-                    Fcos => from_f64(libm::cos(xf)),
+                    Fsin => from_f64(sin(xf)),
+                    Fcos => from_f64(cos(xf)),
                     _ => Ext::ZERO,
                 };
                 if !x.is_zero() { self.raise(SW_PE); }
                 match mn {
                     Fsincos => {
-                        let sn = self.round_constant_rm(from_f64(libm::sin(xf)));
+                        let sn = self.round_constant_rm(from_f64(sin(xf)));
                         self.set_st(0, sn);
-                        let c = self.round_constant_rm(from_f64(libm::cos(xf)));
+                        let c = self.round_constant_rm(from_f64(cos(xf)));
                         self.push(c);
                     }
                     Fptan => {
@@ -1525,6 +1525,17 @@ fn to_wide(v: Ext) -> Wide {
 fn widen_wide_to_ext(w: Wide, rm: Round) -> Ext {
     let mut lost = false;
     w.convert_r(rm, &mut lost).value
+}
+
+/// fsin's value for a double (the translated code's fast path calls this too, so
+/// both give the same bits).
+pub fn sin(x: f64) -> f64 {
+    libm::sin(x)
+}
+
+/// fcos's value for a double.
+pub fn cos(x: f64) -> f64 {
+    libm::cos(x)
 }
 
 fn to_f64(v: Ext) -> f64 {

@@ -137,6 +137,9 @@ pub enum Form {
     /// fincstp (true) / fdecstp
     Incstp(bool),
     Wait,
+    Xam,
+    /// fsin (true) / fcos
+    Trig(bool),
 }
 
 /// Every form, in helper order (export `f<k>` is `FORMS[k]`).
@@ -185,6 +188,7 @@ pub static FORMS: LazyLock<Vec<Form>> = LazyLock::new(|| {
     }
     v.push(Cmp(CSrc::Zero, false, 0));
     v.extend([Fnstsw(false), Fnstsw(true), Fnstcw, Fldcw, Ffree, Incstp(true), Incstp(false), Wait]);
+    v.extend([Xam, Trig(true), Trig(false)]);
     v
 });
 
@@ -224,6 +228,9 @@ pub fn form_of(instr: &Instruction) -> Option<(u32, Arg)> {
             (Form::StoreInt(src?, m), Arg::Mem)
         }
         Frndint => (Form::Rndint, Arg::None),
+        Fxam => (Form::Xam, Arg::None),
+        Fsin => (Form::Trig(true), Arg::None),
+        Fcos => (Form::Trig(false), Arg::None),
         Fchs => (Form::Chs, Arg::None),
         Fabs => (Form::Abs, Arg::None),
         Fxch => (Form::Xch, Arg::St(op1.unwrap_or(1))),
@@ -278,15 +285,21 @@ pub fn form_of(instr: &Instruction) -> Option<(u32, Arg)> {
 
 // ---- the helper module ----------------------------------------------------------------
 
-/// Internal math helpers, at the start of the module's functions.
-const H_ADD: u32 = 0;
-const H_MUL: u32 = 1;
-const H_DIV: u32 = 2;
-const H_X80_LOAD: u32 = 3;
-const H_X80_STORE: u32 = 4;
-const H_I64_EXT: u32 = 5;
-const H_EXT_I64: u32 = 6;
-const N_INTERNAL: u32 = 7;
+/// Imported from the runtime (`rt`): fsin's and fcos's value for a double
+/// (`fpu::sin`, `fpu::cos`).
+const I_SIN: u32 = 0;
+const I_COS: u32 = 1;
+pub const RT_IMPORTS: [&str; 2] = ["sin", "cos"];
+const N_IMPORTED: u32 = 2;
+/// Internal math helpers, after the imports.
+const H_ADD: u32 = N_IMPORTED;
+const H_MUL: u32 = N_IMPORTED + 1;
+const H_DIV: u32 = N_IMPORTED + 2;
+const H_X80_LOAD: u32 = N_IMPORTED + 3;
+const H_X80_STORE: u32 = N_IMPORTED + 4;
+const H_I64_EXT: u32 = N_IMPORTED + 5;
+const H_EXT_I64: u32 = N_IMPORTED + 6;
+const N_INTERNAL: u32 = N_IMPORTED + 7;
 
 /// Type of every form helper, in translated modules and here: (a, ip) -> i32.
 pub fn form_type() -> ([ValType; 2], [ValType; 1]) {
@@ -307,6 +320,7 @@ pub fn module(shared_memory: bool) -> Vec<u8> {
     types.ty().function([ValType::I32, ValType::F64], []); // 3: x80 store
     types.ty().function([ValType::I32, ValType::I64], []); // 4: i64 -> image
     types.ty().function([ValType::I32, ValType::I32], [ValType::I32]); // 5: image -> i64
+    types.ty().function([ValType::F64], [ValType::F64]); // 6: sin, cos
     let mut imports = ImportSection::new();
     imports.import(
         abi::CPU_MODULE,
@@ -321,6 +335,9 @@ pub fn module(shared_memory: bool) -> Vec<u8> {
     );
     let fs = abi::GLOBALS.iter().find(|g| g.0 == abi::Global::FsBase).unwrap();
     imports.import(abi::CPU_MODULE, fs.1, EntityType::Global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }));
+    for name in RT_IMPORTS {
+        imports.import(abi::RT_MODULE, name, EntityType::Function(6));
+    }
     let mut funcs = FunctionSection::new();
     let mut code = CodeSection::new();
     for (ty, body) in [(1, h_add()), (1, h_mul()), (1, h_div()), (2, h_x80_load()), (3, h_x80_store()), (4, h_i64_ext()), (5, h_ext_i64())] {
@@ -406,6 +423,12 @@ impl B {
         self.g(fl).g(fl).i(W::I32Load16U(ma(fb::SW))).c(!SW_C1 & 0xffff).i(W::I32And).i(W::I32Store16(ma(fb::SW)))
     }
     /// The result is exact when `cond` (on stack) holds: clear C1 and return `r`.
+    /// Unless the precision is 53 bits (`FAST_ARITH`), only an exact result (`err` 0)
+    /// is decided here.
+    fn exact_unless_pc53(&mut self, fl: u32, err: u32) -> &mut Self {
+        self.g(fl).i(W::I32Load(ma(fb::FAST))).c(fb::FAST_ARITH).i(W::I32And).i(W::I32Eqz);
+        self.g(err).k(0.0).i(W::F64Ne).i(W::I32And).nan_if()
+    }
     fn exact_if(&mut self, fl: u32, r: u32) -> &mut Self {
         self.i(W::If(BlockType::Empty)).clear_c1_at(fl).g(r).i(W::Return).i(W::End)
     }
@@ -743,7 +766,8 @@ fn form_body(form: Form) -> Function {
             b.load_st(PA, X).load_st(PB, Y).store_st(PA, Y).store_st(PB, X).clear_c1().set_fip();
         }
         Arith(op, reversed, src, pop) => {
-            b.need_fast(fb::FAST_ARITH);
+            // (64-bit precision: the helpers take exact results only)
+            b.need_fast(fb::FAST_ARITH | fb::FAST_EXACT64);
             match src {
                 ASrc::Mem(s) => {
                     b.phys(PA, 0).need_f64(PA).mem_value(s, Y);
@@ -825,6 +849,7 @@ fn form_body(form: Form) -> Function {
             b.g(XB).c(5).i(W::I32ShrU).c(1).i(W::I32And).s(XC);
             b.g(F).c(fb::FAST_MOVE).g(XC).c(fb::FAST_INEXACT.trailing_zeros()).i(W::I32Shl).i(W::I32Or);
             b.g(XC).g(XB).c(0x300).i(W::I32And).c(0x200).i(W::I32Eq).i(W::I32And).c(fb::FAST_ARITH.trailing_zeros()).i(W::I32Shl).i(W::I32Or);
+            b.g(XB).c(0x300).i(W::I32And).c(0x300).i(W::I32Eq).c(fb::FAST_EXACT64.trailing_zeros()).i(W::I32Shl).i(W::I32Or);
             b.i(W::I32Store(ma(fb::FAST)));
         }
         Ffree => {
@@ -837,6 +862,34 @@ fn form_body(form: Form) -> Function {
         }
         Wait => {
             b.need_fast(fb::FAST_MOVE);
+        }
+        Xam => {
+            // C3 C2 C0: zero 1 0 0, normal 0 1 0, infinity 0 1 1; C1 the sign
+            b.need_fast(fb::FAST_MOVE).phys(PA, 0).need_f64(PA).load_st(PA, X);
+            b.g(X).k(0.0).i(W::F64Eq).s(XB);
+            b.g(X).i(W::F64Abs).k(INF).i(W::F64Eq).s(XC);
+            b.g(F).g(F).i(W::I32Load16U(ma(fb::SW))).c(!SW_CC & 0xffff).i(W::I32And);
+            b.g(XB).c(14).i(W::I32Shl).i(W::I32Or);
+            b.g(XB).i(W::I32Eqz).c(10).i(W::I32Shl).i(W::I32Or);
+            b.g(XC).c(8).i(W::I32Shl).i(W::I32Or);
+            b.g(X).i(W::I64ReinterpretF64).c(63).i(W::I64ExtendI32U).i(W::I64ShrU).i(W::I32WrapI64).c(9).i(W::I32Shl).i(W::I32Or);
+            b.i(W::I32Store16(ma(fb::SW))).set_fip();
+        }
+        Trig(sin) => {
+            // as rt.fpu: ST(0) = the double's sin/cos; C1 = C2 = 0; PE unless it is 0.
+            // Infinities, |x| >= 2^63 (C2: out of range) and denormal results fall back.
+            b.need_fast(fb::FAST_INEXACT).phys(PA, 0).need_f64(PA).load_st(PA, X);
+            b.g(X).i(W::F64Abs).k(pow2(63)).i(W::F64Ge).fail_if();
+            b.g(X).k(0.0).i(W::F64Ne).s(XB);
+            if sin {
+                b.g(X).i(W::Call(I_SIN)).g(X).g(XB).i(W::Select).s(Y);
+            } else {
+                b.g(X).i(W::Call(I_COS)).k(1.0).g(XB).i(W::Select).s(Y);
+            }
+            b.g(Y).i(W::F64Abs).k(MIN_NORMAL).i(W::F64Lt).g(Y).k(0.0).i(W::F64Ne).i(W::I32And).fail_if();
+            b.store_st(PA, Y);
+            b.g(F).g(F).i(W::I32Load16U(ma(fb::SW))).c(!(SW_C1 | 0x400) & 0xffff).i(W::I32And);
+            b.g(XB).c(SW_PE_SHIFT).i(W::I32Shl).i(W::I32Or).i(W::I32Store16(ma(fb::SW))).set_fip();
         }
     }
     b.done(result);
@@ -858,6 +911,7 @@ fn h_add() -> Function {
     // TwoSum
     x.g(s).g(a).i(W::F64Sub).s(bb);
     x.g(a).g(s).g(bb).i(W::F64Sub).i(W::F64Sub).g(b).g(bb).i(W::F64Sub).i(W::F64Add).s(e);
+    x.exact_unless_pc53(fl, e);
     x.round_directed(fl, s, e, rc);
     // an exact zero sum of opposite signs is -0 when rounding down
     x.g(rc).c(1).i(W::I32Eq).g(s).k(0.0).i(W::F64Eq).i(W::I32And).nan_if();
@@ -880,6 +934,7 @@ fn h_mul() -> Function {
     x.ret_nan().i(W::End); // underflow
     x.abs_cmp(p, TINY, W::F64Lt).abs_cmp(a, SPLIT_MAX, W::F64Ge).i(W::I32Or).abs_cmp(b, SPLIT_MAX, W::F64Ge).i(W::I32Or).nan_if();
     x.split(a, c, ah, al).split(b, c, bh, bl).product_error(p, ah, al, bh, bl, e);
+    x.exact_unless_pc53(fl, e);
     x.round_directed(fl, p, e, rc);
     x.flags_from_error(fl, e, p);
     x.g(p);
@@ -907,6 +962,7 @@ fn h_div() -> Function {
     x.g(a).g(p).i(W::F64Sub).g(e).i(W::F64Sub).s(r);
     // a/b - q = r/b: e takes its sign
     x.g(r).i(W::F64Neg).g(r).g(b).k(0.0).i(W::F64Lt).i(W::Select).s(e);
+    x.exact_unless_pc53(fl, e);
     x.round_directed(fl, q, e, rc);
     x.flags_from_error(fl, e, q);
     x.g(q);

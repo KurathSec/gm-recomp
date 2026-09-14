@@ -62,6 +62,12 @@ struct Hd {
     mouse: Vec<(u64, i32, i32, u32)>,
     /// The MIDI SoundFont was handed over (or there is none).
     soundfont_given: bool,
+    /// GMR_FRAME_MS=<ms>: report frames that took longer (host time between the
+    /// game's input polls of consecutive frames) with what the engine did in them.
+    frame_ms: Option<f64>,
+    /// (frame, host µs, dispatches, x87 via rt.fpu, translated, translate µs) at the
+    /// start of the frame being measured.
+    frame_mark: (u64, u64, u64, u64, usize, u64),
 }
 
 /// Store and Caller both give direct access to their data.
@@ -158,7 +164,17 @@ impl<C: Cx> Machine for Wt<'_, C> {
             Some(Ref::Func(Some(f))) => f,
             _ => return Err(format!("table slot {idx} is empty")),
         };
-        f.call(&mut *self.cx, &[], &mut []).map_err(|e| format!("{e:?}"))
+        // translated functions take the registers and return them
+        let mut args = [Val::I32(0); 8];
+        for (r, a) in args.iter_mut().enumerate() {
+            *a = self.cpu.globals[r].get(&mut *self.cx);
+        }
+        let mut res = [Val::I32(0); 8];
+        f.call(&mut *self.cx, &args, &mut res).map_err(|e| format!("{e:?}"))?;
+        for (r, v) in res.into_iter().enumerate() {
+            self.cpu.globals[r].set(&mut *self.cx, v).map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
     }
     fn instantiate(&mut self, wasm: &[u8], exports: &[String]) -> Result<Vec<u32>, String> {
         let module = Module::new(self.cx.as_context().engine(), wasm).map_err(|e| {
@@ -182,6 +198,36 @@ impl<C: Cx> Machine for Wt<'_, C> {
         eprintln!("{s}");
     }
     fn take_input(&mut self, frame: u64) -> Vec<runtime::InputEvent> {
+        if let Some(limit) = self.cx.hd_ref().frame_ms {
+            let now = self.cx.hd_ref().t0.elapsed().as_micros() as u64;
+            let hd = self.cx.hd();
+            let e = &hd.engine;
+            let mark = (frame, now, e.dispatches, e.fpu_ops, e.translated, e.translate_us);
+            let (f0, t, d, x, n, tu) = hd.frame_mark;
+            let counting = e.count;
+            if frame != f0 {
+                let ms = (now - t) as f64 / 1000.0;
+                hd.frame_mark = mark;
+                let mut counts = String::new();
+                if counting {
+                    for (k, name) in abi::COUNT_NAMES.iter().enumerate() {
+                        let a = abi::COUNTERS + 4 * k as u32;
+                        let v = self.read_u32(a).unwrap_or(0);
+                        let _ = self.write_u32(a, 0);
+                        counts.push_str(&format!("  {name} {v}"));
+                    }
+                }
+                if ms > limit && f0 != 0 {
+                    eprintln!(
+                        "frame {f0}: {ms:.1} ms  dispatches {}  x87 via rt.fpu {}  translated {} ({:.1} ms){counts}",
+                        mark.2 - d,
+                        mark.3 - x,
+                        mark.4 - n,
+                        (mark.5 - tu) as f64 / 1000.0
+                    );
+                }
+            }
+        }
         let hd = self.cx.hd();
         let due: Vec<(u64, u8, bool, u16)> = hd.keys.iter().copied().filter(|k| k.0 <= frame).collect();
         hd.keys.retain(|k| k.0 > frame);
@@ -244,6 +290,8 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eng.recent_cap = opts.recent;
     // GMR_X87_SLOW=1: no inline x87 (every instruction through rt.fpu).
     eng.no_x87_inline = std::env::var_os("GMR_X87_SLOW").is_some();
+    // GMR_COUNT=1: translated code counts calls, x87 instructions, ... (GMR_FRAME_MS shows them).
+    eng.count = std::env::var_os("GMR_COUNT").is_some();
     // GMR_FPU_PROFILE=1: count x87 instructions by mnemonic.
     if std::env::var_os("GMR_FPU_PROFILE").is_some() {
         eng.fpu_profile = Some(Default::default());
@@ -257,7 +305,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), soundfont_given: false });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0) });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;
@@ -300,7 +348,9 @@ pub fn run(opts: RunOpts) -> Result<()> {
         };
         linker.define(&store, abi::RT_MODULE, name, Extern::Func(func)).map_err(|e| anyhow!("{e:?}"))?;
     }
-    // The x87 fast paths every translated module imports.
+    // The x87 fast paths every translated module imports (with fsin's and fcos's values).
+    linker.func_wrap(abi::RT_MODULE, "sin", fpu::sin).map_err(|e| anyhow!("{e:?}"))?;
+    linker.func_wrap(abi::RT_MODULE, "cos", fpu::cos).map_err(|e| anyhow!("{e:?}"))?;
     let x87 = Module::new(&wt_engine, recomp::x87::module(false)).map_err(|e| anyhow!("{e:?}"))?;
     let x87 = linker.instantiate(&mut store, &x87).map_err(|e| anyhow!("{e:?}"))?;
     linker.instance(&mut store, recomp::x87::MODULE, x87).map_err(|e| anyhow!("{e:?}"))?;

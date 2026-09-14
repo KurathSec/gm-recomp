@@ -176,6 +176,8 @@ impl Runner {
             };
             linker.define(&store, abi::RT_MODULE, name, Extern::Func(func)).map_err(wt)?;
         }
+        linker.func_wrap(abi::RT_MODULE, "sin", fpu::sin).map_err(wt)?;
+        linker.func_wrap(abi::RT_MODULE, "cos", fpu::cos).map_err(wt)?;
         let x87 = linker.instantiate(&mut store, &self.x87).map_err(wt)?;
         linker.instance(&mut store, recomp::x87::MODULE, x87).map_err(wt)?;
         let instance = linker.instantiate(&mut store, &module).map_err(wt).context("instantiating generated wasm")?;
@@ -214,8 +216,15 @@ impl Runner {
         }
 
         let name = abi::export_name(CODE_BASE);
-        let func = instance.get_typed_func::<(), ()>(&mut store, &name).map_err(wt)?;
-        let res = func.call(&mut store, ());
+        type Regs = (i32, i32, i32, i32, i32, i32, i32, i32);
+        let func = instance.get_typed_func::<Regs, Regs>(&mut store, &name).map_err(wt)?;
+        let g = |store: &mut Store<Host>, r: usize| globals[r].get(store).i32().unwrap();
+        let args = (g(&mut store, 0), g(&mut store, 1), g(&mut store, 2), g(&mut store, 3), g(&mut store, 4), g(&mut store, 5), g(&mut store, 6), g(&mut store, 7));
+        let res = func.call(&mut store, args).map(|r| {
+            for (k, v) in [r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7].into_iter().enumerate() {
+                let _ = globals[k].set(&mut store, Val::I32(v));
+            }
+        });
         let host = store.data();
         let trap_kind = host.trap.map(|t| t.0);
         let (status, fault_off) = match host.trap {

@@ -94,6 +94,8 @@ pub struct Engine {
     pub probes: Vec<u32>,
     /// Translate x87 code without the inline paths (checking them).
     pub no_x87_inline: bool,
+    /// Translated code counts events in `abi::COUNTERS` (debugging).
+    pub count: bool,
 }
 
 impl Engine {
@@ -127,6 +129,7 @@ impl Engine {
             watch: Vec::new(),
             probes: Vec::new(),
             no_x87_inline: false,
+            count: false,
         }
     }
 
@@ -654,7 +657,8 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
         let mem = CodeMem(&*m);
         let probes = m.engine_ref().probes.clone();
         let no_x87_inline = m.engine_ref().no_x87_inline;
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true });
+        let count = m.engine_ref().count;
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count });
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = std::collections::HashMap::new();
@@ -1147,7 +1151,7 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let r = p.setup_main_thread(m, image_base).and_then(|r| p.setup_static_tls(m).map(|_| r));
     m.engine().p = Some(p);
     let (teb, stack_top) = r?;
-    m.ensure_mapped(abi::RESOLVE_CACHE, abi::RESOLVE_CACHE_SIZE).map_err(|_| "cannot map the resolve cache".to_string())?;
+    m.ensure_mapped(abi::RESOLVE_CACHE, abi::RESOLVE_CACHE_SIZE + 0x1000).map_err(|_| "cannot map the resolve cache".to_string())?;
     m.set_global(Global::FsBase, teb);
     m.set_global(Global::Mxcsr, 0x1F80);
     let regs = Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: stack_top - 0x100, ebp: 0, esi: 0, edi: 0, eip: entry, fs_base: teb };
@@ -1185,15 +1189,19 @@ pub fn run_process<M: Machine>(m: &mut M, started: &Started) -> Result<(), Strin
 
 /// A module exporting `nop: () -> ()`, the function `resolve` returns after an API call.
 pub fn nop_module() -> Vec<u8> {
-    use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection};
+    use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection, ValType};
+    // a translated function's type: it returns the registers it gets
     let mut types = TypeSection::new();
-    types.ty().function([], []);
+    types.ty().function([ValType::I32; 8], [ValType::I32; 8]);
     let mut funcs = FunctionSection::new();
     funcs.function(0);
     let mut exports = ExportSection::new();
     exports.export("nop", ExportKind::Func, 0);
     let mut code = CodeSection::new();
     let mut f = Function::new([]);
+    for r in 0..8 {
+        f.instruction(&wasm_encoder::Instruction::LocalGet(r));
+    }
     f.instruction(&wasm_encoder::Instruction::End);
     code.function(&f);
     let mut md = Module::new();

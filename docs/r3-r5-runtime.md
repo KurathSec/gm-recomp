@@ -246,6 +246,23 @@ the new room's code is translated then).
   caller and re-entered each at its return address as a new one-off function: Bread,
   900 frames, 5.0 M dispatches -> 2 887 and 7 133 modules -> 697; frame cost median
   Firefox 4.32 -> 2.10 ms, Chrome 2.28 -> 1.94 ms; translation Firefox 4.4 -> 0.8 s.
+- Translated functions take the eight registers as parameters and return them
+  (`types::FUNC`); before, every call stored them in the CPU globals and every
+  callee loaded them, and back. The runtime still sees the globals: they are
+  written around a resolve-cache miss (an API may run there), a trap, cpuid/rdtsc
+  and whenever control goes back to the dispatcher, whose `call` (the browser's
+  glue, the harness) passes them in and out. Calls hand over no flags (no calling
+  convention passes them; the callee's come back through the globals at `ret`, for
+  Delphi's string compares), so flag computations before calls are dead code now,
+  and a function loads only the flags its entry block reads. Counting with
+  `GMR_COUNT=1` (per frame with `GMR_FRAME_MS=0`) showed what dominates: a GMS
+  death (YoYoYo engine, blood) runs ~830 000 guest calls per frame.
+- x87 fast paths for 64-bit precision when the result is exact (the CRT's modf and
+  floor switch to it: `x - trunc(x)`), `fxam`, and `fsin`/`fcos` (their value is
+  `fpu::sin`/`cos`, which the x87 module imports from the runtime so both paths
+  give the same bits). A GMS death, rt.fpu calls per frame ~6 000 -> ~1 800.
+  Same death, guest time per frame at its peak: Firefox 10.2 -> 6.7 ms, Chrome
+  14.4 -> 6.6 ms (harness 22.8 -> 18.1 ms).
 - MCI decodes MP3s as they play (a whole song used to be decoded in the frame its room
   started: 361 ms in Bread); Delphi's resource-string lookups use a parsed resource
   directory per module.

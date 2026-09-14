@@ -39,12 +39,15 @@ pub const FAST_MOVE: u32 = 1;
 pub const FAST_INEXACT: u32 = 2;
 /// … and precision control is 53 bits (add, sub, mul, div in f64; any rounding mode).
 pub const FAST_ARITH: u32 = 4;
+/// … and precision control is 64 bits: add, sub, mul, div whose f64 result is exact
+/// (then it is the 64-bit result too, with no precision exception; any rounding mode).
+pub const FAST_EXACT64: u32 = 8;
 
 /// `FAST` for a control word with no exception pending.
 pub fn fast_bits(cw: u16) -> u32 {
     let pm = (cw >> 5) & 1 != 0;
-    let pc53 = (cw >> 8) & 3 == 2;
-    FAST_MOVE | if pm { FAST_INEXACT } else { 0 } | if pm && pc53 { FAST_ARITH } else { 0 }
+    let pc = (cw >> 8) & 3;
+    FAST_MOVE | if pm { FAST_INEXACT } else { 0 } | if pm && pc == 2 { FAST_ARITH } else { 0 } | if pc == 3 { FAST_EXACT64 } else { 0 }
 }
 
 /// The f64 equal to an 80-bit image, when that is a zero, an infinity or a normal double.
