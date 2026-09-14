@@ -22,7 +22,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', script = [], persist = true } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', ahead = true, script = [], persist = true } = data;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
     const base = `/games/${encodeURIComponent(game)}/`;
@@ -77,7 +77,7 @@ self.onmessage = async ({ data }) => {
     const audioRing = { sab: new SharedArrayBuffer(8 + ringFrames * 8), frames: ringFrames };
     self.postMessage({ type: 'audio', sab: audioRing.sab, frames: ringFrames, rate: 48000 });
     const onStats = (stats) => self.postMessage({ type: 'stats', ...stats });
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, pacing, onFrame, onReady, onResize, audioRing, onSave, onStats });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats });
     await saving;
     self.postMessage({ type: 'done', status });
   } catch (e) {

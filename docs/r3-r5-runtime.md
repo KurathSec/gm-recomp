@@ -226,6 +226,14 @@ the new room's code is translated then).
   dominated GMS loading.
 - The process state is boxed (it was copied, 4.4 KB, on every API call); the
   function map uses an address hasher; API names in logs are built only when logged.
+- Code the game has not reached yet is translated while it waits for real time
+  (`engine::translate_idle`, a few functions per wait, sized by the measured cost):
+  the first run of new code no longer pays for its translation in that frame. Room
+  changes: untitled needle game's tutorial 171 -> 125 ms, Bread's first stage 124 ->
+  108 ms (the rest is the game's own loading); `?noahead` turns it off.
+- MCI decodes MP3s as they play (a whole song used to be decoded in the frame its room
+  started: 361 ms in Bread); Delphi's resource-string lookups use a parsed resource
+  directory per module.
 - `GMR_FPU_PROFILE=1` lists the x87 instructions that still reach `rt.fpu`, by form
   and by address; `node --cpu-prof web/tools/run-node.mjs ...` profiles the browser
   build by translated function (`f_<address>`).

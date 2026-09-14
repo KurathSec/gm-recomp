@@ -41,6 +41,8 @@ unsafe extern "C" {
     fn gpu_present(clock_ms: f64, x: i32, y: i32, w: i32, h: i32, dst_w: u32, dst_h: u32);
     /// Holds the guest until real time reaches its clock (may suspend it).
     fn gpu_pace(clock_ms: f64);
+    /// How long (ms) until real time reaches the clock (0 when not pacing).
+    fn gpu_slack(clock_ms: f64) -> f64;
 }
 
 #[link(wasm_import_module = "audio")]
@@ -290,7 +292,15 @@ impl Machine for Web {
         Web::take_input()
     }
     fn pace(&mut self, clock_us: u64) {
-        unsafe { gpu_pace(clock_us as f64 / 1000.0) }
+        let ms = clock_us as f64 / 1000.0;
+        // Time to wait anyway (often a millisecond at a time: game threads sleep in
+        // short steps): translate code the game has not reached yet.
+        let slack = unsafe { gpu_slack(ms) };
+        if slack > 0.8 {
+            let deadline = self.now_us() + ((slack - 0.3) * 1000.0) as u64;
+            runtime::engine::translate_idle(self, deadline);
+        }
+        unsafe { gpu_pace(ms) }
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         let st = state();
@@ -561,13 +571,15 @@ pub extern "C" fn run() -> i32 {
         },
         format!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)"),
         format!(
-            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s; {} ahead in {} waits)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
             e.resolves,
             e.translated,
             e.translate_us as f64 / 1e6,
+            e.idle_done,
+            e.idle_calls,
             p.now_ms()
         ),
     ];

@@ -347,7 +347,8 @@
         statusEl.textContent = 'Downloading…';
         const offscreen = screen.transferControlToOffscreen();
         const pacing = ['asap', 'jit'].includes(q.get('pacing')) ? q.get('pacing') : 'clock';
-        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, script, persist }, [offscreen]);
+        const ahead = !q.has('noahead');
+        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.

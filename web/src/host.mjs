@@ -20,6 +20,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {OffscreenCanvas} [o.canvas]  render target; without it nothing is drawn
  * @param {boolean} [o.pace]  hold frames to the game's own timing (needs JSPI)
  * @param {'clock'|'jit'|'asap'} [o.pacing]  when the guest waits and frames are shown (see `due`)
+ * @param {boolean} [o.ahead]  translate code the game has not reached yet while it waits
  * @param {(frame: number, gpu: D3DGL|null) => void|Promise<void>} [o.onFrame]  after each Present
  * @param {(input: {key: Function, mouse: Function, pad: Function}) => void} [o.onReady]  input entry points,
  *   usable while the guest is suspended in Present
@@ -32,7 +33,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
  *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -150,6 +151,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
     gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst, pitch),
     gpu_pace: () => {},
+    gpu_slack: () => 0,
     gpu_present: (clockMs, x, y, w, h, dw, dh) => {
       if (!gpu) {
         // Headless (Node): frames are only counted.
@@ -184,6 +186,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       return busy;
     };
     if (pace && pacing === 'clock') {
+      if (ahead) gpuImports.gpu_slack = (clockMs) => due(clockMs) - performance.now();
       gpuImports.gpu_pace = new WebAssembly.Suspending((clockMs) => {
         const at = due(clockMs);
         // within a millisecond: carry on without suspending

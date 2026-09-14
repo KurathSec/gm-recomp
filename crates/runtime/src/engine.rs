@@ -64,6 +64,13 @@ pub struct Engine {
     pub max_api_calls: u64,
     pub tsc: u64,
     pub bad_functions: HashSet<u32>,
+    /// Functions discovery found that nothing has called yet, for `translate_idle`
+    /// (popped from the end), and its estimate of the time one takes (µs).
+    pub idle_queue: Option<Vec<u32>>,
+    pub idle_us_per_fn: u64,
+    /// Functions translated ahead by `translate_idle`, and its calls.
+    pub idle_done: usize,
+    pub idle_calls: usize,
     /// Ring buffer of the most recent dispatcher targets (eip, esp, eax, ebx).
     pub recent: VecDeque<[u32; 4]>,
     pub recent_cap: usize,
@@ -101,6 +108,10 @@ impl Engine {
             max_api_calls: u64::MAX,
             tsc: 0,
             bad_functions: HashSet::default(),
+            idle_queue: None,
+            idle_us_per_fn: 0,
+            idle_done: 0,
+            idle_calls: 0,
             recent: VecDeque::new(),
             recent_cap: 0,
             dispatches: 0,
@@ -676,6 +687,63 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
         }
     }
     Ok(failed)
+}
+
+/// Translates functions discovery found before anything calls them, in batches, until
+/// host time `deadline_us`. The browser does this while it waits for real time, so
+/// code a game reaches later does not stall the frame it first runs in; the guest
+/// sees no difference. Returns how many were translated.
+pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
+    if m.engine_ref().idle_queue.is_none() {
+        let mut q: Vec<u32> = m.engine_ref().mods.iter().flat_map(|md| md.functions.iter().copied()).collect();
+        q.sort_unstable_by(|a, b| b.cmp(a));
+        let e = m.engine();
+        e.idle_queue = Some(q);
+        if e.idle_us_per_fn == 0 {
+            e.idle_us_per_fn = 200;
+        }
+    }
+    let mut done = 0;
+    loop {
+        let now = m.now_us();
+        // what fits in the time left by the running estimate, in small batches (a
+        // function can take far more than the average)
+        let per = m.engine_ref().idle_us_per_fn.max(20);
+        let n = (deadline_us.saturating_sub(now) / per).min(8) as usize;
+        if n == 0 {
+            break;
+        }
+        let batch: Vec<u32> = {
+            let e = m.engine();
+            let q = e.idle_queue.as_mut().expect("queue built above");
+            let mut b = Vec::with_capacity(n);
+            while b.len() < n {
+                match q.pop() {
+                    Some(a) if !e.funcs.contains_key(&a) && !e.bad_functions.contains(&a) => b.push(a),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            b
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let t = m.now_us();
+        match translate_batch(m, &batch) {
+            Ok(failed) => m.engine().bad_functions.extend(failed),
+            Err(_) => m.engine().bad_functions.extend(batch.iter().copied()),
+        }
+        // keep the estimate current (it includes the host's compile and instantiate)
+        let took = (m.now_us() - t) / batch.len() as u64;
+        let e = m.engine();
+        e.idle_us_per_fn = (e.idle_us_per_fn * 3 + took) / 4;
+        done += batch.len();
+    }
+    let e = m.engine();
+    e.idle_calls += 1;
+    e.idle_done += done;
+    done
 }
 
 /// Translates every function discovery found in the loaded modules.
