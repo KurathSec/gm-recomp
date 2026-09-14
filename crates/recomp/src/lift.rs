@@ -801,13 +801,29 @@ impl<'a> FuncEmit<'a> {
         self.i(W::End);
     }
 
-    fn ret(&mut self, extra: u32) {
+    fn ret(&mut self, extra: u32, live_out: u8) {
         self.pop32_to(L_T0);
         if extra != 0 {
             self.get(L_REG + 4);
             self.c(extra);
             self.i(W::I32Add);
             self.set(L_REG + 4);
+        }
+        // to an address this function pushed: stay in it (returning would unwind every
+        // caller to the dispatcher, which then re-enters each one at its return address)
+        let targets: Vec<u32> = self.cfg.ret_targets.iter().copied().filter(|t| self.index.contains_key(t)).collect();
+        if !targets.is_empty() {
+            self.materialize(live_out);
+            for t in targets {
+                self.get(L_T0);
+                self.c(t);
+                self.i(W::I32Eq);
+                self.i(W::If(BlockType::Empty));
+                self.depth += 1;
+                self.goto(t);
+                self.depth -= 1;
+                self.i(W::End);
+            }
         }
         self.get(L_T0);
         self.i(W::GlobalSet(Global::Eip as u32));
@@ -993,7 +1009,7 @@ impl<'a> FuncEmit<'a> {
             }
             Term::Ret => {
                 let extra = if instr.op_count() > 0 { instr.immediate16() as u32 } else { 0 };
-                self.ret(extra);
+                self.ret(extra, live_out);
             }
             Term::Trap => {
                 let kind = match instr.mnemonic() {

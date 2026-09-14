@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Module limit test</title>
+<script type="module">
+// How many small wasm modules a browser instantiates before it runs out of code
+// memory, by how their functions reach the shared table:
+//   ?mode=export  JS reads inst.exports and table.set()s them (what host.mjs does)
+//   ?mode=elem    the module writes its functions into the imported table itself
+// &per=N functions per module, &body=B bytes of filler code per function.
+const q = new URLSearchParams(location.search);
+const mode = q.get('mode') ?? 'export';
+const per = Number(q.get('per') ?? 1);
+const body = Number(q.get('body') ?? 200);
+const max = Number(q.get('max') ?? 40000);
+const send = (path, text) => fetch(path, { method: 'POST', body: text });
+
+const leb = (n) => { const o = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; o.push(b); } while (n); return o; };
+const sleb = (n) => { const o = []; for (;;) { const b = n & 0x7f; n >>= 7; if ((n === 0 && !(b & 0x40)) || (n === -1 && (b & 0x40))) { o.push(b); return o; } o.push(b | 0x80); } };
+const str = (s) => [...leb(s.length), ...new TextEncoder().encode(s)];
+const sec = (id, bytes) => [id, ...leb(bytes.length), ...bytes];
+const vec = (items) => [...leb(items.length), ...items.flat()];
+
+function moduleBytes(seed) {
+  const types = sec(1, vec([[0x60, 0, 0]]));
+  const imports = mode === 'elem'
+    ? sec(2, vec([[...str('m'), ...str('t'), 0x01, 0x70, 0x00, 0x01], [...str('m'), ...str('base'), 0x03, 0x7f, 0x00]]))
+    : sec(2, vec([[...str('m'), ...str('g'), 0x03, 0x7f, 0x01]]));
+  const funcs = sec(3, vec(Array.from({ length: per }, () => [0])));
+  const exports = mode === 'export' ? sec(7, vec(Array.from({ length: per }, (_, i) => [...str('f' + i), 0x00, ...leb(i)]))) : [];
+  const elems = mode === 'elem' ? sec(9, vec([[0x00, 0x23, 0x00, 0x0b, ...vec(Array.from({ length: per }, (_, i) => leb(i)))]])) : [];
+  // filler: repeated (i32.const k; drop) so modules have real code
+  const fn = (i) => {
+    const code = [];
+    for (let k = 0; code.length < body; k++) code.push(0x41, ...sleb((seed * 31 + i * 7 + k) | 0), 0x1a);
+    const b = [0, ...code, 0x0b];
+    return [...leb(b.length), ...b];
+  };
+  const code = sec(10, vec(Array.from({ length: per }, (_, i) => fn(i))));
+  return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...types, ...imports, ...funcs, ...exports, ...elems, ...code]);
+}
+
+const table = new WebAssembly.Table({ element: 'anyfunc', initial: 1 });
+const g = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+const t0 = performance.now();
+let n = 0;
+let err = '';
+const keep = [];
+try {
+  for (; n < max; n++) {
+    const mod = new WebAssembly.Module(moduleBytes(n));
+    if (mode === 'elem') {
+      const base = table.grow(per);
+      keep.push(new WebAssembly.Instance(mod, { m: { t: table, base: new WebAssembly.Global({ value: 'i32', mutable: false }, base) } }));
+    } else {
+      const inst = new WebAssembly.Instance(mod, { m: { g } });
+      const base = table.grow(per);
+      for (let i = 0; i < per; i++) table.set(base + i, inst.exports['f' + i]);
+      keep.push(inst);
+    }
+  }
+} catch (e) {
+  err = String(e);
+}
+await send('/log', `mode=${mode} per=${per} body=${body}: ${n} modules (${n * per} functions) in ${((performance.now() - t0) / 1000).toFixed(1)}s ${err}`);
+await send('/done', '');
+</script>

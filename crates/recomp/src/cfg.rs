@@ -61,6 +61,10 @@ pub struct Cfg {
     pub blocks: BTreeMap<u32, Block>,
     /// x87 instructions: ip -> 11-bit opcode (low 3 bits of the escape byte, then ModRM).
     pub fop: HashMap<u32, u16>,
+    /// Addresses a `ret` here may go to without leaving the function: ones it pushes
+    /// as immediates a little ahead of the push (Delphi's try/finally pushes the exit
+    /// label, falls into the finally code and `ret`s to it).
+    pub ret_targets: Vec<u32>,
 }
 
 const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
@@ -68,6 +72,7 @@ const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
 pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, String> {
     let mut blocks: BTreeMap<u32, Block> = BTreeMap::new();
     let mut fop: HashMap<u32, u16> = HashMap::new();
+    let mut ret_targets = Vec::new();
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
@@ -128,6 +133,15 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
                 return Err(format!("function at {entry:#x} exceeds {MAX_INSTRS_PER_FUNCTION} instructions"));
             }
             let next = instr.next_ip() as u32;
+            if instr.code() == iced_x86::Code::Pushd_imm32 {
+                let v = instr.immediate32();
+                // (discovery may list such a label as a function: it is a pushed code
+                // address; Delphi places nested routines before their parent, not after)
+                if v > ip && v - ip <= 0x1000 && !ret_targets.contains(&v) {
+                    ret_targets.push(v);
+                    queue.push_back(v);
+                }
+            }
             instrs.push(instr);
             // iced treats hlt/int3/int n as ordinary instructions; for translated user code
             // they all hand control to the runtime, so they end the block.
@@ -184,7 +198,7 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
         queue.extend(block.successors());
         blocks.insert(start, block);
     }
-    Ok(Cfg { entry, blocks, fop })
+    Ok(Cfg { entry, blocks, fop, ret_targets })
 }
 
 /// Four zero bytes at `va` (`add [eax],al` twice): memory, not code.

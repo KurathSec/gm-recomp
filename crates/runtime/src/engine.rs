@@ -40,6 +40,8 @@ pub struct ModInfo {
     pub base: u32,
     pub size: u32,
     pub functions: HashSet<u32>,
+    /// The same, in address order.
+    pub sorted: Vec<u32>,
     /// As discovery returns them (only looked up).
     pub jump_tables: std::collections::HashMap<u32, Vec<u32>>,
 }
@@ -59,6 +61,8 @@ pub struct Engine {
     pub ctl: Option<Ctl>,
     pub depth: u32,
     pub translated: usize,
+    /// Modules instantiated for translated code.
+    pub modules: usize,
     pub translate_us: u64,
     pub trace: bool,
     pub max_api_calls: u64,
@@ -103,6 +107,7 @@ impl Engine {
             ctl: None,
             depth: 0,
             translated: 0,
+            modules: 0,
             translate_us: 0,
             trace: false,
             max_api_calls: u64::MAX,
@@ -621,13 +626,24 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
             }
             Err(e) => m.print(&format!("[{name}] discovery failed: {e}")),
         }
-        m.engine().mods.push(ModInfo { name, base, size, functions, jump_tables });
+        let mut sorted: Vec<u32> = functions.iter().copied().collect();
+        sorted.sort_unstable();
+        m.engine().mods.push(ModInfo { name, base, size, functions, sorted, jump_tables });
     }
 }
 
-/// Translates the functions starting at `entries` into one module and registers them.
-/// Returns the entries that could not be translated.
-pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32>, String> {
+/// Functions a module holds at most when it is translated for a call: the called
+/// function, those it calls directly, then its neighbours in the image (code used
+/// together tends to lie together). Browsers bound the number of modules (Firefox
+/// runs out of code memory at a few thousand), so one per function does not last a
+/// long game.
+pub const CALL_BATCH: usize = 16;
+
+/// Translates the functions starting at `entries` into one module and registers them,
+/// together with untranslated functions they call directly, then functions next to
+/// the first one, until the module holds `fill`. Returns the entries that could not
+/// be translated.
+pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> Result<Vec<u32>, String> {
     let t = m.now_us();
     let shared = m.engine_ref().shared_memory;
     let funcs = std::mem::take(&mut m.engine().funcs);
@@ -650,6 +666,39 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
                 failed.push(entry);
             }
         }
+        // callees, breadth first; one that fails is left for when it is called
+        let bad = &m.engine_ref().bad_functions;
+        let mut queue: std::collections::VecDeque<u32> = entries.iter().flat_map(|&e| tr.direct_targets(e)).collect();
+        let mut tried: HashSet<u32> = HashSet::default();
+        while tr.len() < fill {
+            let Some(a) = queue.pop_front() else { break };
+            if !tried.insert(a) || funcs.contains_key(&a) || bad.contains(&a) || Process::stub_id(a).is_some() {
+                continue;
+            }
+            let Some(md) = mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
+            let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
+            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn };
+            if tr.add_function(a, &info).is_ok() {
+                queue.extend(tr.direct_targets(a));
+            }
+        }
+        if let Some(md) = entries.first().and_then(|&e| mods.iter().find(|md| e >= md.base && e < md.base + md.size)).filter(|_| tr.len() < fill) {
+            let at = md.sorted.partition_point(|&a| a < entries[0]);
+            let after = md.sorted[at..].iter();
+            let before = md.sorted[..at].iter().rev();
+            // the next ones first; a bounded look either way
+            for &a in after.take(256).chain(before.take(64)) {
+                if tr.len() >= fill {
+                    break;
+                }
+                if !tried.insert(a) || funcs.contains_key(&a) || bad.contains(&a) {
+                    continue;
+                }
+                let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
+                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn };
+                let _ = tr.add_function(a, &info);
+            }
+        }
         tr.finish()
     };
     m.engine().funcs = funcs;
@@ -669,8 +718,8 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
             }
             // Bisect to isolate the offending function.
             let (a, b) = entries.split_at(entries.len() / 2);
-            failed.extend(translate_batch(m, a)?);
-            failed.extend(translate_batch(m, b)?);
+            failed.extend(translate_batch(m, a, a.len())?);
+            failed.extend(translate_batch(m, b, b.len())?);
             return Ok(failed);
         }
     };
@@ -680,8 +729,17 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32]) -> Result<Vec<u32
         e.funcs.insert(*entry, idx);
     }
     e.translated += out.functions.len();
+    e.modules += 1;
     e.translate_us += now - t;
-    if e.trace {
+    let trace = e.trace;
+    if std::env::var_os("GMR_BATCH_LOG").is_some() {
+        let first = entries.first().copied().unwrap_or(0);
+        let known = e.mods.iter().any(|md| md.functions.contains(&first));
+        let in_mod = e.mods.iter().find(|md| first >= md.base && first < md.base + md.size).map(|md| md.name.clone()).unwrap_or_default();
+        let n = out.functions.len();
+        m.print(&format!("batch {first:#x} [{in_mod}{}] {n} functions", if known { "" } else { ", not discovered" }));
+    }
+    if trace {
         let lines: Vec<String> = out.unimplemented.iter().map(|(a, t)| format!("unimplemented instruction at {a:#x}: {t}")).collect();
         for l in lines {
             m.print(&l);
@@ -709,9 +767,10 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         let now = m.now_us();
         // what fits in the time left by the running estimate, in small batches (a
         // function can take far more than the average)
+        // (modules of at least 8: browsers bound how many there are)
         let per = m.engine_ref().idle_us_per_fn.max(20);
-        let n = (deadline_us.saturating_sub(now) / per).min(8) as usize;
-        if n == 0 {
+        let n = (deadline_us.saturating_sub(now) / per).min(32) as usize;
+        if n < 8 {
             break;
         }
         let batch: Vec<u32> = {
@@ -733,7 +792,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         // Failures are not recorded: a function can fail now and translate when it
         // runs (code a packer has not unpacked yet).
         let t = m.now_us();
-        let _ = translate_batch(m, &batch);
+        let _ = translate_batch(m, &batch, batch.len());
         // keep the estimate current (it includes the host's compile and instantiate)
         let took = (m.now_us() - t) / batch.len() as u64;
         let e = m.engine();
@@ -753,7 +812,7 @@ pub fn translate_all<M: Machine>(m: &mut M, chunk: usize) -> Result<usize, Strin
     entries.sort_unstable();
     let mut failed = 0;
     for c in entries.chunks(chunk.max(1)) {
-        failed += translate_batch(m, c)?.len();
+        failed += translate_batch(m, c, c.len())?.len();
     }
     Ok(failed)
 }
@@ -775,14 +834,49 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
         return Err(format!("function {addr:#x} cannot be translated"));
     }
     sync_modules(m);
-    let failed = translate_batch(m, &[addr])?;
-    if !failed.is_empty() {
+    // Not a function start: most likely a return address the guest goes back to after
+    // its stack was unwound (a thread switch). The frames above it return to theirs
+    // next, so those go into the same module.
+    let mut entries = vec![addr];
+    if !m.engine_ref().mods.iter().any(|md| md.functions.contains(&addr)) {
+        entries.extend(stack_continuations(m, addr, CALL_BATCH - 1));
+    }
+    let failed = translate_batch(m, &entries, CALL_BATCH)?;
+    if failed.contains(&addr) {
         m.engine().bad_functions.insert(addr);
         return Err(format!("cannot translate function at {addr:#x}"));
     }
     let i = m.engine_ref().funcs.get(&addr).copied().ok_or_else(|| format!("translation of {addr:#x} produced no function"))?;
     cache_resolved(m, addr, i);
     Ok(i)
+}
+
+/// Return addresses on the guest stack (values just after a call instruction in a
+/// loaded module) that have no translation yet, nearest first.
+fn stack_continuations<M: Machine>(m: &mut M, addr: u32, max: usize) -> Vec<u32> {
+    let esp = m.global(Global::Esp);
+    let mut out = Vec::new();
+    for k in 0..256 {
+        if out.len() >= max {
+            break;
+        }
+        // (the stack's top ends the scan)
+        let Ok(v) = m.read_u32(esp.wrapping_add(4 * k)) else { break };
+        let e = m.engine_ref();
+        if v == addr || out.contains(&v) || e.funcs.contains_key(&v) || e.bad_functions.contains(&v) || !e.mods.iter().any(|md| v >= md.base + 7 && v < md.base + md.size) {
+            continue;
+        }
+        let mut b = [0u8; 7];
+        if m.read(v - 7, &mut b).is_err() {
+            continue;
+        }
+        // call rel32, or call r/m32 (FF /2) of 2, 3, 4, 6 or 7 bytes
+        let after_call = b[2] == 0xE8 || [5usize, 4, 3, 1, 0].iter().any(|&k| b[k] == 0xFF && (b[k + 1] >> 3) & 7 == 2);
+        if after_call {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// Enters a translated function in the resolve cache that translated code probes

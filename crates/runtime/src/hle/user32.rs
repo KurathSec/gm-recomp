@@ -1287,6 +1287,9 @@ pub fn send_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> Resul
 /// position and button messages.
 /// A key's state change and its message to the focus window.
 fn key_event(c: &mut Ctx, vk: u8, scan: u16, down: bool) {
+    if c.p.trace {
+        c.p.log(format!("key {vk:#04x} {}", if down { "down" } else { "up" }));
+    }
     let k = &mut c.p.key_state[vk as usize];
     let was_down = *k & 0x80 != 0;
     if down {
@@ -1386,8 +1389,12 @@ pub(crate) fn pump_input(c: &mut Ctx) {
                 if let Some(i) = numpad_index(vk).filter(|_| scan & 0x100 == 0) {
                     numpad_key(c, i, vk, scan, down, numlock);
                 } else if matches!(vk, 0xA0 | 0xA1) && !down && c.p.numpad_shift & (1 << (vk - 0xA0)) != 0 {
-                    // a Shift the keypad already released
+                    // a Shift the keypad released: Windows presses it again before the
+                    // release (a press and release in one frame: I Wanna's one-frame
+                    // jump), and the keypad key's release no longer presses it
                     c.p.numpad_shift &= !(1 << (vk - 0xA0));
+                    key_event(c, vk, scan, true);
+                    key_event(c, vk, scan, false);
                 } else {
                     key_event(c, vk, scan, down);
                 }

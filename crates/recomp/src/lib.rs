@@ -59,6 +59,31 @@ impl<'m> Translator<'m> {
         Ok(())
     }
 
+    /// Functions the one at `entry` (added) calls or jumps to directly.
+    pub fn direct_targets(&self, entry: u32) -> Vec<u32> {
+        let Some(cfg) = self.cfgs.get(&entry) else { return Vec::new() };
+        let mut out = Vec::new();
+        for b in cfg.blocks.values() {
+            for i in &b.instrs {
+                if i.flow_control() == iced_x86::FlowControl::Call && i.op0_kind() == iced_x86::OpKind::NearBranch32 {
+                    out.push(i.near_branch_target() as u32);
+                }
+            }
+            if let cfg::Term::TailCall(t) = b.term {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.cfgs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cfgs.is_empty()
+    }
+
     pub fn finish(mut self) -> Output {
         // Imported functions: the runtime services, then every x87 fast path.
         let n_rt = (RT_FUNCS.len() + x87::FORMS.len()) as u32;

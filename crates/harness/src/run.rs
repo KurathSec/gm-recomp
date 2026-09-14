@@ -356,12 +356,13 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eprintln!("fpu: cw={:#06x} sw={:#06x} tw={:#06x}", final_fpu.control_word(), final_fpu.status_word(), final_fpu.tag_word());
     if let Some(p) = p {
         eprintln!(
-            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} in {} modules ({:.1}s)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
             e.resolves,
             e.translated,
+            e.modules,
             e.translate_us as f64 / 1e6,
             p.now_ms()
         );

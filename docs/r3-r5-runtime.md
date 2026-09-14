@@ -231,6 +231,21 @@ the new room's code is translated then).
   the first run of new code no longer pays for its translation in that frame. Room
   changes: untitled needle game's tutorial 171 -> 125 ms, Bread's first stage 124 ->
   108 ms (the rest is the game's own loading); `?noahead` turns it off.
+- Modules hold several functions. Firefox runs out of executable memory after a
+  bounded number of modules (`web/memtest/modlimit.html`: 16 349 small ones; a GM8
+  game stopped at ~7 600, its title-to-file-select startup with ahead translation),
+  however few functions each holds, so one module per function stopped Not Another
+  Needle Game at its file select. A call to untranslated code now translates up to
+  16 functions together (`engine::CALL_BATCH`): the called one, those it calls
+  directly, then its untranslated neighbours in the image; a return address reached
+  after an unwound stack takes the return addresses above it on the stack; ahead
+  translation makes modules of 8 to 32.
+- `ret` to an address the same function pushed (`cfg::Cfg::ret_targets`: Delphi's
+  try/finally pushes its exit label, falls into the finally code and `ret`s there)
+  continues in the function. It used to return to the dispatcher, which unwound every
+  caller and re-entered each at its return address as a new one-off function: Bread,
+  900 frames, 5.0 M dispatches -> 2 887 and 7 133 modules -> 697; frame cost median
+  Firefox 4.32 -> 2.10 ms, Chrome 2.28 -> 1.94 ms; translation Firefox 4.4 -> 0.8 s.
 - MCI decodes MP3s as they play (a whole song used to be decoded in the frame its room
   started: 361 ms in Bread); Delphi's resource-string lookups use a parsed resource
   directory per module.
