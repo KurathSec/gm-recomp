@@ -23,6 +23,47 @@ pub fn sse_mnemonics() -> Vec<Mnemonic> {
     ]
 }
 
+/// MMX instructions (and the SSE/SSE2 ones with an mm operand): integer forms that
+/// share a mnemonic with the xmm ones, moves and the conversions.
+pub fn mmx_mnemonics() -> Vec<Mnemonic> {
+    use Mnemonic::*;
+    vec![
+        Movq, Movd, Movntq, Movq2dq, Movdq2q, Pmovmskb, Pextrw, Pinsrw, Pshufw, Pand, Por, Pxor, Pandn, Pcmpeqb, Pcmpeqw,
+        Pcmpeqd, Pcmpgtb, Pcmpgtw, Pcmpgtd, Paddb, Paddw, Paddd, Paddq, Psubb, Psubw, Psubd, Psubq, Paddsb, Paddsw, Paddusb,
+        Paddusw, Psubsb, Psubsw, Psubusb, Psubusw, Pmullw, Pmaddwd, Pmaxsw, Pminsw, Pmaxub, Pminub, Pavgb, Pavgw, Pmulhw,
+        Pmulhuw, Pmuludq, Packuswb, Packsswb, Packssdw, Psllw, Pslld, Psllq, Psrlw, Psrld, Psrlq, Psraw, Psrad, Punpcklbw,
+        Punpcklwd, Punpckldq, Punpckhbw, Punpckhwd, Punpckhdq, Cvtpi2ps, Cvtpi2pd, Cvttps2pi, Cvtps2pi, Cvttpd2pi, Cvtpd2pi,
+    ]
+}
+
+/// The forms of `mnemonics` with an mm operand.
+pub fn mmx_codes(mnemonics: &[Mnemonic]) -> Vec<Code> {
+    let mut v = Vec::new();
+    for code in Code::values() {
+        let oc = code.op_code();
+        if !oc.is_instruction() || !oc.mode32() || !mnemonics.contains(&code.mnemonic()) {
+            continue;
+        }
+        let name = format!("{code:?}");
+        if name.starts_with("VEX") || name.starts_with("EVEX") || name.contains("r64") {
+            continue;
+        }
+        let mm = (0..oc.op_count()).any(|n| matches!(oc.op_kind(n), OpCodeOperandKind::mm_reg | OpCodeOperandKind::mm_rm | OpCodeOperandKind::mm_or_mem));
+        let ok = (0..oc.op_count()).all(|n| {
+            matches!(
+                oc.op_kind(n),
+                OpCodeOperandKind::mm_reg | OpCodeOperandKind::mm_rm | OpCodeOperandKind::mm_or_mem | OpCodeOperandKind::xmm_reg
+                    | OpCodeOperandKind::xmm_rm | OpCodeOperandKind::xmm_or_mem | OpCodeOperandKind::mem | OpCodeOperandKind::r32_reg
+                    | OpCodeOperandKind::r32_or_mem | OpCodeOperandKind::r32_rm | OpCodeOperandKind::imm8
+            )
+        });
+        if mm && ok {
+            v.push(code);
+        }
+    }
+    v
+}
+
 pub fn sse_codes(mnemonics: &[Mnemonic]) -> Vec<Code> {
     let mut v = Vec::new();
     for code in Code::values() {
@@ -121,6 +162,10 @@ pub fn sse_case(g: &mut Gen, codes: &[Code], max_instrs: usize) -> Option<Case> 
         for k in 0..oc.op_count() {
             match oc.op_kind(k) {
                 OpCodeOperandKind::xmm_reg | OpCodeOperandKind::xmm_rm => ops.push((0, g.rng.random_range(0..8))),
+                OpCodeOperandKind::mm_reg | OpCodeOperandKind::mm_rm => ops.push((4, g.rng.random_range(0..8))),
+                OpCodeOperandKind::mm_or_mem => {
+                    if g.rng.random_bool(0.6) { ops.push((4, g.rng.random_range(0..8))) } else { ops.push((2, 0)) }
+                }
                 OpCodeOperandKind::xmm_or_mem => {
                     if g.rng.random_bool(0.6) { ops.push((0, g.rng.random_range(0..8))) } else { ops.push((2, 0)) }
                 }
@@ -143,6 +188,7 @@ pub fn sse_case(g: &mut Gen, codes: &[Code], max_instrs: usize) -> Option<Case> 
         let to_reg = |k: u8, v: u64| -> Register {
             match k {
                 0 => Register::XMM0 + v as u32,
+                4 => Register::MM0 + v as u32,
                 _ => Register::EAX + v as u32,
             }
         };
@@ -186,6 +232,31 @@ pub fn sse_case(g: &mut Gen, codes: &[Code], max_instrs: usize) -> Option<Case> 
     }
     for x in 0..8 {
         input.fx[160 + 16 * x..176 + 16 * x].copy_from_slice(&random_xmm(g));
+    }
+    // x87 registers (TOP 0, all valid): mostly MMX values (exponent all ones), some
+    // doubles, whose mantissa an MMX read sees
+    input.fx[2] &= !0x38;
+    input.fx[3] &= !0x38;
+    input.fx[4] = 0xFF;
+    for r in 0..8 {
+        let slot = &mut input.fx[32 + 16 * r..42 + 16 * r];
+        if g.rng.random_bool(0.75) {
+            let v: [u8; 16] = random_xmm(g);
+            slot[..8].copy_from_slice(&v[..8]);
+            slot[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        } else {
+            let d = f64::from_bits(random_lane_f64(g));
+            let d = if d.is_nan() || d.is_subnormal() { 1.5 } else { d };
+            let b = d.to_bits();
+            let (sign, exp, frac) = (b >> 63, (b >> 52) & 0x7ff, b & ((1 << 52) - 1));
+            let (e80, m80) = match exp {
+                0 => (0u64, 0u64),
+                0x7ff => (0x7fff, 1 << 63),
+                _ => (exp + 16383 - 1023, (1 << 63) | frac << 11),
+            };
+            slot[..8].copy_from_slice(&m80.to_le_bytes());
+            slot[8..10].copy_from_slice(&((sign << 15 | e80) as u16).to_le_bytes());
+        }
     }
     Some(Case { input, instrs, codes: used, entries: Vec::new() })
 }

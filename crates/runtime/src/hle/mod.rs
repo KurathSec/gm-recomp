@@ -20,6 +20,7 @@ pub mod misc;
 pub mod msvcrt;
 pub mod nls;
 pub mod pads;
+pub mod profile;
 pub mod user32;
 
 use crate::mem::Guest;
@@ -293,6 +294,7 @@ impl Registry {
         threads::register(&mut r);
         pads::register(&mut r);
         dinput::register(&mut r);
+        profile::register(&mut r);
         r
     }
 

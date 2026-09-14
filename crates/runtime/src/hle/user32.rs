@@ -703,9 +703,18 @@ pub fn register(r: &mut Registry) {
         c.p.log(format!("MessageBox [{caption}]: {text}"));
         ok(4, 1)
     });
-    r.alias(u, "MessageBoxW", u, "MessageBoxA");
+    r.add(u, "MessageBoxW", |c| {
+        let (text, caption) = (c.wstr_arg(1), c.wstr_arg(2));
+        c.p.log(format!("MessageBox [{caption}]: {text}"));
+        ok(4, 1)
+    });
     r.add(u, "MessageBoxExA", |c| {
         let (text, caption) = (c.str_arg(1), c.str_arg(2));
+        c.p.log(format!("MessageBox [{caption}]: {text}"));
+        ok(5, 1)
+    });
+    r.add(u, "MessageBoxExW", |c| {
+        let (text, caption) = (c.wstr_arg(1), c.wstr_arg(2));
         c.p.log(format!("MessageBox [{caption}]: {text}"));
         ok(5, 1)
     });
@@ -2309,6 +2318,10 @@ pub fn register_extra(r: &mut Registry) {
     r.alias(u, "LoadImageW", u, "LoadImageA");
     r.alias(u, "PostThreadMessageW", u, "PostThreadMessageA");
     r.add(u, "DialogBoxParamW", |_c| ok(5, 0xFFFF_FFFF));
+    r.add(u, "DialogBoxIndirectParamW", |_c| ok(5, 0xFFFF_FFFF));
+    r.add(u, "DialogBoxIndirectParamA", |_c| ok(5, 0xFFFF_FFFF));
+    r.add(u, "SendDlgItemMessageW", |_c| ok(5, 0));
+    r.add(u, "SendDlgItemMessageA", |_c| ok(5, 0));
     r.add(u, "CreateDialogParamW", |_c| ok(5, 0));
     r.add(u, "GetDlgItemTextW", |c| {
         let (buf, cap) = (c.arg(2), c.arg(3));

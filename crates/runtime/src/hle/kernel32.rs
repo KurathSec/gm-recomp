@@ -469,6 +469,7 @@ pub fn register(r: &mut Registry) {
         if n < 0 {
             bytes.push(0);
         }
+        c.trace(format!("({s:?}) = {} bytes", bytes.len()));
         if cap == 0 {
             return ok(8, bytes.len() as u32);
         }
@@ -1188,14 +1189,6 @@ pub fn register(r: &mut Registry) {
     r.add(k, "GetOverlappedResult", |_c| ok(4, 0));
     r.add(k, "WinExec", |_c| ok(2, 0));
     r.add(k, "CreateProcessA", |_c| ok(10, 0));
-    r.add(k, "GetProfileIntA", |c| ok(3, c.arg(2)));
-    r.add(k, "GetPrivateProfileStringA", |c| {
-        let default = c.str_arg(2);
-        let n = copy_str_out(c, c.arg(3), c.arg(4), default.as_bytes());
-        ok(6, n)
-    });
-    r.add(k, "GetPrivateProfileIntA", |c| ok(4, c.arg(2)));
-    r.add(k, "WritePrivateProfileStringA", |_c| ok(4, 1));
     r.add(k, "GetProcessWorkingSetSize", |c| {
         write_out(c, c.arg(1), 0x0010_0000);
         write_out(c, c.arg(2), 0x0100_0000);
@@ -1608,7 +1601,7 @@ fn read_wsized(c: &Ctx, addr: u32, n: i32) -> String {
     }
 }
 
-fn decode_cp(cp: u32, bytes: &[u8]) -> String {
+pub(crate) fn decode_cp(cp: u32, bytes: &[u8]) -> String {
     match cp {
         65001 => String::from_utf8_lossy(bytes).into_owned(),
         932 => encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned(),
@@ -1617,11 +1610,24 @@ fn decode_cp(cp: u32, bytes: &[u8]) -> String {
 }
 
 pub(crate) fn encode_cp(cp: u32, s: &str) -> Vec<u8> {
-    match cp {
-        65001 => s.as_bytes().to_vec(),
-        932 => encoding_rs::SHIFT_JIS.encode(s).0.into_owned(),
-        _ => encoding_rs::WINDOWS_1252.encode(s).0.into_owned(),
+    let enc = match cp {
+        65001 => return s.as_bytes().to_vec(),
+        932 => encoding_rs::SHIFT_JIS,
+        _ => encoding_rs::WINDOWS_1252,
+    };
+    let (bytes, _, unmappable) = enc.encode(s);
+    if !unmappable {
+        return bytes.into_owned();
     }
+    // Windows writes the default character '?' for what the code page lacks
+    // (encoding_rs would write an HTML character reference)
+    let mut out = Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        let (b, _, bad) = enc.encode(ch.encode_utf8(&mut buf));
+        if bad { out.push(b'?') } else { out.extend_from_slice(&b) }
+    }
+    out
 }
 
 fn write_systemtime(c: &mut Ctx, p: u32) {
@@ -2164,7 +2170,7 @@ fn expand_env(c: &Ctx, s: &str) -> String {
     out
 }
 
-fn full_path(c: &Ctx, name: &str) -> String {
+pub(crate) fn full_path(c: &Ctx, name: &str) -> String {
     let n = name.replace('/', "\\");
     if n.len() >= 2 && n.as_bytes()[1] == b':' || n.starts_with("\\\\") {
         n
@@ -2750,14 +2756,12 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(k, "GlobalDeleteAtom", |_c| ok(1, 0));
     r.add(k, "GlobalGetAtomNameW", |c| {
-        let a = c.arg(0) as u16;
-        let name = c.p.atoms.iter().find(|(_, v)| **v == a).map(|(n, _)| n.clone()).unwrap_or_default();
+        let name = atom_name(c, c.arg(0) as u16);
         let n = copy_wstr_out(c, c.arg(1), c.arg(2), &name);
         ok(3, n)
     });
     r.add(k, "GlobalGetAtomNameA", |c| {
-        let a = c.arg(0) as u16;
-        let name = c.p.atoms.iter().find(|(_, v)| **v == a).map(|(n, _)| n.clone()).unwrap_or_default();
+        let name = atom_name(c, c.arg(0) as u16);
         let n = copy_str_out(c, c.arg(1), c.arg(2), name.as_bytes());
         ok(3, n)
     });
@@ -2766,6 +2770,8 @@ pub fn register_more(r: &mut Registry) {
     r.alias(k, "FindAtomW", k, "GlobalFindAtomW");
     r.alias(k, "FindAtomA", k, "GlobalFindAtomA");
     r.alias(k, "DeleteAtom", k, "GlobalDeleteAtom");
+    r.alias(k, "GetAtomNameW", k, "GlobalGetAtomNameW");
+    r.alias(k, "GetAtomNameA", k, "GlobalGetAtomNameA");
 
     // ---- mappings, processes, threads ----------------------------------------------
     r.add(k, "CreateFileMappingW", |c| {
@@ -2887,7 +2893,15 @@ fn global_atom(c: &mut Ctx, name: &str) -> u16 {
     let a = c.p.next_atom;
     c.p.next_atom = c.p.next_atom.wrapping_add(1).max(0xC000);
     c.p.atoms.insert(key, a);
+    c.p.atom_names.insert(a, name.to_string());
     a
+}
+
+fn atom_name(c: &Ctx, a: u16) -> String {
+    if a < 0xC000 {
+        return format!("#{a}");
+    }
+    c.p.atom_names.get(&a).cloned().or_else(|| c.p.atoms.iter().find(|(_, v)| **v == a).map(|(n, _)| n.clone())).unwrap_or_default()
 }
 
 pub fn register_paths(r: &mut Registry) {
@@ -2927,12 +2941,6 @@ pub fn register_extra(r: &mut Registry) {
         ok(3, (base != 0) as u32)
     });
     r.alias(k, "GetSystemTimePreciseAsFileTime", k, "GetSystemTimeAsFileTime");
-    // There is no win.ini: every key has its default.
-    r.add(k, "GetProfileStringA", |c| {
-        let default = if c.arg(2) != 0 { c.str_arg(2).into_bytes() } else { Vec::new() };
-        let n = copy_str_out(c, c.arg(3), c.arg(4), &default);
-        ok(5, n.min(c.arg(4).saturating_sub(1)))
-    });
     r.add(k, "CreateDirectoryExW", |c| {
         let p = wstr(c, c.arg(1));
         let r = create_dir(c, &p);

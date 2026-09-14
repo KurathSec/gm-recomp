@@ -247,6 +247,9 @@ fn import_one(input: &Path, out: &Path, sys: &inventory::SystemExports, force: b
     let files_dir = staging.join("files");
     let staged = extract::stage(input, &files_dir)?;
     let iexpress = extract::unwrap_iexpress(&files_dir, &staging.join("scratch"))?;
+    if let Some(installer) = extract::unwrap_nsis(&files_dir, &staging.join("scratch"))? {
+        println!("installed the NSIS package {installer}");
+    }
     let _ = fs::remove_dir_all(staging.join("scratch"));
 
     let mut slug = slugify(&staged.title);

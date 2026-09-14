@@ -71,6 +71,10 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
+    if zero_filled(mem, entry) {
+        // nothing to translate yet: a packer has not unpacked it (or it is not code)
+        return Err(format!("function at {entry:#x} is zero-filled memory"));
+    }
     while let Some(start) = queue.pop_front() {
         if blocks.contains_key(&start) {
             continue;
@@ -157,7 +161,10 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
                 }
                 FlowControl::UnconditionalBranch => {
                     let target = instr.near_branch_target() as u32;
-                    term = if target != entry && (info.is_function)(target) { Term::TailCall(target) } else { Term::Jump(target) };
+                    // A jump into zero-filled memory (a packer's stub jumping to the code it
+                    // unpacks there) goes through the dispatcher, so the target is
+                    // translated when it runs, not from the bytes it has now.
+                    term = if target != entry && ((info.is_function)(target) || zero_filled(mem, target)) { Term::TailCall(target) } else { Term::Jump(target) };
                 }
                 FlowControl::IndirectBranch => {
                     term = match info.jump_tables.get(&(instr.ip() as u32)) {
@@ -178,6 +185,12 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
         blocks.insert(start, block);
     }
     Ok(Cfg { entry, blocks, fop })
+}
+
+/// Four zero bytes at `va` (`add [eax],al` twice): memory, not code.
+fn zero_filled(mem: &dyn GuestMem, va: u32) -> bool {
+    let mut b = [0u8; 4];
+    mem.read(va, &mut b) && b == [0; 4]
 }
 
 /// The call target pops its return address right away (and is not the `call $+5`

@@ -103,6 +103,9 @@ pub enum FxCompare {
     X87,
     /// x87 registers within ~53 bits (transcendental results), status C1/PE ignored.
     X87Approx,
+    /// xmm registers and the x87 register images MMX writes (tags not compared: an
+    /// MMX instruction marks all eight valid, the translation only those it writes).
+    Mmx,
 }
 
 fn ext_to_f64(b: &[u8]) -> f64 {
@@ -117,7 +120,7 @@ fn ext_to_f64(b: &[u8]) -> f64 {
 }
 
 pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], fx: FxCompare) -> Vec<Diff> {
-    let compare_xmm = fx == FxCompare::Xmm;
+    let compare_xmm = matches!(fx, FxCompare::Xmm | FxCompare::Mmx);
     let mut diffs = Vec::new();
     fn push_into(diffs: &mut Vec<Diff>, field: &str, a: String, b: String) {
         if a != b {
@@ -179,6 +182,15 @@ pub fn compare(native: &CaseOut, wasm: &CaseOut, instrs: &[Instruction], fx: FxC
                 }
             } else {
                 push!(&format!("st{i}"), hex(a), hex(b));
+            }
+        }
+    }
+    if fx == FxCompare::Mmx {
+        for i in 0..8 {
+            let a = &native.fx[32 + 16 * i..42 + 16 * i];
+            let b = &wasm.fx[32 + 16 * i..42 + 16 * i];
+            if a != b {
+                push!(&format!("mm{i}/st"), hex(a), hex(b));
             }
         }
     }

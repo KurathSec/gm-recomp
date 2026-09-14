@@ -237,6 +237,8 @@ fn main() -> Result<()> {
             };
             let mut codes = if mode == "sse" {
                 ssegen::sse_codes(&ssegen::sse_mnemonics())
+            } else if mode == "mmx" {
+                ssegen::mmx_codes(&ssegen::mmx_mnemonics())
             } else if mode == "x87" {
                 x87gen::x87_codes(&x87gen::x87_mnemonics())
             } else if mode == "x87fast" {
@@ -264,7 +266,7 @@ fn main() -> Result<()> {
             let mut cases = Vec::new();
             while cases.len() < count {
                 let c = match mode.as_str() {
-                    "sse" => ssegen::sse_case(&mut g, &codes, max_instrs),
+                    "sse" | "mmx" => ssegen::sse_case(&mut g, &codes, max_instrs),
                     "x87" => x87gen::x87_case(&mut g, &codes, max_instrs),
                     "x87trans" => x87gen::x87_case_mode(&mut g, &codes, max_instrs, x87gen::Style::Trans),
                     "x87fast" => x87gen::x87_case_mode(&mut g, &codes, max_instrs, x87gen::Style::Fast),
@@ -314,6 +316,7 @@ fn main() -> Result<()> {
                 };
                 let fxmode = match mode.as_str() {
                     "sse" => compare::FxCompare::Xmm,
+                    "mmx" => compare::FxCompare::Mmx,
                     "x87" | "x87fast" => compare::FxCompare::X87,
                     "x87trans" => compare::FxCompare::X87Approx,
                     _ => compare::FxCompare::None,

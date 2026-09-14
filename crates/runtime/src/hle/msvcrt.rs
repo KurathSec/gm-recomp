@@ -1235,6 +1235,25 @@ fn itoa(v: u64, neg: bool, radix: u32) -> Vec<u8> {
     digits
 }
 
+/// _vsnwprintf: the wide format string formatted narrow (%s takes wide strings), then
+/// widened into `buf` (`cap` units; -1 when it does not fit with its terminator).
+fn snwprintf(c: &mut Ctx, buf: u32, cap: u32, fmt: u32, va: u32) -> u32 {
+    let f = c.host.read_wstr(fmt).unwrap_or_default();
+    let mut va = VaList { p: va };
+    let out = format(c, f.as_bytes(), &mut va, true);
+    let text: Vec<u16> = String::from_utf8_lossy(&out).encode_utf16().collect();
+    let n = text.len().min(cap as usize);
+    for (i, u) in text[..n].iter().enumerate() {
+        let _ = c.host.write_u16(buf + 2 * i as u32, *u);
+    }
+    if text.len() < cap as usize {
+        let _ = c.host.write_u16(buf + 2 * text.len() as u32, 0);
+        text.len() as u32
+    } else {
+        0xFFFF_FFFF
+    }
+}
+
 fn write_cstr(c: &mut Ctx, p: u32, s: &[u8]) {
     let mut b = s.to_vec();
     b.push(0);
@@ -1599,21 +1618,12 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(m, "_vsnwprintf", |c| {
         let (buf, cap, fmt, va) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
-        let f = c.host.read_wstr(fmt).unwrap_or_default();
-        let mut va = VaList { p: va };
-        // narrow formatting of the wide format string: %s takes wide strings here
-        let out = format(c, f.as_bytes(), &mut va, true);
-        let text: Vec<u16> = String::from_utf8_lossy(&out).encode_utf16().collect();
-        let n = text.len().min(cap as usize);
-        for (i, u) in text[..n].iter().enumerate() {
-            let _ = c.host.write_u16(buf + 2 * i as u32, *u);
-        }
-        if text.len() < cap as usize {
-            let _ = c.host.write_u16(buf + 2 * text.len() as u32, 0);
-            ok(text.len() as u32)
-        } else {
-            ok(0xFFFF_FFFF)
-        }
+        ok(snwprintf(c, buf, cap, fmt, va))
+    });
+    r.add(m, "_snwprintf", |c| {
+        let (buf, cap, fmt) = (c.arg(0), c.arg(1), c.arg(2));
+        let va = c.regs.esp + 16;
+        ok(snwprintf(c, buf, cap, fmt, va))
     });
     r.add(m, "sscanf", |c| {
         let input = c.host.read_cstr(c.arg(0)).unwrap_or_default();
@@ -1645,6 +1655,72 @@ pub fn register_more(r: &mut Registry) {
             let _ = c.host.write_u8(dst + k as u32, 0);
         }
         ok(k as u32)
+    });
+    r.add(m, "wcstoul", |c| {
+        let (p, end, base) = (c.arg(0), c.arg(1), c.arg(2));
+        let w = c.host.read_wstr(p).unwrap_or_default();
+        // digits are ASCII: one byte per character
+        let s: Vec<u8> = w.chars().map(|ch| if ch.is_ascii() { ch as u8 } else { 0xFF }).collect();
+        let (v, n) = parse_long(&s, base);
+        if end != 0 {
+            let _ = c.host.write_u32(end, p + 2 * n as u32);
+        }
+        ok(v as u32)
+    });
+    r.add(m, "abs", |c| ok(c.arg_i32(0).wrapping_abs() as u32));
+    r.alias(m, "labs", m, "abs");
+    r.add_data(m, "_adjust_fdiv", 4, |_| vec![0; 4]);
+    r.add(m, "getenv", |c| {
+        let name = c.str_arg(0);
+        let Some(v) = c.p.env.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)).map(|(_, v)| v.clone()) else { return ok(0) };
+        let key = name.to_ascii_uppercase();
+        if let Some(&p) = c.p.crt_getenv.get(&key) {
+            if c.host.read_cstr_lossy(p) == v {
+                return ok(p);
+            }
+        }
+        let p = strdup(c, &super::kernel32::encode_cp(1252, &v));
+        c.p.crt_getenv.insert(key, p);
+        ok(p)
+    });
+    r.add(m, "_fullpath", |c| {
+        let (buf, rel, cap) = (c.arg(0), c.arg(1), c.arg(2));
+        let rel = if rel == 0 { String::new() } else { c.str_arg(1) };
+        let full = super::kernel32::full_path(c, &rel);
+        let bytes = super::kernel32::encode_cp(1252, &full);
+        if buf == 0 {
+            return ok(strdup(c, &bytes));
+        }
+        if bytes.len() >= cap as usize {
+            set_errno(c, 34); // ERANGE
+            return ok(0);
+        }
+        write_cstr(c, buf, &bytes);
+        ok(buf)
+    });
+    r.add(m, "_stat", |c| {
+        let (path, out) = (c.str_arg(0), c.arg(1));
+        let Some(meta) = c.p.fs.stat(&c.p.vpath(&path)) else {
+            set_errno(c, 2); // ENOENT
+            return ok(0xFFFF_FFFF);
+        };
+        // struct _stat with 32-bit time_t: dev, ino:u16, mode:u16, nlink, uid, gid, rdev, size, atime, mtime, ctime
+        let exe = [".exe", ".com", ".bat", ".cmd"].iter().any(|e| path.to_ascii_lowercase().ends_with(e));
+        let mut mode: u32 = if meta.is_dir { 0x4000 | 0x1C0 } else { 0x8000 | 0x180 | if exe { 0x40 } else { 0 } };
+        mode |= (mode & 0x1C0) >> 3 | (mode & 0x1C0) >> 6;
+        let drive = path.as_bytes().get(1).filter(|&&b| b == b':').map(|_| (path.as_bytes()[0].to_ascii_uppercase() - b'A') as u32).unwrap_or(2);
+        let time = if meta.mtime > 116_444_736_000_000_000 { ((meta.mtime - 116_444_736_000_000_000) / 10_000_000) as u32 } else { 0 };
+        let mut b = vec![0u8; 36];
+        b[0..4].copy_from_slice(&drive.to_le_bytes());
+        b[6..8].copy_from_slice(&(mode as u16).to_le_bytes());
+        b[8..10].copy_from_slice(&1u16.to_le_bytes());
+        b[16..20].copy_from_slice(&drive.to_le_bytes());
+        b[20..24].copy_from_slice(&(meta.size as u32).to_le_bytes());
+        for k in 0..3 {
+            b[24 + 4 * k..28 + 4 * k].copy_from_slice(&time.to_le_bytes());
+        }
+        let _ = c.host.write(out, &b);
+        ok(0)
     });
     r.add(m, "wctomb", |c| {
         let (dst, wc) = (c.arg(0), c.arg(1) & 0xFFFF);

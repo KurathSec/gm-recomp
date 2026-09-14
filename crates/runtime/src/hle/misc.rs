@@ -545,6 +545,12 @@ pub fn register(r: &mut Registry) {
         let e = open_key(c, c.arg(0), &sub, out);
         ok(3, e)
     });
+    r.add(a, "RegCreateKeyW", |c| {
+        let sub = c.wstr_arg(1);
+        let out = c.arg(2);
+        let e = open_key(c, c.arg(0), &sub, out);
+        ok(3, e)
+    });
     r.add(a, "RegCloseKey", |c| {
         let h = c.arg(0);
         if root_name(h).is_none() {
@@ -600,6 +606,7 @@ pub fn register(r: &mut Registry) {
     r.add(a, "RegEnumKeyExA", |_c| ok(8, ERROR_NO_MORE_ITEMS));
     r.alias(a, "RegEnumKeyExW", a, "RegEnumKeyExA");
     r.add(a, "RegEnumKeyA", |_c| ok(4, ERROR_NO_MORE_ITEMS));
+    r.alias(a, "RegEnumKeyW", a, "RegEnumKeyA");
     r.add(a, "RegEnumValueA", |_c| ok(8, ERROR_NO_MORE_ITEMS));
     r.alias(a, "RegEnumValueW", a, "RegEnumValueA");
     r.add(a, "RegQueryInfoKeyA", |c| {
@@ -733,6 +740,8 @@ pub fn register(r: &mut Registry) {
         "CoInitializeSecurity" => (9, S_OK),
         "CoMarshalInterThreadInterfaceInStream" => (3, E_FAIL),
         "CoGetInterfaceAndReleaseStream" => (3, E_FAIL),
+        // no cross-apartment marshaling: callers treat the failure as "no marshaler"
+        "CoCreateFreeThreadedMarshaler" => (2, E_OUTOFMEMORY),
     });
     r.add(o, "CoCreateInstance", |c| {
         let (clsid_p, iid_p, ppv) = (c.arg(0), c.arg(3), c.arg(4));
@@ -1758,6 +1767,15 @@ pub fn register(r: &mut Registry) {
         "DirectDrawEnumerateW" => (2, 0),
         "DirectDrawEnumerateExA" => (3, 0),
         "DirectDrawEnumerateExW" => (3, 0),
+    });
+    // Installable drivers (ACM codecs open theirs this way): there are none.
+    const_apis!(r, "winmm.dll", {
+        "OpenDriver" => (3, 0),
+        "CloseDriver" => (3, 0),
+        "SendDriverMessage" => (4, 0),
+        "DefDriverProc" => (5, 0),
+        "DrvGetModuleHandle" => (1, 0),
+        "GetDriverModuleHandle" => (1, 0),
     });
     const_apis!(r, "dinput.dll", {
         "DirectInputCreateA" => (4, E_NOINTERFACE),

@@ -557,7 +557,8 @@ pub fn rt_fpu<M: Machine>(m: &mut M, code: i32, a: u32, b: u32, ip: u32, fop: u3
 pub fn cpuid_regs(leaf: u32, _sub: u32) -> (u32, u32, u32, u32) {
     match leaf {
         0 => (1, 0x756E_6547, 0x6C65_746E, 0x4965_6E69),
-        // FPU, TSC, CX8, CMOV, FXSR, SSE, SSE2 (no MMX: mm registers are not lifted)
+        // FPU, TSC, CX8, CMOV, FXSR, SSE, SSE2. MMX is translated (code that only checks
+        // SSE uses it) but not advertised, so code that asks takes the paths tested so far.
         1 => (0x0001_06A5, 0x0001_0800, 0, 0x0700_8111),
         0x8000_0000 => (0x8000_0000, 0, 0, 0),
         _ => (0, 0, 0, 0),
@@ -729,11 +730,10 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         if batch.is_empty() {
             break;
         }
+        // Failures are not recorded: a function can fail now and translate when it
+        // runs (code a packer has not unpacked yet).
         let t = m.now_us();
-        match translate_batch(m, &batch) {
-            Ok(failed) => m.engine().bad_functions.extend(failed),
-            Err(_) => m.engine().bad_functions.extend(batch.iter().copied()),
-        }
+        let _ = translate_batch(m, &batch);
         // keep the estimate current (it includes the host's compile and instantiate)
         let took = (m.now_us() - t) / batch.len() as u64;
         let e = m.engine();
@@ -1006,6 +1006,10 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         let r = |name: &str| read(m, name);
         collect_order(exe, &r, &mut seen, &mut order)?;
     }
+    // Windows maps the exe before its DLLs: keep its preferred range free for it (an
+    // exe without relocations cannot go anywhere else).
+    let exe_range = read(m, exe).and_then(|b| pe::Pe::parse(&b).ok().map(|pe| (pe.image_base, pe.size_of_image.div_ceil(0x1000) * 0x1000)));
+    let mut reserved = exe_range.and_then(|(base, size)| m.engine().p.as_mut()?.vm.alloc(base, size, false, crate::mem::PAGE_NOACCESS, false, "exe"));
     let mut attach = Vec::new();
     let (mut entry, mut image_base) = (0, 0);
     for name in order {
@@ -1013,6 +1017,11 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         let in_game = m.engine_ref().process().fs.is_file(&name);
         let guest_path = if in_game { format!("C:\\game\\{name}") } else { format!("C:\\Windows\\system32\\{name}") };
         let mut p = m.engine().p.take().ok_or("process not available")?;
+        if name.eq_ignore_ascii_case(exe) {
+            if let Some(base) = reserved.take() {
+                p.vm.release(base);
+            }
+        }
         let loaded = {
             let req = crate::LoadRequest { name: &name, path: &guest_path, bytes };
             let mut resolver = crate::StubResolver { registry: &mut p.registry, modules: &p.modules };

@@ -321,6 +321,9 @@ pub struct Process {
     pub exit_code: Option<u32>,
     pub tls_used: Vec<bool>,
     pub atoms: HashMap<String, u16>,
+    /// Atom -> its name as first added (lookups ignore case; GetAtomName keeps it, and
+    /// MinGW's runtime encodes a pointer in the letter case of an atom name).
+    pub atom_names: HashMap<u16, String>,
     pub next_atom: u16,
     pub classes: HashMap<String, WndClass>,
     pub windows: HashMap<u32, Window>,
@@ -369,6 +372,8 @@ pub struct Process {
     pub crt_rand: u32,
     /// setlocale's "C" string.
     pub crt_locale: u32,
+    /// getenv's copies of the variables it returned (they stay valid).
+    pub crt_getenv: HashMap<String, u32>,
     /// AllocateLocallyUniqueId's counter.
     pub next_luid: u64,
     /// Characters written to stdout one at a time (fputc), until the line ends.
@@ -466,6 +471,7 @@ impl Process {
             exit_code: None,
             tls_used: vec![false; 1088],
             atoms: HashMap::default(),
+            atom_names: HashMap::default(),
             next_atom: 0xC000,
             classes: HashMap::default(),
             windows: HashMap::default(),
@@ -503,6 +509,7 @@ impl Process {
             crt_files: HashMap::default(),
             crt_rand: 1,
             crt_locale: 0,
+            crt_getenv: HashMap::default(),
             next_luid: 0,
             crt_line: Vec::new(),
             resources: HashMap::default(),

@@ -245,6 +245,60 @@ pub fn unwrap_iexpress(files_dir: &Path, scratch: &Path) -> Result<Option<IExpre
     Ok(None)
 }
 
+/// If a top-level exe is an NSIS installer, installs it: extracts what it would put in
+/// the install directory (7z reads NSIS) and deletes the installer. Returns its name.
+pub fn unwrap_nsis(files_dir: &Path, scratch: &Path) -> Result<Option<String>> {
+    for entry in fs::read_dir(files_dir)? {
+        let path = entry?.path();
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        if Pe::parse(&bytes).is_err() || !bytes.windows(12).any(|w| w == b"NullsoftInst") {
+            continue;
+        }
+        drop(bytes);
+        let unpacked = scratch.join("nsis");
+        fs::create_dir_all(&unpacked)?;
+        let status = Command::new("7z")
+            .arg("x")
+            .arg("-y")
+            .arg(format!("-o{}", unpacked.display()))
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .context("running 7z (is p7zip installed?)")?;
+        if !status.success() {
+            bail!("7z failed to extract the NSIS installer {}", path.display());
+        }
+        fs::remove_file(&path)?;
+        // $INSTDIR is the game's directory; $TEMP, $PLUGINSDIR (the installer's own
+        // plugins, DirectX setup) and the uninstaller are not part of the game.
+        let move_into = |from: &Path, to: &Path| -> Result<()> {
+            for e in fs::read_dir(from)? {
+                let e = e?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('$') || name.eq_ignore_ascii_case("uninstall.exe") || name.eq_ignore_ascii_case("uninst.exe") {
+                    continue;
+                }
+                let dst = to.join(&name);
+                if !dst.exists() {
+                    fs::rename(e.path(), dst)?;
+                }
+            }
+            Ok(())
+        };
+        let instdir = unpacked.join("$INSTDIR");
+        if instdir.is_dir() {
+            move_into(&instdir, files_dir)?;
+        }
+        move_into(&unpacked, files_dir)?;
+        fs::remove_dir_all(&unpacked)?;
+        return Ok(Some(path.file_name().unwrap().to_string_lossy().into_owned()));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

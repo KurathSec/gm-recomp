@@ -1,10 +1,17 @@
 //! SSE/SSE2 lifting onto wasm SIMD. XMM registers are v128 globals; scalar
 //! double/single operations work on lane 0 and keep the other lanes, as the
 //! hardware does. NaN payloads are not reproduced (wasm does not define them).
+//!
+//! MMX registers are the x87 registers' mantissas, as on the hardware: mmN is
+//! physical register RN in the thread's x87 block (`fpu::block`). Packed MMX
+//! operations run on a v128 holding the 64-bit value in both halves and keep the
+//! low half; the ones whose lanes cross the halves (packs, high unpacks, pshufw,
+//! pmovmskb) arrange their operands first.
 
 use crate::abi::Global;
 use crate::flags;
-use crate::lift::{FuncEmit, L_D0, L_FLAG, L_Q0, L_T0, L_T1, L_V0, L_V1, mem0};
+use crate::lift::{FuncEmit, L_D0, L_FLAG, L_MM, L_MQ, L_Q0, L_T0, L_T1, L_V0, L_V1, mem0};
+use fpu::block as fb;
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
 use wasm_encoder::{BlockType, Instruction as W, MemArg};
 
@@ -25,30 +32,115 @@ fn shuffle_lanes(lane_bytes: u8, pick: impl Fn(u8) -> (bool, u8)) -> [u8; 16] {
     out
 }
 
+fn mem_at(offset: u32) -> MemArg {
+    MemArg { offset: offset as u64, ..mem0() }
+}
+
 impl<'a> FuncEmit<'a> {
+    /// Pushes an xmm register, or an mm register as an i64x2 splat.
     fn xget(&mut self, r: Register) {
-        self.i(W::GlobalGet(xmm_global(r)));
+        if r.is_mm() {
+            self.mm_get(r);
+            self.i(W::I64x2Splat);
+        } else {
+            self.i(W::GlobalGet(xmm_global(r)));
+        }
     }
 
+    /// Pops a v128 into an xmm register, or its low 64 bits into an mm register.
     fn xset(&mut self, r: Register) {
-        self.i(W::GlobalSet(xmm_global(r)));
+        if r.is_mm() {
+            self.i(W::I64x2ExtractLane(0));
+            self.mm_set(r);
+        } else {
+            self.i(W::GlobalSet(xmm_global(r)));
+        }
     }
 
-    /// Pushes a v128 from an xmm register or a 16-byte memory operand.
+    /// L_MM = the thread's x87 block.
+    fn mm_block(&mut self) {
+        self.i(W::GlobalGet(Global::FsBase as u32));
+        self.c(fb::OFFSET);
+        self.i(W::I32Sub);
+        self.i(W::LocalSet(L_MM));
+    }
+
+    /// Pushes mmN (i64): the 80-bit image's mantissa, or that of the double the
+    /// register holds (a zero, an infinity or a normal number).
+    fn mm_get(&mut self, r: Register) {
+        let n = r.number() as u32;
+        self.mm_block();
+        self.i(W::LocalGet(L_MM));
+        self.i(W::I64Load(mem_at(fb::EXT + 10 * n)));
+        // from the double: exponent 0 -> 0, else (fraction | 1 << 52) << 11
+        self.i(W::LocalGet(L_MM));
+        self.i(W::I64Load(mem_at(fb::REGS + 8 * n)));
+        self.i(W::LocalSet(L_MQ));
+        self.i(W::LocalGet(L_MQ));
+        self.i(W::I64Const((1 << 52) - 1));
+        self.i(W::I64And);
+        self.i(W::I64Const(1 << 52));
+        self.i(W::I64Or);
+        self.i(W::I64Const(11));
+        self.i(W::I64Shl);
+        self.i(W::I64Const(0));
+        self.i(W::LocalGet(L_MQ));
+        self.i(W::I64Const(0x7ff0_0000_0000_0000));
+        self.i(W::I64And);
+        self.i(W::I64Const(0));
+        self.i(W::I64Ne);
+        self.i(W::Select);
+        self.i(W::LocalGet(L_MM));
+        self.i(W::I32Load8U(mem_at(fb::KIND + n)));
+        self.c(fb::EXT_IMAGE as u32);
+        self.i(W::I32And);
+        self.i(W::Select);
+    }
+
+    /// Pops an i64 into mmN: exponent and sign all ones, the register valid, TOP 0.
+    fn mm_set(&mut self, r: Register) {
+        let n = r.number() as u32;
+        self.i(W::LocalSet(L_MQ));
+        self.mm_block();
+        self.i(W::LocalGet(L_MM));
+        self.i(W::LocalGet(L_MQ));
+        self.i(W::I64Store(mem_at(fb::EXT + 10 * n)));
+        self.i(W::LocalGet(L_MM));
+        self.c(0xFFFF);
+        self.i(W::I32Store16(mem_at(fb::EXT + 10 * n + 8)));
+        self.i(W::LocalGet(L_MM));
+        self.c((fb::VALID | fb::EXT_IMAGE) as u32);
+        self.i(W::I32Store8(mem_at(fb::KIND + n)));
+        self.i(W::LocalGet(L_MM));
+        self.c(0);
+        self.i(W::I32Store(mem_at(fb::TOP)));
+    }
+
+    /// Pushes a v128 from an xmm/mm register or a memory operand (an 8-byte one is
+    /// loaded with the upper half zero).
     fn vsrc(&mut self, instr: &Instruction, n: u32) {
         match instr.op_kind(n) {
             OpKind::Register => self.xget(instr.op_register(n)),
             OpKind::Memory => {
                 self.addr(instr);
-                self.i(W::V128Load(mem0()));
+                if instr.memory_size().size() == 8 {
+                    self.i(W::V128Load64Zero(mem0()));
+                    if (0..instr.op_count()).any(|k| instr.op_kind(k) == OpKind::Register && instr.op_register(k).is_mm()) {
+                        self.i(W::I64x2ExtractLane(0));
+                        self.i(W::I64x2Splat);
+                    }
+                } else {
+                    self.i(W::V128Load(mem0()));
+                }
             }
             _ => unreachable!(),
         }
     }
 
-    /// Pushes the low 64 bits (i64) of an xmm register or an m64.
+    /// Pushes the low 64 bits (i64) of an xmm/mm register or an m64.
     fn src64(&mut self, instr: &Instruction, n: u32) {
         match instr.op_kind(n) {
+            OpKind::Register if instr.op_register(n).is_mm() => self.mm_get(instr.op_register(n)),
             OpKind::Register => {
                 self.xget(instr.op_register(n));
                 self.i(W::I64x2ExtractLane(0));
@@ -326,7 +418,108 @@ impl<'a> FuncEmit<'a> {
         let reg1 = instr.op_count() > 1 && instr.op1_kind() == OpKind::Register;
         let is_xmm0 = reg0 && instr.op0_register().is_xmm();
         let is_xmm1 = reg1 && instr.op1_register().is_xmm();
+        let is_mm0 = reg0 && instr.op0_register().is_mm();
+        let is_mm1 = reg1 && instr.op1_register().is_mm();
         match m {
+            // ---- MMX moves and the forms that differ from the xmm ones ---------------------
+            Movq | Movntq if is_mm0 || is_mm1 => {
+                if is_mm0 {
+                    self.src64(instr, 1);
+                    self.mm_set(instr.op0_register());
+                } else {
+                    self.addr(instr);
+                    self.mm_get(instr.op1_register());
+                    self.i(W::I64Store(mem0()));
+                }
+            }
+            Movd if is_mm0 || is_mm1 => {
+                if is_mm0 {
+                    self.read_op(instr, 1, false);
+                    self.i(W::I64ExtendI32U);
+                    self.mm_set(instr.op0_register());
+                } else if instr.op0_kind() == OpKind::Memory {
+                    self.addr(instr);
+                    self.mm_get(instr.op1_register());
+                    self.i(W::I32WrapI64);
+                    self.i(W::I32Store(mem0()));
+                } else {
+                    self.mm_get(instr.op1_register());
+                    self.i(W::I32WrapI64);
+                    self.i(W::LocalSet(L_T1));
+                    self.write_reg_from(instr.op0_register(), L_T1);
+                }
+            }
+            Movq2dq => {
+                self.mm_get(instr.op1_register());
+                self.i(W::I64x2Splat);
+                self.i(W::I64Const(0));
+                self.i(W::I64x2ReplaceLane(1));
+                self.xset(instr.op0_register());
+            }
+            Movdq2q => {
+                self.xget(instr.op1_register());
+                self.i(W::I64x2ExtractLane(0));
+                self.mm_set(instr.op0_register());
+            }
+            Pmovmskb if is_mm1 => {
+                self.xget(instr.op1_register());
+                self.i(W::I8x16Bitmask);
+                self.c(0xFF);
+                self.i(W::I32And);
+                self.i(W::LocalSet(L_T1));
+                self.write_reg_from(instr.op0_register(), L_T1);
+            }
+            Pextrw if is_mm1 => {
+                self.xget(instr.op1_register());
+                self.i(W::I16x8ExtractLaneU(instr.immediate8() & 3));
+                self.i(W::LocalSet(L_T1));
+                self.write_reg_from(instr.op0_register(), L_T1);
+            }
+            Pinsrw if is_mm0 => {
+                let d = instr.op0_register();
+                self.xget(d);
+                self.read_op(instr, 1, false);
+                self.i(W::I16x8ReplaceLane(instr.immediate8() & 3));
+                self.xset(d);
+            }
+            Pshufw => {
+                let imm = instr.immediate8();
+                self.vsrc(instr, 1);
+                self.i(W::LocalSet(L_V0));
+                self.i(W::LocalGet(L_V0));
+                self.i(W::LocalGet(L_V0));
+                self.i(W::I8x16Shuffle(shuffle_lanes(2, |l| (false, (imm >> (2 * (l % 4))) & 3))));
+                self.xset(instr.op0_register());
+            }
+            Packuswb | Packsswb | Packssdw if is_mm0 => {
+                // narrow the i64x2 (dst, src): its low half is the result
+                let d = instr.op0_register();
+                self.mm_get(d);
+                self.i(W::I64x2Splat);
+                self.src64(instr, 1);
+                self.i(W::I64x2ReplaceLane(1));
+                self.i(W::LocalSet(L_V0));
+                self.i(W::LocalGet(L_V0));
+                self.i(W::LocalGet(L_V0));
+                self.i(match m { Packuswb => W::I8x16NarrowI16x8U, Packsswb => W::I8x16NarrowI16x8S, _ => W::I16x8NarrowI32x4S });
+                self.xset(d);
+            }
+            Cvtpi2ps => {
+                // two i32 -> the low two floats; the upper two stay
+                let d = instr.op0_register();
+                self.xget(d);
+                self.src64(instr, 1);
+                self.i(W::I64x2Splat);
+                self.i(W::F32x4ConvertI32x4S);
+                self.i(W::I8x16Shuffle(shuffle_lanes(4, |l| if l < 2 { (true, l) } else { (false, l) })));
+                self.xset(d);
+            }
+            Cvtpi2pd => {
+                self.src64(instr, 1);
+                self.i(W::I64x2Splat);
+                self.i(W::F64x2ConvertLowI32x4S);
+                self.xset(instr.op0_register());
+            }
             // ---- moves -----------------------------------------------------------------
             Movaps | Movups | Movapd | Movupd | Movdqa | Movdqu | Movntdq | Movntps | Movntpd | Lddqu => {
                 self.vsrc(instr, 1);
@@ -642,10 +835,10 @@ impl<'a> FuncEmit<'a> {
                 self.i(W::F32x4ConvertI32x4S);
                 self.xset(instr.op0_register());
             }
-            Cvttps2dq | Cvtps2dq => {
-                // out-of-range and NaN lanes become 0x80000000
+            Cvttps2dq | Cvtps2dq | Cvttps2pi | Cvtps2pi => {
+                // out-of-range and NaN lanes become 0x80000000 (the pi forms keep two)
                 self.vsrc(instr, 1);
-                if m == Cvtps2dq {
+                if matches!(m, Cvtps2dq | Cvtps2pi) {
                     self.i(W::F32x4Nearest);
                 }
                 self.i(W::LocalSet(L_V0));
@@ -665,9 +858,9 @@ impl<'a> FuncEmit<'a> {
                 self.i(W::V128Bitselect);
                 self.xset(instr.op0_register());
             }
-            Cvttpd2dq | Cvtpd2dq => {
+            Cvttpd2dq | Cvtpd2dq | Cvttpd2pi | Cvtpd2pi => {
                 self.vsrc(instr, 1);
-                if m == Cvtpd2dq {
+                if matches!(m, Cvtpd2dq | Cvtpd2pi) {
                     self.i(W::F64x2Nearest);
                 }
                 self.i(W::LocalSet(L_V0));
@@ -723,7 +916,7 @@ impl<'a> FuncEmit<'a> {
                     self.xset(d);
                 }
             }
-            Pcmpeqb | Pcmpeqw | Pcmpeqd | Pcmpgtb | Pcmpgtw | Pcmpgtd if is_xmm0 => {
+            Pcmpeqb | Pcmpeqw | Pcmpeqd | Pcmpgtb | Pcmpgtw | Pcmpgtd if is_xmm0 || is_mm0 => {
                 let d = instr.op0_register();
                 self.xget(d);
                 self.vsrc(instr, 1);
@@ -740,7 +933,7 @@ impl<'a> FuncEmit<'a> {
             // ---- packed integer arithmetic -------------------------------------------------
             Paddb | Paddw | Paddd | Paddq | Psubb | Psubw | Psubd | Psubq | Paddsb | Paddsw | Paddusb | Paddusw | Psubsb
             | Psubsw | Psubusb | Psubusw | Pmullw | Pmaddwd | Pmaxsw | Pminsw | Pmaxub | Pminub | Pavgb | Pavgw
-                if is_xmm0 =>
+                if is_xmm0 || is_mm0 =>
             {
                 let d = instr.op0_register();
                 self.xget(d);
@@ -773,7 +966,7 @@ impl<'a> FuncEmit<'a> {
                 });
                 self.xset(d);
             }
-            Pmulhw | Pmulhuw if is_xmm0 => {
+            Pmulhw | Pmulhuw if is_xmm0 || is_mm0 => {
                 // high halves of the 16x16 products
                 let d = instr.op0_register();
                 self.xget(d);
@@ -793,7 +986,7 @@ impl<'a> FuncEmit<'a> {
                 self.i(W::I16x8NarrowI32x4S);
                 self.xset(d);
             }
-            Pmuludq if is_xmm0 => {
+            Pmuludq if is_xmm0 || is_mm0 => {
                 // x86 multiplies lanes 0 and 2 (the low dwords of each qword); gather them first
                 let d = instr.op0_register();
                 self.xget(d);
@@ -817,14 +1010,14 @@ impl<'a> FuncEmit<'a> {
                 self.xset(d);
             }
             // ---- shifts -----------------------------------------------------------------------
-            Psllw if is_xmm0 => self.packed_shift(instr, 16, W::I16x8Shl, false),
-            Pslld if is_xmm0 => self.packed_shift(instr, 32, W::I32x4Shl, false),
-            Psllq if is_xmm0 => self.packed_shift(instr, 64, W::I64x2Shl, false),
-            Psrlw if is_xmm0 => self.packed_shift(instr, 16, W::I16x8ShrU, false),
-            Psrld if is_xmm0 => self.packed_shift(instr, 32, W::I32x4ShrU, false),
-            Psrlq if is_xmm0 => self.packed_shift(instr, 64, W::I64x2ShrU, false),
-            Psraw if is_xmm0 => self.packed_shift(instr, 16, W::I16x8ShrS, true),
-            Psrad if is_xmm0 => self.packed_shift(instr, 32, W::I32x4ShrS, true),
+            Psllw if is_xmm0 || is_mm0 => self.packed_shift(instr, 16, W::I16x8Shl, false),
+            Pslld if is_xmm0 || is_mm0 => self.packed_shift(instr, 32, W::I32x4Shl, false),
+            Psllq if is_xmm0 || is_mm0 => self.packed_shift(instr, 64, W::I64x2Shl, false),
+            Psrlw if is_xmm0 || is_mm0 => self.packed_shift(instr, 16, W::I16x8ShrU, false),
+            Psrld if is_xmm0 || is_mm0 => self.packed_shift(instr, 32, W::I32x4ShrU, false),
+            Psrlq if is_xmm0 || is_mm0 => self.packed_shift(instr, 64, W::I64x2ShrU, false),
+            Psraw if is_xmm0 || is_mm0 => self.packed_shift(instr, 16, W::I16x8ShrS, true),
+            Psrad if is_xmm0 || is_mm0 => self.packed_shift(instr, 32, W::I32x4ShrS, true),
             Pslldq | Psrldq => {
                 let d = instr.op0_register();
                 let n = instr.immediate8().min(16);
@@ -879,7 +1072,8 @@ impl<'a> FuncEmit<'a> {
                     Punpcklwd => (2, false),
                     _ => (2, true),
                 };
-                let half = 16 / lane / 2;
+                // within the 64 bits of an mm register, or the 128 of an xmm one
+                let half = if is_mm0 { 8 } else { 16 } / lane / 2;
                 let idx = shuffle_lanes(lane, |l| {
                     let src = l / 2 + if high { half } else { 0 };
                     (l % 2 == 1, src)
@@ -901,7 +1095,7 @@ impl<'a> FuncEmit<'a> {
                 self.i(W::GlobalGet(Global::Mxcsr as u32));
                 self.i(W::I32Store(mem0()));
             }
-            Movntq | Movnti => {
+            Movnti => {
                 // movnti r32 -> m32
                 self.addr(instr);
                 self.read_op(instr, 1, false);

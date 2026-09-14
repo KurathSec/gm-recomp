@@ -33,7 +33,10 @@ pub(crate) const L_Q1: u32 = 26;
 pub(crate) const L_D0: u32 = 27;
 pub(crate) const L_V0: u32 = 28;
 pub(crate) const L_V1: u32 = 29;
-pub const LOCALS: [(u32, ValType); 4] = [(25, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128)];
+pub(crate) const L_MM: u32 = 30; // MMX register access: x87 block address, mantissa
+pub(crate) const L_MQ: u32 = 31;
+pub const LOCALS: [(u32, ValType); 6] =
+    [(25, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128), (1, ValType::I32), (1, ValType::I64)];
 
 pub(crate) fn mem0() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
@@ -1050,10 +1053,24 @@ impl<'a> FuncEmit<'a> {
         match instr.mnemonic() {
             Nop | Pause | Lfence | Mfence | Sfence | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchnta | Endbr32 => {}
             Mov => {
-                if instr.op0_kind() == OpKind::Register && instr.op0_register().is_segment_register()
-                    || instr.op1_kind() == OpKind::Register && instr.op1_register().is_segment_register()
-                {
+                if instr.op0_kind() == OpKind::Register && instr.op0_register().is_segment_register() {
                     return self.unimplemented(instr);
+                }
+                if instr.op1_kind() == OpKind::Register && instr.op1_register().is_segment_register() {
+                    // the selectors of a 32-bit process on 64-bit Windows (crash reports
+                    // save them into a CONTEXT)
+                    let sel = match instr.op1_register() {
+                        Register::CS => 0x23,
+                        Register::FS => 0x53,
+                        _ => 0x2B,
+                    };
+                    // a register destination takes the zero-extended selector, memory 16 bits
+                    let w = if instr.op0_kind() == OpKind::Register { Self::op_width(instr, 0) } else { 16 };
+                    let dst = self.prep_dst(instr, 0);
+                    self.c(sel);
+                    self.set(L_T1);
+                    self.write_dst(dst, w, L_T1);
+                    return;
                 }
                 let w = Self::op_width(instr, 0);
                 let dst = self.prep_dst(instr, 0);
