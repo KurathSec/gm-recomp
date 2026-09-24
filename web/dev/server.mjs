@@ -33,6 +33,7 @@ const types = {
 // URL prefix -> directory
 const mounts = [
   ['/runtime/', join(repoRoot, 'target/wasm/wasm32-unknown-unknown/release')],
+  ['/monitor/', join(repoRoot, 'target/monitor')],
   ['/games/', join(webRoot, 'public/games')],
   ['/', webRoot],
 ];

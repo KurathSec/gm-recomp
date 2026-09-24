@@ -847,6 +847,10 @@ impl<'a> FuncEmit<'a> {
     /// Calls the guest function at a static address.
     fn call_static(&mut self, target: u32) {
         self.count(crate::abi::COUNT_CALLS);
+        // the callee reads flags at entry: they go over in the globals
+        if self.cfg.call_flags.get(&target).copied().unwrap_or(flags::ALL) != 0 {
+            self.spill_flags();
+        }
         self.push32_const(self.next_ip);
         if let Some(&idx) = self.func_index.get(&target) {
             self.push_regs();
@@ -877,6 +881,11 @@ impl<'a> FuncEmit<'a> {
     }
 
     fn after_call(&mut self) {
+        self.after_call_to(self.next_ip);
+    }
+
+    /// After a call that is to return to `expected`.
+    fn after_call_to(&mut self, expected: u32) {
         // the callee's registers come back as results; its flags (those read before
         // written again) in the globals
         self.pop_regs();
@@ -890,7 +899,7 @@ impl<'a> FuncEmit<'a> {
         // The callee's `ret` left the continuation in eip; anything else means the
         // guest unwound past us, so keep returning until a frame matches.
         self.i(W::GlobalGet(Global::Eip as u32));
-        self.c(self.next_ip);
+        self.c(expected);
         self.i(W::I32Ne);
         self.i(W::GlobalGet(Global::Ctl as u32));
         self.i(W::I32Or);
@@ -962,6 +971,19 @@ impl<'a> FuncEmit<'a> {
     pub fn emit(&mut self) {
         self.load_state();
         self.count(crate::abi::COUNT_ENTRIES);
+        if self.count {
+            // [entry, count] in this function's slot
+            let slot = crate::abi::ENTRY_COUNTS + 8 * ((self.cfg.entry.wrapping_mul(crate::abi::RESOLVE_HASH) >> 19) & (crate::abi::ENTRY_SLOTS - 1));
+            self.c(slot);
+            self.c(self.cfg.entry);
+            self.i(W::I32Store(mem0()));
+            self.c(slot + 4);
+            self.c(slot + 4);
+            self.i(W::I32Load(mem0()));
+            self.c(1);
+            self.i(W::I32Add);
+            self.i(W::I32Store(mem0()));
+        }
         if self.probe {
             self.ip = self.cfg.entry;
             self.trap(trap::PROBE, self.cfg.entry);
@@ -1001,9 +1023,9 @@ impl<'a> FuncEmit<'a> {
         // Flags each instruction must leave available for later readers.
         let mut needs = vec![0u8; block.instrs.len()];
         let mut need = live_out;
-        for (k, instr) in block.instrs.iter().enumerate().rev() {
+        for (k, _) in block.instrs.iter().enumerate().rev() {
             needs[k] = need;
-            let (def, used) = flags::effects(instr);
+            let (def, used) = effects_at(self.cfg, block, k);
             need = (need & !def) | used;
         }
         let last = block.instrs.len().saturating_sub(1);
@@ -1118,6 +1140,59 @@ impl<'a> FuncEmit<'a> {
             Term::Ret => {
                 let extra = if instr.op_count() > 0 { instr.immediate16() as u32 } else { 0 };
                 self.ret(extra, live_out);
+            }
+            Term::InlineCall { entry } => {
+                // the call's effect on the guest: its return address on the stack
+                self.push32_const(self.next_ip);
+                self.materialize(live_out);
+                if self.index[entry] != self.cur_block as u32 + 1 {
+                    self.goto(*entry);
+                }
+            }
+            Term::InlineTail { target, ret_to, ret_key } => {
+                // the inlined call's return address is on the stack: the target returns
+                // through it
+                if self.cfg.call_flags.get(target).copied().unwrap_or(flags::ALL) != 0 {
+                    self.spill_flags();
+                }
+                if let Some(&idx) = self.func_index.get(target) {
+                    self.push_regs();
+                    self.i(W::Call(idx));
+                } else {
+                    self.c(*target);
+                    self.resolve();
+                    self.set(L_R0);
+                    self.push_regs();
+                    self.get(L_R0);
+                    self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
+                }
+                self.after_call_to(*ret_to);
+                if self.index[ret_key] != self.cur_block as u32 + 1 {
+                    self.goto(*ret_key);
+                }
+            }
+            Term::InlineRet { ret_to, ret_key } => {
+                self.pop32_to(L_T0);
+                if instr.op_count() > 0 {
+                    self.get(L_REG + 4);
+                    self.c(instr.immediate16() as u32);
+                    self.i(W::I32Add);
+                    self.set(L_REG + 4);
+                }
+                self.materialize(live_out);
+                self.get(L_T0);
+                self.c(*ret_to);
+                self.i(W::I32Eq);
+                self.i(W::If(BlockType::Empty));
+                self.depth += 1;
+                self.goto(*ret_key);
+                self.depth -= 1;
+                self.i(W::End);
+                // the callee returned elsewhere: as a plain `ret`
+                self.get(L_T0);
+                self.i(W::GlobalSet(Global::Eip as u32));
+                self.spill_flags();
+                self.ret_regs();
             }
             Term::Trap => {
                 let kind = match instr.mnemonic() {
@@ -2332,13 +2407,36 @@ impl<'a> FuncEmit<'a> {
 
 /// Flags live into each block (and out, via successors). Conservatively assumes
 /// returns and tail/indirect jumps need every flag.
+/// Flags instruction `k` of `block` writes and reads. A direct call reads what its
+/// callee's entry reads (the callee's writes count as the call's); an inlined call
+/// touches none (the callee's blocks do).
+fn effects_at(cfg: &Cfg, block: &Block, k: usize) -> (u8, u8) {
+    let i = &block.instrs[k];
+    if i.flow_control() == iced_x86::FlowControl::Call {
+        if k + 1 == block.instrs.len() && matches!(block.term, Term::InlineCall { .. }) {
+            return (0, 0);
+        }
+    }
+    if k + 1 == block.instrs.len()
+        && let Term::InlineTail { target, .. } = block.term
+    {
+        return (flags::ALL, cfg.call_flags.get(&target).copied().unwrap_or(flags::ALL));
+    }
+    if i.flow_control() == iced_x86::FlowControl::Call {
+        if i.op0_kind() == OpKind::NearBranch32 {
+            return (flags::ALL, cfg.call_flags.get(&(i.near_branch_target() as u32)).copied().unwrap_or(flags::ALL));
+        }
+    }
+    flags::effects(i)
+}
+
 /// Flags live into and out of each block.
 fn liveness(cfg: &Cfg) -> (HashMap<u32, u8>, HashMap<u32, u8>) {
     let mut usedef: HashMap<u32, (u8, u8)> = HashMap::new();
     for (&start, b) in &cfg.blocks {
         let (mut used, mut def) = (0u8, 0u8);
-        for i in &b.instrs {
-            let (d, u) = flags::effects(i);
+        for k in 0..b.instrs.len() {
+            let (d, u) = effects_at(cfg, b, k);
             used |= u & !def;
             def |= d;
         }

@@ -94,6 +94,8 @@ pub struct Engine {
     pub probes: Vec<u32>,
     /// Translate x87 code without the inline paths (checking them).
     pub no_x87_inline: bool,
+    /// Do not inline small leaf callees (checking the inlining).
+    pub no_inline: bool,
     /// Translated code counts events in `abi::COUNTERS` (debugging).
     pub count: bool,
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
@@ -132,6 +134,7 @@ impl Engine {
             watch: Vec::new(),
             probes: Vec::new(),
             no_x87_inline: false,
+            no_inline: false,
             count: false,
             monitor: false,
         }
@@ -671,7 +674,8 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
         let probes = m.engine_ref().probes.clone();
         let no_x87_inline = m.engine_ref().no_x87_inline;
         let count = m.engine_ref().count;
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count });
+        let no_inline = m.engine_ref().no_inline;
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, no_inline });
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = std::collections::HashMap::new();
@@ -1164,7 +1168,7 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let r = p.setup_main_thread(m, image_base).and_then(|r| p.setup_static_tls(m).map(|_| r));
     m.engine().p = Some(p);
     let (teb, stack_top) = r?;
-    m.ensure_mapped(abi::RESOLVE_CACHE, abi::RESOLVE_CACHE_SIZE + 0x1000).map_err(|_| "cannot map the resolve cache".to_string())?;
+    m.ensure_mapped(abi::RESOLVE_CACHE, abi::RESOLVE_CACHE_SIZE + 0x1000 + 8 * abi::ENTRY_SLOTS).map_err(|_| "cannot map the resolve cache".to_string())?;
     m.set_global(Global::FsBase, teb);
     m.set_global(Global::Mxcsr, 0x1F80);
     let regs = Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: stack_top - 0x100, ebp: 0, esi: 0, edi: 0, eip: entry, fs_base: teb };
@@ -1236,7 +1240,9 @@ pub fn state_hash<M: Machine>(m: &mut M, limit: u32) -> (u64, u32) {
             *h = h.wrapping_mul(0x0100_0000_01B3);
         }
     };
-    for r in [regs.eax, regs.ecx, regs.edx, regs.ebx, regs.esp, regs.ebp, regs.esi, regs.edi, regs.eip] {
+    // (not eip: when a run stops inside translated code it holds the last `ret`'s
+    // target, which depends on what was inlined)
+    for r in [regs.eax, regs.ecx, regs.edx, regs.ebx, regs.esp, regs.ebp, regs.esi, regs.edi] {
         mix(&mut h, &r.to_le_bytes());
     }
     // The x87 state by value (its FXSAVE image): the block's bytes depend on which

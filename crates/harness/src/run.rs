@@ -272,6 +272,21 @@ impl<C: Cx> Machine for Wt<'_, C> {
                         let _ = self.write_u32(a, 0);
                         counts.push_str(&format!("  {name} {v}"));
                     }
+                    // GMR_COUNT=top: the functions entered most this frame
+                    if std::env::var("GMR_COUNT").map(|v| v == "top").unwrap_or(false) {
+                        let mut slots = Vec::new();
+                        for k in 0..abi::ENTRY_SLOTS {
+                            let a = abi::ENTRY_COUNTS + 8 * k;
+                            let (f, n) = (self.read_u32(a).unwrap_or(0), self.read_u32(a + 4).unwrap_or(0));
+                            if n > 0 {
+                                slots.push((n, f));
+                                let _ = self.write_u32(a + 4, 0);
+                            }
+                        }
+                        slots.sort_unstable_by(|a, b| b.cmp(a));
+                        let top: Vec<String> = slots.iter().take(12).map(|(n, f)| format!("{f:#x}:{n}")).collect();
+                        counts.push_str(&format!("\n    top {}", top.join(" ")));
+                    }
                 }
                 if ms > limit && f0 != 0 {
                     eprintln!(
@@ -378,6 +393,8 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eng.recent_cap = opts.recent;
     // GMR_X87_SLOW=1: no inline x87 (every instruction through rt.fpu).
     eng.no_x87_inline = std::env::var_os("GMR_X87_SLOW").is_some();
+    // GMR_NO_INLINE=1: no inlined leaf callees.
+    eng.no_inline = std::env::var_os("GMR_NO_INLINE").is_some();
     // GMR_COUNT=1: translated code counts calls, x87 instructions, ... (GMR_FRAME_MS shows them).
     eng.count = std::env::var_os("GMR_COUNT").is_some();
     // GMR_FPU_PROFILE=1: count x87 instructions by mnemonic.
@@ -478,7 +495,14 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eprintln!("---- run finished in {elapsed:.2}s ----");
     match &outcome {
         Ok(()) => match e.exit {
-            _ if p.is_some_and(|p| p.frames_presented >= p.frame_limit) => eprintln!("frame limit reached"),
+            _ if p.is_some_and(|p| p.frames_presented >= p.frame_limit) => {
+                let r = final_regs;
+                eprintln!("frame limit reached");
+                eprintln!(
+                    "regs: eax={:#x} ecx={:#x} edx={:#x} ebx={:#x} esp={:#x} ebp={:#x} esi={:#x} edi={:#x} eip={:#x}",
+                    r.eax, r.ecx, r.edx, r.ebx, r.esp, r.ebp, r.esi, r.edi, r.eip
+                );
+            }
             Some(code) => eprintln!("exit code {code}"),
             None => eprintln!("entry point returned (eip={:#x})", final_regs.eip),
         },

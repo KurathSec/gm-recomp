@@ -30,6 +30,8 @@ pub struct Options {
     pub resolve_cache: bool,
     /// Count events in `abi::COUNTERS` (debugging).
     pub count: bool,
+    /// Do not inline small leaf callees (checking the inlining).
+    pub no_inline: bool,
 }
 
 pub struct Translator<'m> {
@@ -56,7 +58,7 @@ impl<'m> Translator<'m> {
         if self.cfgs.contains_key(&entry) {
             return Ok(());
         }
-        let cfg = cfg::build(self.mem, entry, info)?;
+        let cfg = cfg::build(self.mem, entry, info, !self.opts.no_inline)?;
         self.cfgs.insert(entry, cfg);
         Ok(())
     }

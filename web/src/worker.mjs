@@ -22,7 +22,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', ahead = true, script = [], persist = true, monitor = false } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', ahead = true, script = [], persist = true, monitor = false, replay = null } = data;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
     const base = `/games/${encodeURIComponent(game)}/`;
@@ -55,6 +55,8 @@ self.onmessage = async ({ data }) => {
         db = null;
       }
     }
+    // a replayed session starts from its saves
+    if (replay) files = applySaves(files, replay.saves);
     let saving = Promise.resolve();
     const onSave = (changes) => {
       if (db) saving = saving.then(() => storeSaves(db, game, changes)).catch((e) => post(`saving failed: ${e}`));
@@ -85,7 +87,7 @@ self.onmessage = async ({ data }) => {
     const onSlow = monitor ? (frame, busy, interval, clockMs) => self.postMessage({ type: 'monitor', line: `slow ${frame} guest ${busy.toFixed(1)} interval ${interval.toFixed(1)} clock ${clockMs.toFixed(0)}` }) : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log
     const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input });
     await saving;
     self.postMessage({ type: 'done', status });
   } catch (e) {

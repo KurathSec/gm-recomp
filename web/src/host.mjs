@@ -33,7 +33,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
  *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -365,6 +365,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     throw new Error('init failed');
   }
   if (monitor) x.set_monitor(1);
+  // [kind, frame, clock, a, b, c]: a recorded session's input
+  for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   print(`modules instantiated: ${modules}`);
   if (frameMs.length > 60) {

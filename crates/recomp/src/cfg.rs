@@ -32,7 +32,29 @@ pub enum Term {
     Trap,
     /// Undecodable or unmapped bytes at this address: executing them faults (#UD).
     Bad(u32),
+    /// `call` (the block's last instruction) to a small leaf function whose blocks are
+    /// part of this one's (`entry`, an inline key): the return address is pushed and
+    /// the callee's code follows.
+    InlineCall { entry: u32 },
+    /// `ret` of an inlined callee: back at `ret_to` (the block `ret_key`) when the
+    /// popped address is the call's, else a plain `ret`.
+    InlineRet { ret_to: u32, ret_key: u32 },
+    /// An inlined callee's tail jump to `target`: called (the inlined call's return
+    /// address is on the stack), then back at `ret_to` as after `InlineRet`.
+    InlineTail { target: u32, ret_to: u32, ret_key: u32 },
 }
+
+/// Inlined callees' blocks have keys from here up (one per block); their
+/// instructions keep their addresses.
+pub const INLINE_KEYS: u32 = 0x8000_0000;
+/// Inlining reaches this many calls deep (a callee's own small callees are inlined
+/// into it before it is inlined).
+const INLINE_DEPTH: u8 = 2;
+/// Small functions are inlined at up to this many call sites per function, each of
+/// up to `MAX_INLINE_INSTRS` instructions and `INLINE_BUDGET` in all.
+const MAX_INLINE_SITES: u32 = 64;
+const MAX_INLINE_INSTRS: usize = 96;
+const INLINE_BUDGET: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -51,6 +73,8 @@ impl Block {
             Term::Fall(a) | Term::Jump(a) => vec![*a],
             Term::Cond { taken, next } => vec![*taken, *next],
             Term::Table(t) => t.clone(),
+            Term::InlineCall { entry } => vec![*entry],
+            Term::InlineRet { ret_key, .. } | Term::InlineTail { ret_key, .. } => vec![*ret_key],
             _ => Vec::new(),
         }
     }
@@ -65,14 +89,46 @@ pub struct Cfg {
     /// as immediates a little ahead of the push (Delphi's try/finally pushes the exit
     /// label, falls into the finally code and `ret`s to it).
     pub ret_targets: Vec<u32>,
+    /// Direct call target -> the flags its entry reads before writing them (callers
+    /// hand those over: the CRT's x87 wrappers test flags a previous call returned).
+    pub call_flags: HashMap<u32, u8>,
 }
 
 const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
 
-pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, String> {
+/// The function at `entry`, with small callees inlined when `inline`.
+pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, inline: bool) -> Result<Cfg, String> {
+    build_with(mem, entry, info, if inline { INLINE_DEPTH } else { 0 })
+}
+
+/// The callee at `target` as blocks to inline, if it is small: a few instructions
+/// within 4 KiB after its entry, leaving by `ret` or direct jumps to functions (no
+/// jump tables or computed jumps; calls are fine).
+fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8) -> Option<Cfg> {
+    let c = build_with(mem, target, info, depth).ok()?;
+    let n: usize = c.blocks.values().map(|b| b.instrs.len()).sum();
+    let simple = n <= MAX_INLINE_INSTRS
+        && c.ret_targets.is_empty()
+        && c.blocks.iter().all(|(&k, b)| {
+            (k >= INLINE_KEYS || k.wrapping_sub(target) < 0x1000)
+                && matches!(
+                    b.term,
+                    Term::Fall(_) | Term::Jump(_) | Term::Cond { .. } | Term::Ret | Term::TailCall(_) | Term::InlineCall { .. } | Term::InlineRet { .. } | Term::InlineTail { .. }
+                )
+                && b.successors().iter().all(|t| c.blocks.contains_key(t))
+        });
+    simple.then_some(c)
+}
+
+fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Result<Cfg, String> {
+    let inline = depth > 0;
+    let mut sites = 0u32;
+    let mut next_key = INLINE_KEYS;
+    let mut budget = INLINE_BUDGET;
     let mut blocks: BTreeMap<u32, Block> = BTreeMap::new();
     let mut fop: HashMap<u32, u16> = HashMap::new();
     let mut ret_targets = Vec::new();
+    let mut call_flags = HashMap::new();
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
@@ -165,7 +221,51 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
                     // similar thunks): the bytes after the call are data the callee consumes.
                     term = Term::Bad(next);
                 }
+                FlowControl::Call
+                    if inline
+                        && sites < MAX_INLINE_SITES
+                        && instr.op0_kind() == OpKind::NearBranch32
+                        && instr.near_branch_target() as u32 != entry
+                        && let Some(callee) = inlinable(mem, instr.near_branch_target() as u32, info, depth - 1)
+                        && callee.blocks.values().map(|b| b.instrs.len()).sum::<usize>() <= budget =>
+                {
+                    budget -= callee.blocks.values().map(|b| b.instrs.len()).sum::<usize>();
+                    // a small function: its blocks join this function's under keys of
+                    // their own; its returns and tail jumps come back here
+                    let target = instr.near_branch_target() as u32;
+                    sites += 1;
+                    let mut keys = HashMap::new();
+                    for &k in callee.blocks.keys() {
+                        keys.insert(k, next_key);
+                        next_key += 1;
+                    }
+                    let key = |a: u32| keys[&a];
+                    for (k, b) in callee.blocks {
+                        let t = match b.term {
+                            Term::Fall(a) => Term::Fall(key(a)),
+                            Term::Jump(a) => Term::Jump(key(a)),
+                            Term::Cond { taken, next: n } => Term::Cond { taken: key(taken), next: key(n) },
+                            Term::TailCall(t) => {
+                                call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t));
+                                Term::InlineTail { target: t, ret_to: next, ret_key: next }
+                            }
+                            Term::InlineCall { entry: e } => Term::InlineCall { entry: key(e) },
+                            Term::InlineRet { ret_to, ret_key } => Term::InlineRet { ret_to, ret_key: key(ret_key) },
+                            Term::InlineTail { target: t, ret_to, ret_key } => Term::InlineTail { target: t, ret_to, ret_key: key(ret_key) },
+                            _ => Term::InlineRet { ret_to: next, ret_key: next },
+                        };
+                        blocks.insert(key(k), Block { start: key(k), instrs: b.instrs, term: t });
+                    }
+                    fop.extend(callee.fop);
+                    call_flags.extend(callee.call_flags);
+                    queue.push_back(next);
+                    term = Term::InlineCall { entry: key(target) };
+                }
                 FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
+                    if instr.flow_control() == FlowControl::Call && instr.op0_kind() == OpKind::NearBranch32 {
+                        let t = instr.near_branch_target() as u32;
+                        call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t));
+                    }
                     ip = next;
                     continue;
                 }
@@ -198,7 +298,34 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo) -> Result<Cfg, Str
         queue.extend(block.successors());
         blocks.insert(start, block);
     }
-    Ok(Cfg { entry, blocks, fop, ret_targets })
+    Ok(Cfg { entry, blocks, fop, ret_targets, call_flags })
+}
+
+/// The flags the code at `entry` reads before writing them, following its first
+/// instructions (straight on and through direct jumps); everything not yet written
+/// when the path branches or ends there.
+pub fn entry_flag_reads(mem: &dyn GuestMem, entry: u32) -> u8 {
+    let (mut ip, mut written, mut reads) = (entry, 0u8, 0u8);
+    let mut buf = [0u8; 16];
+    for _ in 0..24 {
+        let n = (0..16).rev().find(|&n| mem.read(ip, &mut buf[..n])).unwrap_or(0);
+        let instr = Decoder::with_ip(32, &buf[..n], ip as u64, DecoderOptions::NONE).decode();
+        if n == 0 || instr.is_invalid() {
+            break;
+        }
+        let (def, used) = crate::flags::effects(&instr);
+        reads |= used & !written;
+        written |= def;
+        if written == crate::flags::ALL {
+            return reads;
+        }
+        match instr.flow_control() {
+            FlowControl::Next => ip = instr.next_ip() as u32,
+            FlowControl::UnconditionalBranch if instr.op0_kind() == OpKind::NearBranch32 => ip = instr.near_branch_target() as u32,
+            _ => break,
+        }
+    }
+    reads | (crate::flags::ALL & !written)
 }
 
 /// Four zero bytes at `va` (`add [eax],al` twice): memory, not code.

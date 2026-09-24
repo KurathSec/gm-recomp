@@ -22,6 +22,10 @@ pub const COUNT_CALLS: u32 = 1;
 pub const COUNT_X87: u32 = 2;
 pub const COUNT_RESOLVES: u32 = 3;
 pub const COUNT_NAMES: [&str; 4] = ["function entries", "calls", "x87 instructions", "resolve probes"];
+/// With counting: entries per function, a table of [entry address, count] slots
+/// indexed by `resolve_slot`-style hashing (`ENTRY_SLOTS` of them).
+pub const ENTRY_COUNTS: u32 = COUNTERS + 0x1000;
+pub const ENTRY_SLOTS: u32 = 1 << 13;
 pub const RESOLVE_HASH: u32 = 0x9E37_79B1;
 
 /// Byte offset of the cache entry for `addr` (what translated code computes).

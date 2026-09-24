@@ -115,6 +115,7 @@
       // &nopace=1 &script=100:Enter:1,105:Enter:0 (or f:mouse:x:y:b) &audio=1 &nosave=1
       // &monitor: the dev server records the session (start, saves, input as the guest
       // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
+      // &replay=<session>: plays a recorded session again (its date, saves and input)
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
 
@@ -372,8 +373,23 @@
         const offscreen = screen.transferControlToOffscreen();
         const pacing = ['asap', 'jit'].includes(q.get('pacing')) ? q.get('pacing') : 'clock';
         const ahead = !q.has('noahead');
-        monitorSend(`start game=${game} epoch=${epoch} ua=${navigator.userAgent.replaceAll(' ', '_')}`);
-        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist, monitor }, [offscreen]);
+        // a recorded session to replay: its date, saves and input
+        let replay = null;
+        let runEpoch = epoch;
+        if (q.has('replay')) {
+          const text = await (await fetch(`/monitor/${encodeURIComponent(q.get('replay'))}.log`)).text();
+          replay = { saves: [], input: [] };
+          const unhex = (h) => Uint8Array.from({ length: h.length >> 1 }, (_, i) => parseInt(h.substr(2 * i, 2), 16));
+          for (const line of text.split('\n')) {
+            const w = line.split(' ');
+            if (w[0] === 'start') runEpoch = Number((w.find((t) => t.startsWith('epoch=')) ?? 'epoch=0').slice(6)) || epoch;
+            else if (w[0] === 'save') replay.saves.push({ path: w[1].replaceAll('%20', ' '), data: unhex(w[2] ?? ''), mtime: 0 });
+            else if (w[0] === 'deleted') replay.saves.push({ path: w[1].replaceAll('%20', ' '), data: null, mtime: 0 });
+            else if (w[0] === 'input' && (w[3] === 'key' || w[3] === 'mouse')) replay.input.push([w[3] === 'key' ? 0 : 1, Number(w[1]), Number(w[2]), ...w.slice(4, 7).map(Number)]);
+          }
+        }
+        monitorSend(`start game=${game} epoch=${runEpoch} ua=${navigator.userAgent.replaceAll(' ', '_')}`);
+        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.

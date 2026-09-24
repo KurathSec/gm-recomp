@@ -184,9 +184,11 @@ struct State {
     /// The MIDI SoundFont: asked for, and the bytes until the runtime takes them.
     soundfont_requested: bool,
     soundfont: Option<Vec<u8>>,
+    /// A recorded session's input: (frame, guest clock, event).
+    replay: std::collections::VecDeque<(u64, u64, runtime::InputEvent)>,
 }
 
-static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None };
+static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new() };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -291,8 +293,17 @@ impl Machine for Web {
     fn print(&mut self, s: &str) {
         log(s);
     }
-    fn take_input(&mut self, _frame: u64, _clock_us: u64) -> Vec<runtime::InputEvent> {
-        Web::take_input()
+    fn take_input(&mut self, frame: u64, clock_us: u64) -> Vec<runtime::InputEvent> {
+        let mut out = Web::take_input();
+        // a replayed session: each event at the poll it was taken at
+        let r = &mut state().replay;
+        while let Some(&(f, t, _)) = r.front() {
+            if frame < f || frame == f && clock_us < t {
+                break;
+            }
+            out.push(r.pop_front().unwrap().2);
+        }
+        out
     }
     fn pace(&mut self, clock_us: u64) {
         let ms = clock_us as f64 / 1000.0;
@@ -620,6 +631,17 @@ pub extern "C" fn run() -> i32 {
         log(&l);
     }
     if r.is_ok() { 0 } else { 1 }
+}
+
+/// Queues an input event of a recorded session (`kind` 0 key: a = vk, b = scan,
+/// c = down; 1 mouse: x, y, buttons), delivered at the poll of `frame` and `clock_us`.
+#[unsafe(no_mangle)]
+pub extern "C" fn replay_push(kind: u32, frame: f64, clock_us: f64, a: i32, b: i32, c: i32) {
+    let ev = match kind {
+        0 => runtime::InputEvent::Key { vk: a as u8, scan: b as u16, down: c != 0 },
+        _ => runtime::InputEvent::Mouse { x: a, y: b, buttons: c as u32 },
+    };
+    state().replay.push_back((frame as u64, clock_us as u64, ev));
 }
 
 /// Prints each input event as the guest takes it (`input <frame> <clock> ...`) for the
