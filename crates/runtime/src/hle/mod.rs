@@ -104,10 +104,17 @@ pub trait Host: Guest {
     /// holds it there until real time catches up.
     fn pace(&mut self, _clock_us: u64) {}
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
-    /// of frames presented so far.
-    fn poll_input(&mut self, _frame: u64) -> Vec<InputEvent> {
+    /// of frames presented so far, `clock_us` the guest's clock (a replay delivers each
+    /// event at the poll it was taken at).
+    fn poll_input(&mut self, _frame: u64, _clock_us: u64) -> Vec<InputEvent> {
         Vec::new()
     }
+    /// Whether `monitor` lines are wanted (a session that can be replayed).
+    fn monitoring(&self) -> bool {
+        false
+    }
+    /// A line for whoever watches the session live (the input as the guest took it).
+    fn monitor(&mut self, _line: &str) {}
 }
 
 #[derive(Debug, Clone, Copy)]

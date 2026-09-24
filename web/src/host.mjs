@@ -33,7 +33,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
  *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -67,6 +67,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       // later than half a frame beyond the guest's own frame time
       const target = clockMs - lastClockMs;
       if (target > 0 && interval > target * 1.5) win.late++;
+      // monitor: frames that took long or reached the screen late (the frame number
+      // is the one being presented)
+      if (onSlow && ((busy ?? 0) > 12 || (target > 0 && interval > target + 4))) onSlow(gpu.frames + 1, busy ?? 0, interval, clockMs);
     }
     lastPresentReal = t;
     lastClockMs = clockMs;
@@ -361,6 +364,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   if (x.init(ep, e.length, frames, trace ? 1 : 0, epoch, nopIndex, gpu ? 1 : 0) !== 0) {
     throw new Error('init failed');
   }
+  if (monitor) x.set_monitor(1);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   print(`modules instantiated: ${modules}`);
   if (frameMs.length > 60) {

@@ -43,6 +43,60 @@ pub struct RunOpts {
     pub mouse: Vec<(u64, i32, i32, u32)>,
     /// Write the mixed sound output to this WAV file.
     pub audio_out: Option<PathBuf>,
+    /// A session recorded by the page's monitor mode, replayed.
+    pub replay: Option<PathBuf>,
+    pub epoch: Option<u64>,
+}
+
+/// What a monitor log holds for a replay.
+#[derive(Default)]
+struct Session {
+    epoch: Option<u64>,
+    /// (path in the game's file system, contents), None when the save deleted it.
+    saves: Vec<(String, Option<Vec<u8>>)>,
+    /// (frame, guest clock, event) as the guest took them.
+    input: std::collections::VecDeque<(u64, u64, runtime::InputEvent)>,
+}
+
+fn read_session(path: &std::path::Path) -> Result<Session> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut s = Session::default();
+    let num = |t: &str| -> i64 {
+        if let Some(h) = t.strip_prefix("0x") { i64::from_str_radix(h, 16).unwrap_or(0) } else { t.parse().unwrap_or(0) }
+    };
+    for line in text.lines() {
+        let w: Vec<&str> = line.split(' ').collect();
+        match w.first().copied() {
+            Some("start") => {
+                s.epoch = w.iter().find_map(|t| t.strip_prefix("epoch=")).and_then(|v| v.parse().ok());
+            }
+            Some("save") if w.len() >= 2 => {
+                let hex = w.get(2).copied().unwrap_or("");
+                let data = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0)).collect();
+                s.saves.push((w[1].replace("%20", " "), Some(data)));
+            }
+            Some("deleted") if w.len() >= 2 => s.saves.push((w[1].replace("%20", " "), None)),
+            Some("input") if w.len() >= 5 => {
+                let (frame, clock) = (num(w[1]) as u64, num(w[2]) as u64);
+                let a: Vec<i64> = w[4..].iter().map(|t| num(t)).collect();
+                let ev = match w[3] {
+                    "key" if a.len() >= 3 => runtime::InputEvent::Key { vk: a[0] as u8, scan: a[1] as u16, down: a[2] != 0 },
+                    "mouse" if a.len() >= 3 => runtime::InputEvent::Mouse { x: a[0] as i32, y: a[1] as i32, buttons: a[2] as u32 },
+                    "pad" if a.len() >= 9 => runtime::InputEvent::Pad {
+                        index: a[0] as u8,
+                        connected: a[1] != 0,
+                        buttons: a[2] as u16,
+                        triggers: [a[3] as u8, a[4] as u8],
+                        thumbs: [a[5] as i16, a[6] as i16, a[7] as i16, a[8] as i16],
+                    },
+                    _ => continue,
+                };
+                s.input.push_back((frame, clock, ev));
+            }
+            _ => {}
+        }
+    }
+    Ok(s)
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +114,8 @@ struct Hd {
     /// Scripted input not delivered yet, by frame.
     keys: Vec<(u64, u8, bool, u16)>,
     mouse: Vec<(u64, i32, i32, u32)>,
+    /// A recorded session's input, delivered at the poll it was taken at.
+    replay: std::collections::VecDeque<(u64, u64, runtime::InputEvent)>,
     /// The MIDI SoundFont was handed over (or there is none).
     soundfont_given: bool,
     /// GMR_FRAME_MS=<ms>: report frames that took longer (host time between the
@@ -197,7 +253,7 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn print(&mut self, s: &str) {
         eprintln!("{s}");
     }
-    fn take_input(&mut self, frame: u64) -> Vec<runtime::InputEvent> {
+    fn take_input(&mut self, frame: u64, clock_us: u64) -> Vec<runtime::InputEvent> {
         if let Some(limit) = self.cx.hd_ref().frame_ms {
             let now = self.cx.hd_ref().t0.elapsed().as_micros() as u64;
             let hd = self.cx.hd();
@@ -235,6 +291,12 @@ impl<C: Cx> Machine for Wt<'_, C> {
         hd.mouse.retain(|k| k.0 > frame);
         let mut out: Vec<runtime::InputEvent> = due.into_iter().map(|(_, vk, down, scan)| runtime::InputEvent::Key { vk, scan, down }).collect();
         out.extend(mice.into_iter().map(|(_, x, y, buttons)| runtime::InputEvent::Mouse { x, y, buttons }));
+        while let Some(&(f, t, _)) = hd.replay.front() {
+            if frame < f || frame == f && clock_us < t {
+                break;
+            }
+            out.push(hd.replay.pop_front().unwrap().2);
+        }
         out
     }
 }
@@ -275,12 +337,38 @@ pub fn run(opts: RunOpts) -> Result<()> {
         let _ = std::fs::remove_dir_all(&write_root);
     }
     std::fs::create_dir_all(&write_root)?;
-    let fs = runtime::vfs::DirFs::new(host_root.clone(), Some(write_root));
+    let session = match &opts.replay {
+        Some(p) => read_session(p)?,
+        None => Session::default(),
+    };
+    // the saves the session started with, in the write layer
+    for (path, data) in &session.saves {
+        let mut host = write_root.clone();
+        for comp in path.split(['\\', '/']).filter(|c| !c.is_empty()) {
+            host.push(comp);
+        }
+        match data {
+            Some(d) => {
+                if let Some(parent) = host.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&host, d)?;
+            }
+            None => {}
+        }
+    }
+    if opts.replay.is_some() {
+        eprintln!("replay: {} saved files, {} input events, epoch {:?}", session.saves.len(), session.input.len(), session.epoch);
+    }
+    let mut fs = runtime::vfs::DirFs::new(host_root.clone(), Some(write_root));
+    for (path, _) in session.saves.iter().filter(|(_, d)| d.is_none()) {
+        runtime::vfs::Vfs::remove(&mut fs, &path.replace('/', "\\"));
+    }
     let mut process = Process::new(Box::new(fs), &exe_path, &cmdline);
     process.trace = opts.trace;
     process.frame_limit = opts.frames;
-    // A fixed date keeps runs reproducible.
-    process.epoch_unix = 1_767_225_600;
+    // A fixed date keeps runs reproducible (a replay uses its session's).
+    process.epoch_unix = opts.epoch.or(session.epoch).unwrap_or(1_767_225_600);
     if let Some(path) = &opts.audio_out {
         process.audio = Box::new(runtime::hle::audio::WavSink { path: path.clone(), samples: Vec::new(), rate: runtime::hle::audio::RATE });
     }
@@ -305,7 +393,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0) });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0) });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;

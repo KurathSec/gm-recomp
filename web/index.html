@@ -113,6 +113,8 @@
       // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
       // &stats (overlay) &pacing=jit|asap (other frame pacing; the default follows the guest's clock)
       // &nopace=1 &script=100:Enter:1,105:Enter:0 (or f:mouse:x:y:b) &audio=1 &nosave=1
+      // &monitor: the dev server records the session (start, saves, input as the guest
+      // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
 
@@ -177,6 +179,7 @@
       async function play(game) {
         const frames = Number(q.get('frames') ?? 0);
         const epoch = q.has('epoch') ? Number(q.get('epoch')) : Math.floor(Date.now() / 1000);
+        // (monitor: the session's first line, for replays)
         const report = q.has('report');
         const capture = (q.get('capture') ?? '').split(',').filter(Boolean).map(Number);
         const pace = !q.has('nopace');
@@ -194,6 +197,21 @@
         const hint = document.getElementById('hint');
         const send = (path, body) => report && fetch(path, { method: 'POST', body }).catch(() => {});
         send('/log', `userAgent: ${navigator.userAgent}\ncrossOriginIsolated: ${self.crossOriginIsolated}`);
+        // Monitor mode: lines batched to the dev server every half second.
+        const monitor = q.has('monitor');
+        const session = `${game}-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        let monitorLines = [];
+        const monitorSend = (line) => monitor && monitorLines.push(line);
+        const monitorFlush = () => {
+          if (!monitorLines.length) return;
+          const body = monitorLines.join('\n') + '\n';
+          monitorLines = [];
+          fetch(`/monitor?s=${encodeURIComponent(session)}`, { method: 'POST', body }).catch(() => {});
+        };
+        if (monitor) {
+          setInterval(monitorFlush, 500);
+          window.addEventListener('pagehide', monitorFlush);
+        }
 
         let title = game;
         fetch(`games/${encodeURIComponent(game)}/manifest.json`)
@@ -312,6 +330,7 @@
           if (data.type === 'log') {
             logEl.textContent += data.line + '\n';
             send('/log', data.line);
+            monitorSend(`log ${data.line}`);
             if (data.line.startsWith('downloaded')) statusEl.textContent = 'Starting…';
           } else if (data.type === 'audio') {
             audio = data;
@@ -321,6 +340,8 @@
             [gameW, gameH] = [data.w, data.h];
             statusEl.hidden = true;
             fit();
+          } else if (data.type === 'monitor') {
+            monitorSend(data.line);
           } else if (data.type === 'stats') {
             const f = (v) => v.toFixed(1);
             statsEl.textContent =
@@ -328,11 +349,14 @@
               `guest ${f(data.busy)} ms per frame (max ${f(data.busyMax)})   late ${data.late}   wake +${f(data.wake)} ms (max ${f(data.wakeMax)})\n` +
               (data.inputs ? `input → frame ${f(data.input)} ms (max ${f(data.inputMax)}, ${data.inputs})` : 'input → frame —');
             if (report && q.has('stats')) send('/log', 'stats: ' + statsEl.textContent.replace(/\n/g, ' | '));
+            monitorSend('stats ' + statsEl.textContent.replace(/\n/g, ' | '));
           } else if (data.type === 'capture') {
             if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
           } else if (data.type === 'done') {
             statusEl.hidden = false;
             statusEl.textContent = data.status === 0 ? 'The game has ended.' : `The game stopped (status ${data.status}). See the log for details.`;
+            monitorSend(`done status ${data.status}`);
+            monitorFlush();
             audioStats().then((a) => {
               if (a) send('/log', a);
               send('/done', `status ${data.status}`);
@@ -348,7 +372,8 @@
         const offscreen = screen.transferControlToOffscreen();
         const pacing = ['asap', 'jit'].includes(q.get('pacing')) ? q.get('pacing') : 'clock';
         const ahead = !q.has('noahead');
-        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist }, [offscreen]);
+        monitorSend(`start game=${game} epoch=${epoch} ua=${navigator.userAgent.replaceAll(' ', '_')}`);
+        w.postMessage({ game, frames, epoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist, monitor }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.

@@ -96,6 +96,9 @@ pub struct Engine {
     pub no_x87_inline: bool,
     /// Translated code counts events in `abi::COUNTERS` (debugging).
     pub count: bool,
+    /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
+    /// a session can be replayed (`harness run --replay`).
+    pub monitor: bool,
 }
 
 impl Engine {
@@ -130,6 +133,7 @@ impl Engine {
             probes: Vec::new(),
             no_x87_inline: false,
             count: false,
+            monitor: false,
         }
     }
 
@@ -155,8 +159,9 @@ pub trait Machine: Guest {
     /// Wall-clock microseconds (statistics only).
     fn now_us(&self) -> u64;
     fn print(&mut self, s: &str);
-    /// Input that arrived from the user since the last call (`frame`: frames shown).
-    fn take_input(&mut self, _frame: u64) -> Vec<crate::hle::InputEvent> {
+    /// Input that arrived from the user since the last call (`frame`: frames shown,
+    /// `clock_us`: the guest's clock).
+    fn take_input(&mut self, _frame: u64, _clock_us: u64) -> Vec<crate::hle::InputEvent> {
         Vec::new()
     }
     /// A General MIDI SoundFont, once available (the first call may start loading it).
@@ -349,8 +354,16 @@ impl<M: Machine> Host for M {
         self.set_global(Global::Mxcsr, v)
     }
 
-    fn poll_input(&mut self, frame: u64) -> Vec<crate::hle::InputEvent> {
-        self.take_input(frame)
+    fn poll_input(&mut self, frame: u64, clock_us: u64) -> Vec<crate::hle::InputEvent> {
+        self.take_input(frame, clock_us)
+    }
+
+    fn monitoring(&self) -> bool {
+        self.engine_ref().monitor
+    }
+
+    fn monitor(&mut self, line: &str) {
+        self.print(line);
     }
 
     fn fpu_pop(&mut self) -> f64 {

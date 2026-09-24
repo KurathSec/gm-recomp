@@ -1,9 +1,10 @@
 // Development server: serves the web runtime with cross-origin isolation headers
 // (SharedArrayBuffer, high-resolution timers). With --report, it also prints each
-// line the page POSTs to /log and exits when the page POSTs /done.
+// line the page POSTs to /log and exits when the page POSTs /done. Pages opened with
+// ?monitor record their session in target/monitor/ (see index.html).
 //   node web/dev/server.mjs [--port 8766] [--report] [--timeout SECONDS]
 import { createServer } from 'node:http';
-import { createReadStream, statSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -64,6 +65,17 @@ const server = createServer(async (req, res) => {
       writeFileSync(join(captureDir, `frame-${n.padStart(5, '0')}.png`), Buffer.concat(chunks));
       if (report) console.log(`captured frame ${n}`);
     }
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/monitor') {
+    // a monitored session (page ?monitor): appended to target/monitor/<session>.log
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    res.writeHead(204, headers).end();
+    const name = (url.searchParams.get('s') ?? 'session').replace(/[^A-Za-z0-9._-]/g, '_');
+    const dir = join(repoRoot, 'target', 'monitor');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, `${name}.log`), body);
     return;
   }
   if (req.method === 'POST' && (url.pathname === '/log' || url.pathname === '/done')) {

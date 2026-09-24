@@ -291,7 +291,7 @@ impl Machine for Web {
     fn print(&mut self, s: &str) {
         log(s);
     }
-    fn take_input(&mut self, _frame: u64) -> Vec<runtime::InputEvent> {
+    fn take_input(&mut self, _frame: u64, _clock_us: u64) -> Vec<runtime::InputEvent> {
         Web::take_input()
     }
     fn pace(&mut self, clock_us: u64) {
@@ -620,6 +620,15 @@ pub extern "C" fn run() -> i32 {
         log(&l);
     }
     if r.is_ok() { 0 } else { 1 }
+}
+
+/// Prints each input event as the guest takes it (`input <frame> <clock> ...`) for the
+/// page's monitor mode: the session can then be replayed (`harness run --replay`).
+#[unsafe(no_mangle)]
+pub extern "C" fn set_monitor(on: u32) {
+    if let Some(e) = state().engine.as_mut() {
+        e.monitor = on != 0;
+    }
 }
 
 /// A key event from the page (Windows virtual-key code, scan code with 0x100 for

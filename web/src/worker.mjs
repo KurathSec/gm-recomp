@@ -22,7 +22,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', ahead = true, script = [], persist = true } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', ahead = true, script = [], persist = true, monitor = false } = data;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
     const base = `/games/${encodeURIComponent(game)}/`;
@@ -44,6 +44,11 @@ self.onmessage = async ({ data }) => {
         db = await openSaves();
         const saves = await loadSaves(db, game);
         if (saves.length) post(`restored ${saves.length} saved file${saves.length === 1 ? '' : 's'}`);
+        // monitor: the saves the session starts from, so it can be replayed
+        if (monitor) {
+          const hex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
+          for (const sv of saves) self.postMessage({ type: 'monitor', line: sv.data ? `save ${sv.path.replaceAll(' ', '%20')} ${hex(sv.data)}` : `deleted ${sv.path.replaceAll(' ', '%20')}` });
+        }
         files = applySaves(downloaded, saves);
       } catch (e) {
         post(`saves unavailable: ${e}`);
@@ -77,7 +82,10 @@ self.onmessage = async ({ data }) => {
     const audioRing = { sab: new SharedArrayBuffer(8 + ringFrames * 8), frames: ringFrames };
     self.postMessage({ type: 'audio', sab: audioRing.sab, frames: ringFrames, rate: 48000 });
     const onStats = (stats) => self.postMessage({ type: 'stats', ...stats });
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print: post, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats });
+    const onSlow = monitor ? (frame, busy, interval, clockMs) => self.postMessage({ type: 'monitor', line: `slow ${frame} guest ${busy.toFixed(1)} interval ${interval.toFixed(1)} clock ${clockMs.toFixed(0)}` }) : undefined;
+    // monitor: input lines go to the page as monitor lines, everything else to the log
+    const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow });
     await saving;
     self.postMessage({ type: 'done', status });
   } catch (e) {

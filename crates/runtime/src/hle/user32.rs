@@ -1374,7 +1374,21 @@ fn numpad_key(c: &mut Ctx, i: usize, vk: u8, scan: u16, down: bool, numlock: boo
 
 pub(crate) fn pump_input(c: &mut Ctx) {
     let frame = c.p.frames_presented;
-    let events = c.host.poll_input(frame);
+    let events = c.host.poll_input(frame, c.p.clock_us);
+    if c.host.monitoring() {
+        let clock = c.p.clock_us;
+        for ev in &events {
+            let what = match ev {
+                super::InputEvent::Key { vk, scan, down } => format!("key {vk:#x} {scan:#x} {}", *down as u8),
+                super::InputEvent::Mouse { x, y, buttons } => format!("mouse {x} {y} {buttons}"),
+                super::InputEvent::Pad { index, connected, buttons, triggers, thumbs } => format!(
+                    "pad {index} {} {buttons:#x} {} {} {} {} {} {}",
+                    *connected as u8, triggers[0], triggers[1], thumbs[0], thumbs[1], thumbs[2], thumbs[3]
+                ),
+            };
+            c.host.monitor(&format!("input {frame} {clock} {what}"));
+        }
+    }
     for ev in events {
         match ev {
             super::InputEvent::Key { vk, scan, down } => {

@@ -125,6 +125,13 @@ enum Cmd {
         /// Write the game's sound output to this WAV file.
         #[arg(long)]
         audio_out: Option<PathBuf>,
+        /// Replay a session the page recorded with ?monitor (target/monitor/*.log): its
+        /// start date, saves and input, each event at the poll the guest took it at.
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// The date the game sees, in Unix seconds (default a fixed one).
+        #[arg(long)]
+        epoch: Option<u64>,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -169,7 +176,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, key, mouse, audio_out } => {
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, key, mouse, audio_out, replay, epoch } => {
             let mouse = mouse
                 .iter()
                 .map(|k| {
@@ -194,7 +201,7 @@ fn main() -> Result<()> {
                     Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, keys, mouse, audio_out })
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, keys, mouse, audio_out, replay, epoch })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;
