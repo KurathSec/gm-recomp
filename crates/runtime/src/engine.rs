@@ -731,6 +731,12 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
         return Ok(failed);
     }
     let names: Vec<String> = out.functions.iter().map(|(_, n)| n.clone()).collect();
+    // GMR_DUMP_FN=hex: write the module that holds this function (debugging)
+    if let Some(a) = std::env::var("GMR_DUMP_FN").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+        if out.functions.iter().any(|(e, _)| *e == a) {
+            let _ = std::fs::write(format!("target/fn-{a:x}.wasm"), &out.wasm);
+        }
+    }
     let indices = match m.instantiate(&out.wasm, &names) {
         Ok(ix) => ix,
         Err(e) => {

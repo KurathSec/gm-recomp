@@ -731,20 +731,9 @@ impl<'a> FuncEmit<'a> {
                 self.set(L_FLAG + fl);
             }
         }
-        if which & flags::ALL == flags::ALL {
-            self.pending = None;
-        } else {
-            // Partially materialized: the rest stays pending, but a reader of a
-            // materialized flag must now use the local. Simplest: materialize all.
-            for fl in 0..6u32 {
-                let bit = 1u8 << fl;
-                if which & bit == 0 {
-                    self.flag(bit);
-                    self.set(L_FLAG + fl);
-                }
-            }
-            self.pending = None;
-        }
+        // The others are dead (`which` comes from liveness): nothing reads them before
+        // they are written again.
+        self.pending = None;
     }
 
     /// Records a lazily evaluated flag result. The operands must already be in
