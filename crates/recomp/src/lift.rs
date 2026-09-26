@@ -2349,7 +2349,7 @@ impl<'a> FuncEmit<'a> {
             match i.mnemonic() {
                 Fld | Fild | Fst | Fstp | Fist | Fistp | Fisttp | Fadd | Faddp | Fiadd | Fsub | Fsubp | Fisub | Fsubr | Fsubrp | Fisubr
                 | Fmul | Fmulp | Fimul | Fdiv | Fdivp | Fidiv | Fdivr | Fdivrp | Fidivr | Fxch | Fchs | Fabs | Fcom | Fcomp | Fcompp
-                | Fucom | Fucomp | Fucompp | Fcomi | Fcomip | Fucomi | Fucomip | Ftst | Fxam | Fld1 | Fldz | Fldpi | Fldl2e | Fldl2t
+                | Fucom | Fucomp | Fucompp | Ftst | Fxam | Fld1 | Fldz | Fldpi | Fldl2e | Fldl2t
                 | Fldlg2 | Fldln2 | Frndint | Fsqrt | Fsin | Fcos | Fsincos | Fptan | Fpatan | Fscale | Fprem | Fprem1 | Fyl2x | Fyl2xp1
                 | F2xm1 | Fxtract | Ficom | Ficomp => return true,
                 m if format!("{m:?}").starts_with('F') => return false,

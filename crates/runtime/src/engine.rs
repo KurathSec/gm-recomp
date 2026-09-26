@@ -98,6 +98,8 @@ pub struct Engine {
     pub no_inline: bool,
     /// Translated code counts events in `abi::COUNTERS` (debugging).
     pub count: bool,
+    /// Host time spent running the other guest threads (while the current one waits).
+    pub thread_us: u64,
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
     /// a session can be replayed (`harness run --replay`).
     pub monitor: bool,
@@ -136,6 +138,7 @@ impl Engine {
             no_x87_inline: false,
             no_inline: false,
             count: false,
+            thread_us: 0,
             monitor: false,
         }
     }
@@ -334,7 +337,10 @@ impl<M: Machine> Host for M {
     }
 
     fn run_threads(&mut self, p: &mut Process) {
+        let t = self.now_us();
         run_threads(self, p);
+        let dt = self.now_us() - t;
+        self.engine().thread_us += dt;
     }
 
     fn soundfont(&mut self) -> Option<Vec<u8>> {

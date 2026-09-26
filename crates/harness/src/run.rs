@@ -121,9 +121,9 @@ struct Hd {
     /// GMR_FRAME_MS=<ms>: report frames that took longer (host time between the
     /// game's input polls of consecutive frames) with what the engine did in them.
     frame_ms: Option<f64>,
-    /// (frame, host µs, dispatches, x87 via rt.fpu, translated, translate µs) at the
-    /// start of the frame being measured.
-    frame_mark: (u64, u64, u64, u64, usize, u64),
+    /// (frame, host µs, dispatches, x87 via rt.fpu, translated, translate µs, other
+    /// threads µs) at the start of the frame being measured.
+    frame_mark: (u64, u64, u64, u64, usize, u64, u64),
 }
 
 /// Store and Caller both give direct access to their data.
@@ -258,8 +258,8 @@ impl<C: Cx> Machine for Wt<'_, C> {
             let now = self.cx.hd_ref().t0.elapsed().as_micros() as u64;
             let hd = self.cx.hd();
             let e = &hd.engine;
-            let mark = (frame, now, e.dispatches, e.fpu_ops, e.translated, e.translate_us);
-            let (f0, t, d, x, n, tu) = hd.frame_mark;
+            let mark = (frame, now, e.dispatches, e.fpu_ops, e.translated, e.translate_us, e.thread_us);
+            let (f0, t, d, x, n, tu, th) = hd.frame_mark;
             let counting = e.count;
             if frame != f0 {
                 let ms = (now - t) as f64 / 1000.0;
@@ -290,7 +290,8 @@ impl<C: Cx> Machine for Wt<'_, C> {
                 }
                 if ms > limit && f0 != 0 {
                     eprintln!(
-                        "frame {f0}: {ms:.1} ms  dispatches {}  x87 via rt.fpu {}  translated {} ({:.1} ms){counts}",
+                        "frame {f0}: {ms:.1} ms (other threads {:.1})  dispatches {}  x87 via rt.fpu {}  translated {} ({:.1} ms){counts}",
+                        (mark.6 - th) as f64 / 1000.0,
                         mark.2 - d,
                         mark.3 - x,
                         mark.4 - n,
@@ -410,7 +411,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0) });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0) });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;

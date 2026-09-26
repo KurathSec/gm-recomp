@@ -556,8 +556,11 @@ impl B {
         self.g(F).g(PB).i(W::I32Add).kind(PB).c(!(fb::VALID as u32) & 0xff).i(W::I32And).i(W::I32Store8(ma(fb::KIND)));
         self.g(PB).c(1).i(W::I32Add).c(7).i(W::I32And).s(PB).set_top(PB)
     }
+    /// C1 = 0, unless the next x87 instruction overwrites it anyway (`IP_C1_DEAD`).
     fn clear_c1(&mut self) -> &mut Self {
-        self.clear_c1_at(F)
+        self.g(IP).c(0).i(W::I32GeS).i(W::If(BlockType::Empty));
+        self.clear_c1_at(F);
+        self.i(W::End)
     }
     /// PE (sticky) and C1 from XB (inexact) and XC (rounded up in magnitude).
     fn sw_inexact(&mut self) -> &mut Self {
@@ -569,8 +572,12 @@ impl B {
     fn rc(&mut self, into: u32) -> &mut Self {
         self.rc_at(F, into)
     }
+    /// FIP = this instruction, unless the next x87 instruction (which writes C1 and
+    /// FIP alike) comes before anything can read it (`IP_C1_DEAD`).
     fn set_fip(&mut self) -> &mut Self {
-        self.g(F).g(IP).c(!IP_C1_DEAD).i(W::I32And).i(W::I32Store(ma(fb::FIP)))
+        self.g(IP).c(0).i(W::I32GeS).i(W::If(BlockType::Empty));
+        self.g(F).g(IP).i(W::I32Store(ma(fb::FIP)));
+        self.i(W::End)
     }
     /// XB = (y != x), XC = XB && |y| > |x|: inexact, and rounded up in magnitude.
     fn inexact_flags(&mut self, x: u32, y: u32) -> &mut Self {
@@ -862,6 +869,7 @@ fn form_body(form: Form) -> Function {
             }
             b.set_fip();
             if eflags {
+                // (fcomi leaves the condition codes, C1 too, as they are)
                 // CF = below, ZF = equal, PF = 0 (unordered is not possible here)
                 b.g(XB).g(XC).c(6).i(W::I32Shl).i(W::I32Or).s(XB);
                 result = Some(XB);
