@@ -88,7 +88,7 @@ self.onmessage = async ({ data }) => {
     const onSlow = monitor
       ? (frame, busy, interval, clockMs, d) => {
           const f = (v) => v.toFixed(1);
-          self.postMessage({ type: 'monitor', line: `slow ${frame} guest ${f(busy)} interval ${f(interval)} clock ${clockMs.toFixed(0)} waits ${d.waits} waited ${f(d.waited)} late ${f(d.late)} threads ${f(d.threads)} ahead ${f(d.ahead)} translate ${f(d.translate)}` });
+          self.postMessage({ type: 'monitor', line: `slow ${frame} guest ${f(busy)} interval ${f(interval)} clock ${clockMs.toFixed(0)} waits ${d.waits} waited ${f(d.waited)} late ${f(d.late)} threads ${f(d.threads)} ahead ${f(d.ahead)} translate ${f(d.translate)} api ${d.api} dispatches ${d.dispatches}` });
         }
       : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log

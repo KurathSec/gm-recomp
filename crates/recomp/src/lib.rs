@@ -3,6 +3,7 @@
 pub mod abi;
 pub mod cfg;
 pub mod flags;
+pub mod layout;
 pub mod lift;
 pub mod sse;
 pub mod x87;
@@ -30,6 +31,9 @@ pub struct Options {
     pub resolve_cache: bool,
     /// Count events in `abi::COUNTERS` (debugging).
     pub count: bool,
+    /// With `count`: `abi::ENTRY_COUNTS` counts blocks (by their first instruction's
+    /// address) instead of function entries.
+    pub count_blocks: bool,
     /// Do not inline small leaf callees (checking the inlining).
     pub no_inline: bool,
 }
@@ -39,6 +43,8 @@ pub struct Translator<'m> {
     opts: Options,
     cfgs: BTreeMap<u32, Cfg>,
     pub unimplemented: Vec<(u32, String)>,
+    /// Callees considered for inlining (hand it to the next translator: `take_cache`).
+    cache: cfg::InlineCache,
 }
 
 pub struct Output {
@@ -51,16 +57,32 @@ pub struct Output {
 
 impl<'m> Translator<'m> {
     pub fn new(mem: &'m dyn GuestMem, opts: Options) -> Self {
-        Translator { mem, opts, cfgs: BTreeMap::new(), unimplemented: Vec::new() }
+        Translator { mem, opts, cfgs: BTreeMap::new(), unimplemented: Vec::new(), cache: Default::default() }
+    }
+
+    /// Starts from the inlining cache of an earlier translator.
+    pub fn with_cache(mut self, cache: HashMap<(u32, u8), Option<std::rc::Rc<Cfg>>>) -> Self {
+        self.cache = std::cell::RefCell::new(cache);
+        self
+    }
+
+    /// The inlining cache, for the next translator.
+    pub fn take_cache(&mut self) -> HashMap<(u32, u8), Option<std::rc::Rc<Cfg>>> {
+        std::mem::take(&mut *self.cache.borrow_mut())
     }
 
     pub fn add_function(&mut self, entry: u32, info: &FuncInfo) -> Result<(), String> {
         if self.cfgs.contains_key(&entry) {
             return Ok(());
         }
-        let cfg = cfg::build(self.mem, entry, info, !self.opts.no_inline)?;
+        let cfg = cfg::build(self.mem, entry, info, !self.opts.no_inline, &self.cache)?;
         self.cfgs.insert(entry, cfg);
         Ok(())
+    }
+
+    /// Entries of the functions added so far.
+    pub fn entries(&self) -> impl Iterator<Item = u32> + '_ {
+        self.cfgs.keys().copied()
     }
 
     /// Functions the one at `entry` (added) calls or jumps to directly.
@@ -146,6 +168,7 @@ impl<'m> Translator<'m> {
             fe.x87_inline = !self.opts.no_x87_inline;
             fe.resolve_cache = self.opts.resolve_cache;
             fe.count = self.opts.count;
+            fe.count_blocks = self.opts.count_blocks;
             fe.emit();
             self.unimplemented.extend(fe.unimplemented.drain(..));
             functions.function(types::FUNC);

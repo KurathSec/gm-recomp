@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Call cost test</title>
+<script type="module">
+// ns per call of the call kinds translated code uses, with the (i32 x 8) -> (i32 x 8)
+// register signature and a (i32) -> (i32) one: direct, call_indirect into the same
+// instance's table, call_indirect to another instance's function, an import from
+// another instance, and return_call_indirect chains.
+const send = (path, text) => fetch(path, { method: 'POST', body: text });
+const leb = (n) => { const o = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; o.push(b); } while (n); return o; };
+const str = (s) => [...leb(s.length), ...new TextEncoder().encode(s)];
+const sec = (id, bytes) => [id, ...leb(bytes.length), ...bytes];
+const vec = (items) => [...leb(items.length), ...items.flat()];
+const I32 = 0x7f;
+const t8 = [0x60, 8, ...Array(8).fill(I32), 8, ...Array(8).fill(I32)];
+const t1 = [0x60, 1, I32, 1, I32];
+const tLoop = [0x60, 1, I32, 1, I32]; // (n) -> sum
+const body = (locals, code) => { const b = [...vec(locals), ...code, 0x0b]; return [...leb(b.length), ...b]; };
+const lget = (i) => [0x20, ...leb(i)];
+const lset = (i) => [0x21, ...leb(i)];
+
+// callee module: f8 (adds 1 to each reg), f1 (adds 1); exports both and puts them in the table
+function callee() {
+  const types = sec(1, vec([t8, t1]));
+  const imports = sec(2, vec([[...str('m'), ...str('t'), 0x01, 0x70, 0x00, 0x04]]));
+  const funcs = sec(3, vec([[0], [1]]));
+  const exps = sec(7, vec([[...str('f8'), 0, 0], [...str('f1'), 0, 1]]));
+  const elems = sec(9, vec([[0x00, 0x41, 2, 0x0b, ...vec([[0], [1]])]])); // table[2] = f8, table[3] = f1
+  const f8 = body([], [...Array.from({ length: 8 }, (_, i) => [...lget(i), 0x41, 1, 0x6a]).flat()]);
+  const f1 = body([], [...lget(0), 0x41, 1, 0x6a]);
+  const code = sec(10, vec([f8, f1]));
+  return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...types, ...imports, ...funcs, ...exps, ...elems, ...code]);
+}
+
+// caller module: local copies g8/g1 (table[0], table[1]) and loops calling by each kind
+function caller() {
+  const types = sec(1, vec([t8, t1, tLoop]));
+  const imports = sec(2, vec([
+    [...str('m'), ...str('t'), 0x01, 0x70, 0x00, 0x04],
+    [...str('m'), ...str('f8'), 0x00, 0],
+    [...str('m'), ...str('f1'), 0x00, 1],
+  ]));
+  // funcs: 2 g8, 3 g1, then loops
+  const kinds = ['direct8', 'indirect_same8', 'indirect_other8', 'import8', 'direct1', 'indirect_same1', 'indirect_other1', 'import1'];
+  const funcs = sec(3, vec([[0], [1], ...kinds.map(() => [2])]));
+  const exps = sec(7, vec(kinds.map((k, i) => [...str(k), 0, ...leb(4 + i)])));
+  const elems = sec(9, vec([[0x00, 0x41, 0, 0x0b, ...vec([[2], [3]])]])); // table[0] = g8, table[1] = g1
+  const g8 = body([], [...Array.from({ length: 8 }, (_, i) => [...lget(i), 0x41, 1, 0x6a]).flat()]);
+  const g1 = body([], [...lget(0), 0x41, 1, 0x6a]);
+  // loop: locals 1..8 regs; while (n--) regs = call(regs); return r0
+  const loop8 = (callInstr) => body([[8, I32]], [
+    0x02, 0x40, 0x03, 0x40,
+    ...lget(0), 0x45, 0x0d, 1,
+    ...lget(0), 0x41, 1, 0x6b, ...lset(0),
+    ...Array.from({ length: 8 }, (_, i) => lget(1 + i)).flat(),
+    ...callInstr,
+    ...Array.from({ length: 8 }, (_, i) => lset(8 - i)).flat(),
+    0x0c, 0, 0x0b, 0x0b,
+    ...lget(1),
+  ]);
+  const loop1 = (callInstr) => body([[1, I32]], [
+    0x02, 0x40, 0x03, 0x40,
+    ...lget(0), 0x45, 0x0d, 1,
+    ...lget(0), 0x41, 1, 0x6b, ...lset(0),
+    ...lget(1), ...callInstr, ...lset(1),
+    0x0c, 0, 0x0b, 0x0b,
+    ...lget(1),
+  ]);
+  const code = sec(10, vec([
+    g8, g1,
+    loop8([0x10, 2]), loop8([0x41, 0, 0x11, 0, 0]), loop8([0x41, 2, 0x11, 0, 0]), loop8([0x10, 0]),
+    loop1([0x10, 3]), loop1([0x41, 1, 0x11, 1, 0]), loop1([0x41, 3, 0x11, 1, 0]), loop1([0x10, 1]),
+  ]));
+  return { kinds, bytes: new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...types, ...imports, ...funcs, ...exps, ...elems, ...code]) };
+}
+
+const out = [];
+try {
+  const table = new WebAssembly.Table({ element: 'anyfunc', initial: 4 });
+  const a = new WebAssembly.Instance(new WebAssembly.Module(callee()), { m: { t: table } });
+  const { kinds, bytes } = caller();
+  const b = new WebAssembly.Instance(new WebAssembly.Module(bytes), { m: { t: table, f8: a.exports.f8, f1: a.exports.f1 } });
+  const N = 20_000_000;
+  for (let round = 0; round < 2; round++) {
+    for (const k of kinds) {
+      const t = performance.now();
+      b.exports[k](N);
+      const ns = ((performance.now() - t) * 1e6) / N;
+      if (round === 1) out.push(`${k} ${ns.toFixed(2)}`);
+    }
+  }
+} catch (e) {
+  out.push(String(e));
+}
+await send('/log', `${navigator.userAgent.includes('Firefox') ? 'firefox' : 'chrome'}: ${out.join('  ')}`);
+await send('/done', '');
+</script>

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs a game page in a headless browser and prints what the page reports.
 #   web/tools/run-browser.sh chrome|firefox '<query string>' [capture dir] [port]
+# FFPREFS='name=value ...' sets Firefox preferences.
 # PROFILE=<dir> keeps the browser profile (and with it the games' saves) across runs;
 # flatpak Chrome only sees directories it may access, e.g. ~/.var/app/com.google.Chrome/.
 set -e
@@ -20,6 +21,8 @@ case $browser in
     ff=${PROFILE:-$tmp}
     mkdir -p "$ff"
     echo 'user_pref("media.autoplay.default", 0); user_pref("media.autoplay.blocking_policy", 0);' > "$ff/user.js"
+    # FFPREFS='name=value ...' adds preferences, e.g. javascript.options.wasm_baselinejit=false
+    for p in ${FFPREFS:-}; do echo "user_pref(\"${p%%=*}\", ${p#*=});" >> "$ff/user.js"; done
     firefox --headless --no-remote --profile "$ff" "$url" > "$tmp/browser.log" 2>&1 & ;;
 esac
 browser_pid=$!

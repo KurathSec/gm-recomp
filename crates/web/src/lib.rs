@@ -314,7 +314,8 @@ impl Machine for Web {
         // short steps): translate code the game has not reached yet.
         let slack = unsafe { gpu_slack(ms) };
         if slack > 0.8 {
-            let deadline = self.now_us() + ((slack - 0.3) * 1000.0) as u64;
+            // most of it, at most 6 ms: a compile can take longer than estimated
+            let deadline = self.now_us() + ((slack - 0.3) * 600.0).min(6000.0) as u64;
             runtime::engine::translate_idle_timed(self, deadline);
         }
         unsafe { gpu_pace(ms) }
@@ -609,7 +610,7 @@ pub extern "C" fn run() -> i32 {
         },
         format!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)"),
         format!(
-            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s; {} ahead in {} waits)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s; {} ahead in {} waits, {:.1}s, ~{} ns/byte)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
@@ -618,6 +619,8 @@ pub extern "C" fn run() -> i32 {
             e.translate_us as f64 / 1e6,
             e.idle_done,
             e.idle_calls,
+            e.idle_us as f64 / 1e6,
+            e.idle_ns_per_byte,
             p.now_ms()
         ),
     ];
@@ -637,14 +640,16 @@ pub extern "C" fn run() -> i32 {
     if r.is_ok() { 0 } else { 1 }
 }
 
-/// Host time the runtime spent so far (µs) on: 0 the other guest threads, 1
-/// translating ahead, 2 translating in all (live statistics for the page).
+/// Runtime statistics so far, for the page: host time (µs) spent on 0 the other
+/// guest threads, 1 translating ahead, 2 translating in all; 3 api calls; 4 dispatches.
 #[unsafe(no_mangle)]
 pub extern "C" fn stat_us(which: u32) -> f64 {
     state().engine.as_ref().map_or(0.0, |e| match which {
         0 => e.thread_us,
         1 => e.idle_us,
-        _ => e.translate_us,
+        2 => e.translate_us,
+        3 => e.api_calls,
+        _ => e.dispatches,
     } as f64)
 }
 

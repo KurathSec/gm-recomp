@@ -273,7 +273,7 @@ impl<C: Cx> Machine for Wt<'_, C> {
                         counts.push_str(&format!("  {name} {v}"));
                     }
                     // GMR_COUNT=top: the functions entered most this frame
-                    if std::env::var("GMR_COUNT").map(|v| v == "top").unwrap_or(false) {
+                    if std::env::var("GMR_COUNT").is_ok_and(|v| v == "top" || v == "blocks") {
                         let mut slots = Vec::new();
                         for k in 0..abi::ENTRY_SLOTS {
                             let a = abi::ENTRY_COUNTS + 8 * k;
@@ -284,7 +284,7 @@ impl<C: Cx> Machine for Wt<'_, C> {
                             }
                         }
                         slots.sort_unstable_by(|a, b| b.cmp(a));
-                        let top: Vec<String> = slots.iter().take(12).map(|(n, f)| format!("{f:#x}:{n}")).collect();
+                        let top: Vec<String> = slots.iter().take(if std::env::var("GMR_COUNT").is_ok_and(|v| v == "blocks") { 40 } else { 12 }).map(|(n, f)| format!("{f:#x}:{n}")).collect();
                         counts.push_str(&format!("\n    top {}", top.join(" ")));
                     }
                 }
@@ -398,6 +398,8 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eng.no_inline = std::env::var_os("GMR_NO_INLINE").is_some();
     // GMR_COUNT=1: translated code counts calls, x87 instructions, ... (GMR_FRAME_MS shows them).
     eng.count = std::env::var_os("GMR_COUNT").is_some();
+    // GMR_COUNT=blocks: as top, by block
+    eng.count_blocks = std::env::var("GMR_COUNT").is_ok_and(|v| v == "blocks");
     // GMR_FPU_PROFILE=1: count x87 instructions by mnemonic.
     if std::env::var_os("GMR_FPU_PROFILE").is_some() {
         eng.fpu_profile = Some(Default::default());

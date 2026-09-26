@@ -3,8 +3,11 @@
 //        [--key frame:vk:down ...] (as the harness: vk in hex, down 1/0, after that frame)
 //        [--replay target/monitor/<session>.log] (a session the page recorded: its date,
 //        saves and input; `node --cpu-prof` then profiles it)
+//        [--profile from:to [--profile-out file.cpuprofile]] (a CPU profile of these frames only)
 import { readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { writeFileSync } from 'node:fs';
+import inspector from 'node:inspector';
 import { runGame } from '../src/host.mjs';
 
 const args = process.argv.slice(2);
@@ -57,8 +60,22 @@ const dumpMem = opt('--dump-mem', null);
 let guest;
 const keys = args.flatMap((a, i) => (a === '--key' ? [args[i + 1].split(':')] : [])).map(([f, vk, d]) => [Number(f), parseInt(vk, 16), d === '1']);
 let input;
+const [profFrom, profTo] = (opt('--profile', '') || '-1:-1').split(':').map(Number);
+const profOut = opt('--profile-out', 'frames.cpuprofile');
+let session;
 const onFrame = (frame) => {
   for (const [f, vk, down] of keys) if (f === frame) input.key(vk, 0, down);
+  // the inspector answers a session of this thread synchronously
+  if (frame === profFrom) {
+    session = new inspector.Session();
+    session.connect();
+    session.post('Profiler.enable');
+    session.post('Profiler.setSamplingInterval', { interval: 100 });
+    session.post('Profiler.start');
+  } else if (frame === profTo && session) {
+    session.post('Profiler.stop', (err, { profile }) => writeFileSync(profOut, JSON.stringify(profile)));
+    session.disconnect();
+  }
 };
 const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory), replay: replay.input });
 if (dumpMem) await writeFile(dumpMem, new Uint8Array(guest.buffer));

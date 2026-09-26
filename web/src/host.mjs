@@ -56,17 +56,24 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // Live statistics (onStats): this window's samples.
   const epochNow = () => performance.timeOrigin + performance.now();
   let pendingInputs = [];
+  const slackStats = { n: 0, est: 0, left: 0 };
+  let gpuMs = 0;
+  let compileMs = 0;
+  let instantiateMs = 0;
+  let moduleBytes = 0;
   // this frame's waits (count, ms waited, latest wake) and the runtime's counters at its start
   let waits = { n: 0, ms: 0, late: 0 };
-  let marks = [0, 0, 0];
+  let marks = [0, 0, 0, 0, 0];
+  // ms of other threads, ahead translation and translation; api calls; dispatches
+  const counters = () => [0, 1, 2, 3, 4].map((k) => rt.exports.stat_us(k) / (k < 3 ? 1000 : 1));
   const frameDetail = () => {
-    const now = [0, 1, 2].map((k) => rt.exports.stat_us(k) / 1000);
-    const d = { waits: waits.n, waited: waits.ms, late: waits.late, threads: now[0] - marks[0], ahead: now[1] - marks[1], translate: now[2] - marks[2] };
+    const now = counters();
+    const d = { waits: waits.n, waited: waits.ms, late: waits.late, threads: now[0] - marks[0], ahead: now[1] - marks[1], translate: now[2] - marks[2], api: now[3] - marks[3], dispatches: now[4] - marks[4] };
     return d;
   };
   const frameReset = () => {
     waits = { n: 0, ms: 0, late: 0 };
-    if (onSlow) marks = [0, 1, 2].map((k) => rt.exports.stat_us(k) / 1000);
+    if (onSlow) marks = counters();
   };
   let win = { start: performance.now(), frames: 0, intervals: [], busy: [], late: 0, inputs: [], wake: [] };
   let lastPresentReal = 0;
@@ -160,8 +167,16 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_texture_delete: (id) => gpu?.textureDelete(id),
     gpu_set_target: (id, w, h) => gpu?.setTarget(id, w, h),
     gpu_clear: (flags, color, z, stencil, x, y, w, h) => gpu?.clear(flags, color >>> 0, z, stencil, x, y, w, h),
-    gpu_draw: (ptr) => gpu?.draw(ptr),
-    gpu_draw9: (ptr) => gpu?.draw9(ptr),
+    gpu_draw: (ptr) => {
+      const t = performance.now();
+      gpu?.draw(ptr);
+      gpuMs += performance.now() - t;
+    },
+    gpu_draw9: (ptr) => {
+      const t = performance.now();
+      gpu?.draw9(ptr);
+      gpuMs += performance.now() - t;
+    },
     gpu_shader_create: (id, vertex, ptr, len) => gpu?.shaderCreate(id, !!vertex, dec.decode(mem().subarray(ptr, ptr + len))),
     gpu_shader_delete: (id) => gpu?.shaderDelete(id),
     gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
@@ -209,7 +224,21 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       // Waits block the worker (Atomics.wait ends on time; an event-loop timer can
       // be late by several ms); each frame then yields once so the canvas shows it
       // and messages arrive.
-      if (ahead) gpuImports.gpu_slack = (clockMs) => due(clockMs) - performance.now();
+      // Translating ahead may use the rest of the frame, not only this wait (the game
+      // sleeps a millisecond at a time): until the next frame is due, less what the
+      // guest needs for it and a margin; the waits after it then end at once.
+      let shownClock = 0;
+      let frameStep = 20;
+      if (ahead)
+        gpuImports.gpu_slack = (clockMs) => {
+          const now = performance.now();
+          const est = estimate();
+          const frameLeft = due(shownClock + frameStep) - est - 2 - now;
+          slackStats.n++;
+          slackStats.est += est;
+          slackStats.left += Math.max(0, frameLeft);
+          return Math.max(due(clockMs) - now, frameLeft);
+        };
       gpuImports.gpu_pace = (clockMs) => {
         const at = due(clockMs);
         const before = performance.now();
@@ -226,6 +255,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       let wakeUp = null;
       channel.port1.onmessage = () => wakeUp?.();
       gpuImports.gpu_present = new WebAssembly.Suspending((clockMs, x, y, w, h, dw, dh) => {
+        if (clockMs > shownClock) frameStep = Math.min(100, clockMs - shownClock);
+        shownClock = clockMs;
         const frame = show(clockMs, x, y, w, h, dw, dh, guestTime());
         const r = onFrame ? onFrame(frame, gpu) : undefined;
         return Promise.resolve(r).then(
@@ -325,9 +356,16 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
     instantiate(ptr, len, namesPtr, namesLen, out) {
       try {
-        const bytes = mem().slice(ptr, ptr + len);
+        const t0 = performance.now();
+        // (a view: the module takes its own copy, so no garbage is left here)
+        const bytes = mem().subarray(ptr, ptr + len);
         const names = dec.decode(mem().subarray(namesPtr, namesPtr + namesLen)).split('\n');
-        const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { cpu: cpuImports, rt: rtImports, x87: x87Imports });
+        const module = new WebAssembly.Module(bytes);
+        const t1 = performance.now();
+        const inst = new WebAssembly.Instance(module, { cpu: cpuImports, rt: rtImports, x87: x87Imports });
+        compileMs += t1 - t0;
+        instantiateMs += performance.now() - t1;
+        moduleBytes += len;
         const base = table.grow(names.length);
         const o = new Uint32Array(rt.exports.memory.buffer, out, names.length);
         names.forEach((n, i) => {
@@ -432,7 +470,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // [kind, frame, clock, a, b, c]: a recorded session's input
   for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
-  print(`modules instantiated: ${modules}`);
+  if (gpu) print(`draw calls: ${(gpuMs / 1000).toFixed(2)}s in all, ${(gpuMs / Math.max(1, gpu.frames)).toFixed(2)} ms per frame`);
+  if (slackStats.n) print(`slack: ${slackStats.n} asks, estimate ${(slackStats.est / slackStats.n).toFixed(2)} ms, frame left ${(slackStats.left / slackStats.n).toFixed(2)} ms`);
+  print(`modules instantiated: ${modules} (${(moduleBytes / 1048576).toFixed(1)} MB; compile ${(compileMs / 1000).toFixed(2)}s, instantiate ${(instantiateMs / 1000).toFixed(2)}s)`);
   if (frameMs.length > 60) {
     // Steady state: skip the loading frames.
     const tail = frameMs.slice(Math.floor(frameMs.length / 2)).sort((a, b) => a - b);

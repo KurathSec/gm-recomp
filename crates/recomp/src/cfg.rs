@@ -101,16 +101,30 @@ pub struct Cfg {
 
 const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
 
+/// Callees considered for inlining, by (address, depth): what `inlinable` found (many
+/// functions call the same few small ones). Kept across translations; code changing
+/// under a cached entry is not noticed (as translated code itself is not).
+pub type InlineCache = std::cell::RefCell<HashMap<(u32, u8), Option<std::rc::Rc<Cfg>>>>;
+
 /// The function at `entry`, with small callees inlined when `inline`.
-pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, inline: bool) -> Result<Cfg, String> {
-    build_with(mem, entry, info, if inline { INLINE_DEPTH } else { 0 })
+pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, inline: bool, cache: &InlineCache) -> Result<Cfg, String> {
+    build_with(mem, entry, info, if inline { INLINE_DEPTH } else { 0 }, cache)
 }
 
 /// The callee at `target` as blocks to inline, if it is small: a few instructions
 /// within 4 KiB after its entry, leaving by `ret` or direct jumps to functions (no
 /// jump tables or computed jumps; calls are fine).
-fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8) -> Option<Cfg> {
-    let c = build_with(mem, target, info, depth).ok()?;
+fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache) -> Option<std::rc::Rc<Cfg>> {
+    if let Some(c) = cache.borrow().get(&(target, depth)) {
+        return c.clone();
+    }
+    let c = inlinable_uncached(mem, target, info, depth, cache).map(std::rc::Rc::new);
+    cache.borrow_mut().insert((target, depth), c.clone());
+    c
+}
+
+fn inlinable_uncached(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache) -> Option<Cfg> {
+    let c = build_with(mem, target, info, depth, cache).ok()?;
     let n: usize = c.blocks.values().map(|b| b.instrs.len()).sum();
     let simple = n <= MAX_INLINE_INSTRS
         && c.ret_targets.is_empty()
@@ -125,7 +139,7 @@ fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8) -> Opt
     simple.then_some(c)
 }
 
-fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Result<Cfg, String> {
+fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache: &InlineCache) -> Result<Cfg, String> {
     let inline = depth > 0;
     let mut sites = 0u32;
     let mut next_key = INLINE_KEYS;
@@ -181,7 +195,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                 break;
             }
             total += 1;
-            if format!("{:?}", instr.mnemonic()).starts_with('F') && instr.mnemonic() != Mnemonic::Femms {
+            if is_x87(instr.mnemonic()) && instr.mnemonic() != Mnemonic::Femms {
                 // skip legacy prefixes to find the D8..DF escape byte
                 let mut k = 0;
                 while k + 1 < instr.len() && matches!(buf[k], 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3) {
@@ -232,7 +246,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                         && sites < MAX_INLINE_SITES
                         && instr.op0_kind() == OpKind::NearBranch32
                         && instr.near_branch_target() as u32 != entry
-                        && let Some(callee) = inlinable(mem, instr.near_branch_target() as u32, info, depth - 1)
+                        && let Some(callee) = inlinable(mem, instr.near_branch_target() as u32, info, depth - 1, cache)
                         && callee.blocks.values().map(|b| b.instrs.len()).sum::<usize>() <= budget =>
                 {
                     budget -= callee.blocks.values().map(|b| b.instrs.len()).sum::<usize>();
@@ -246,8 +260,8 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                         next_key += 1;
                     }
                     let key = |a: u32| keys[&a];
-                    for (k, b) in callee.blocks {
-                        let t = match b.term {
+                    for (&k, b) in &callee.blocks {
+                        let t = match b.term.clone() {
                             Term::Fall(a) => Term::Fall(key(a)),
                             Term::Jump(a) => Term::Jump(key(a)),
                             Term::Cond { taken, next: n } => Term::Cond { taken: key(taken), next: key(n) },
@@ -263,11 +277,11 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                             Term::InlineTail { target: t, ret_to, ret_key } => Term::InlineTail { target: t, ret_to, ret_key: key(ret_key) },
                             _ => Term::InlineRet { ret_to: next, ret_key: next },
                         };
-                        blocks.insert(key(k), Block { start: key(k), instrs: b.instrs, term: t });
+                        blocks.insert(key(k), Block { start: key(k), instrs: b.instrs.clone(), term: t });
                     }
-                    fop.extend(callee.fop);
-                    call_flags.extend(callee.call_flags);
-                    known.extend(callee.known);
+                    fop.extend(callee.fop.iter().map(|(&a, &b)| (a, b)));
+                    call_flags.extend(callee.call_flags.iter().map(|(&a, &b)| (a, b)));
+                    known.extend(callee.known.iter().map(|(&a, &b)| (a, b)));
                     queue.push_back(next);
                     term = Term::InlineCall { entry: key(target) };
                 }
@@ -342,6 +356,13 @@ pub fn entry_flag_reads(mem: &dyn GuestMem, entry: u32) -> u8 {
         }
     }
     reads | (crate::flags::ALL & !written)
+}
+
+/// An x87 instruction (its mnemonic starts with F), by table.
+pub fn is_x87(m: Mnemonic) -> bool {
+    static TABLE: std::sync::LazyLock<Vec<bool>> =
+        std::sync::LazyLock::new(|| Mnemonic::values().map(|m| format!("{m:?}").starts_with('F')).collect());
+    TABLE.get(m as usize).copied().unwrap_or(false)
 }
 
 /// Four zero bytes at `va` (`add [eax],al` twice): memory, not code.

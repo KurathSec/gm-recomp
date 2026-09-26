@@ -47,6 +47,24 @@ impl Semantics for WideS {
 }
 pub type Wide = IeeeFloat<WideS>;
 
+/// fld1, fldl2t, fldl2e, fldpi, fldlg2, fldln2 and fldz as 80-bit images, by rounding
+/// control (parsed once: parsing on every load showed in profiles).
+static CONSTANTS: std::sync::LazyLock<[[u128; 4]; 7]> = std::sync::LazyLock::new(|| {
+    let texts = [
+        "1",
+        "3.32192809488736234787031942948939017586483139302458061205",
+        "1.44269504088896340735992468100189213742664595415298593413",
+        "3.14159265358979323846264338327950288419716939937510582097",
+        "0.30102999566398119521373889472449302676818988146210854131",
+        "0.69314718055994530941723212145817656807550013436025525412",
+        "0",
+    ];
+    texts.map(|t| {
+        let w: Wide = t.parse().unwrap();
+        [0u16, 1, 2, 3].map(|rc| widen_wide_to_ext(w, round_mode(rc << 10)).to_bits())
+    })
+});
+
 /// Truncating wide operation with a sticky bit.
 fn wide_sticky(op: Arith, a: Wide, b: Wide) -> (Wide, Status) {
     let r = match op {
@@ -1018,17 +1036,16 @@ impl Fpu {
             }
             Fld1 | Fldl2t | Fldl2e | Fldpi | Fldlg2 | Fldln2 | Fldz => {
                 // Constants are kept to 66 bits internally and rounded by RC only (PC is ignored).
-                let text = match mn {
-                    Fld1 => "1",
-                    Fldl2t => "3.32192809488736234787031942948939017586483139302458061205",
-                    Fldl2e => "1.44269504088896340735992468100189213742664595415298593413",
-                    Fldpi => "3.14159265358979323846264338327950288419716939937510582097",
-                    Fldlg2 => "0.30102999566398119521373889472449302676818988146210854131",
-                    Fldln2 => "0.69314718055994530941723212145817656807550013436025525412",
-                    _ => "0",
+                let k = match mn {
+                    Fld1 => 0,
+                    Fldl2t => 1,
+                    Fldl2e => 2,
+                    Fldpi => 3,
+                    Fldlg2 => 4,
+                    Fldln2 => 5,
+                    _ => 6,
                 };
-                let w: Wide = text.parse().unwrap();
-                let v = widen_wide_to_ext(w, round_mode(self.cw));
+                let v = ext_from_bits(CONSTANTS[k][((self.cw >> 10) & 3) as usize]);
                 self.clear_c1();
                 self.push(v);
             }

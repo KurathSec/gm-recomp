@@ -57,12 +57,26 @@ enum Dst {
     None,
 }
 
+/// A label around the code being emitted, by what a branch to it continues at.
+enum Label {
+    /// The end of a block: the code of the block at this position follows.
+    Block(u32),
+    /// A loop whose header block is at this position.
+    Loop(u32),
+    /// The dispatcher loop (`L_BLK` selects the block).
+    Dispatch,
+}
+
 pub struct FuncEmit<'a> {
     pub f: Function,
     cfg: &'a Cfg,
-    /// Block start address -> dispatch index.
+    /// Block start address -> position in `order` (the dispatch index).
     index: HashMap<u32, u32>,
     order: Vec<u32>,
+    /// Loops nested over `order` (taken by `emit`).
+    items: Vec<crate::layout::Item>,
+    /// Labels open around the current block's code, outermost first.
+    labels: Vec<Label>,
     live_out: HashMap<u32, u8>,
     /// Flags the entry block reads before writing (loaded from the globals).
     entry_flags: u8,
@@ -75,6 +89,7 @@ pub struct FuncEmit<'a> {
     pub x87_inline: bool,
     pub resolve_cache: bool,
     pub count: bool,
+    pub count_blocks: bool,
     /// Flags some later instruction (or a successor) will read after the current one.
     needed: u8,
     ip: u32,
@@ -91,7 +106,7 @@ impl<'a> FuncEmit<'a> {
     }
 
     pub fn new(cfg: &'a Cfg, func_index: &'a HashMap<u32, u32>) -> Self {
-        let order: Vec<u32> = cfg.blocks.keys().copied().collect();
+        let crate::layout::Layout { order, items } = crate::layout::layout(cfg);
         let index = order.iter().enumerate().map(|(i, &a)| (a, i as u32)).collect();
         let (live_in, live_out) = liveness(cfg);
         let entry_flags = live_in.get(&cfg.entry).copied().unwrap_or(flags::ALL);
@@ -100,6 +115,8 @@ impl<'a> FuncEmit<'a> {
             cfg,
             index,
             order,
+            items,
+            labels: Vec::new(),
             live_out,
             entry_flags,
             func_index,
@@ -108,6 +125,7 @@ impl<'a> FuncEmit<'a> {
             x87_inline: true,
             resolve_cache: false,
             count: false,
+            count_blocks: false,
             needed: 0,
             ip: 0,
             next_ip: 0,
@@ -216,6 +234,20 @@ impl<'a> FuncEmit<'a> {
         for r in (0..8).rev() {
             self.set(L_REG + r);
         }
+    }
+
+    /// Bumps the count of `addr` in `abi::ENTRY_COUNTS`: [address, count] in its slot.
+    fn count_at(&mut self, addr: u32) {
+        let slot = crate::abi::ENTRY_COUNTS + 8 * ((addr.wrapping_mul(crate::abi::RESOLVE_HASH) >> 19) & (crate::abi::ENTRY_SLOTS - 1));
+        self.c(slot);
+        self.c(addr);
+        self.i(W::I32Store(mem0()));
+        self.c(slot + 4);
+        self.c(slot + 4);
+        self.i(W::I32Load(mem0()));
+        self.c(1);
+        self.i(W::I32Add);
+        self.i(W::I32Store(mem0()));
     }
 
     /// Bumps event counter `k` (`abi::COUNT_*`) when counting.
@@ -792,16 +824,29 @@ impl<'a> FuncEmit<'a> {
 
     // ---- control flow ----------------------------------------------------
 
-    fn loop_depth(&self) -> u32 {
-        (self.order.len() as u32 - 1 - self.cur_block as u32) + self.depth
-    }
-
     /// Jumps to another block of this function.
     fn goto(&mut self, target: u32) {
+        self.goto_within(target, 0);
+    }
+
+    /// `goto` from inside `extra` more nested blocks than `depth` counts. A later block
+    /// is a branch to the end of its label (its code follows), the header of a loop
+    /// around this block a branch to the loop; anything else goes round the dispatcher
+    /// loop. Branches straight to their target keep the engines' branch prediction
+    /// apart, where the dispatcher's one indirect jump would share it.
+    fn goto_within(&mut self, target: u32, extra: u32) {
         let idx = self.index[&target];
-        self.c(idx);
-        self.set(L_BLK);
-        self.i(W::Br(self.loop_depth()));
+        self.count(crate::abi::COUNT_JUMPS);
+        let found = self.labels.iter().rev().position(|l| matches!(l, Label::Block(p) | Label::Loop(p) if *p == idx));
+        if let Some(d) = found {
+            self.i(W::Br(d as u32 + self.depth + extra));
+        } else {
+            self.count(crate::abi::COUNT_LOOPS);
+            self.c(idx);
+            self.set(L_BLK);
+            let top = self.labels.iter().rev().position(|l| matches!(l, Label::Dispatch)).expect("dispatcher label");
+            self.i(W::Br(top as u32 + self.depth + extra));
+        }
     }
 
     fn push32_from(&mut self, src: u32) {
@@ -969,18 +1014,8 @@ impl<'a> FuncEmit<'a> {
     pub fn emit(&mut self) {
         self.load_state();
         self.count(crate::abi::COUNT_ENTRIES);
-        if self.count {
-            // [entry, count] in this function's slot
-            let slot = crate::abi::ENTRY_COUNTS + 8 * ((self.cfg.entry.wrapping_mul(crate::abi::RESOLVE_HASH) >> 19) & (crate::abi::ENTRY_SLOTS - 1));
-            self.c(slot);
-            self.c(self.cfg.entry);
-            self.i(W::I32Store(mem0()));
-            self.c(slot + 4);
-            self.c(slot + 4);
-            self.i(W::I32Load(mem0()));
-            self.c(1);
-            self.i(W::I32Add);
-            self.i(W::I32Store(mem0()));
+        if self.count && !self.count_blocks {
+            self.count_at(self.cfg.entry);
         }
         if self.probe {
             self.ip = self.cfg.entry;
@@ -992,28 +1027,70 @@ impl<'a> FuncEmit<'a> {
             self.c(entry_index);
             self.set(L_BLK);
         }
-        let n = self.order.len() as u32;
-        // block $fail; loop $top; block b_{n-1} ... block b_0; br_table; end b_0; code 0; end b_1; code 1; ...
+        // block $fail; loop $dispatch; block i_{m-1} ... block i_0; br_table; end i_0;
+        // item 0; end i_1; item 1; ... where a loop item is loop $head; block j_{k-1} ...
+        // block j_1; header block; end j_1; item 1; ...; end. The dispatcher reaches the
+        // outermost items (loops by their header); the layout leaves nothing else that
+        // jumps back to an earlier block other than a loop's header.
+        let items = std::mem::take(&mut self.items);
+        let m = items.len() as u32;
         self.i(W::Block(BlockType::Empty));
         self.i(W::Loop(BlockType::Empty));
-        for _ in 0..n {
+        self.labels.push(Label::Dispatch);
+        for it in items.iter().rev() {
             self.i(W::Block(BlockType::Empty));
+            self.labels.push(Label::Block(it.first()));
         }
         self.get(L_BLK);
-        let targets: Vec<u32> = (0..n).collect();
-        self.i(W::BrTable(Cow::Owned(targets), n + 1));
-        for k in 0..n as usize {
-            self.i(W::End);
-            self.cur_block = k;
-            self.depth = 0;
-            self.pending = None;
-            let block = &self.cfg.blocks[&self.order[k]];
-            self.emit_block(block);
+        let mut targets = vec![m + 1; self.order.len()];
+        for (j, it) in items.iter().enumerate() {
+            targets[it.first() as usize] = j as u32;
         }
-        self.i(W::End); // loop
+        self.i(W::BrTable(Cow::Owned(targets), m + 1));
+        for it in &items {
+            self.i(W::End);
+            self.labels.pop();
+            self.emit_item(it);
+        }
+        self.i(W::End); // dispatch
+        self.labels.pop();
         self.i(W::End); // fail
         self.i(W::Unreachable);
         self.i(W::End);
+    }
+
+    fn emit_item(&mut self, item: &crate::layout::Item) {
+        use crate::layout::Item;
+        match item {
+            Item::Block(p) => {
+                self.cur_block = *p as usize;
+                self.depth = 0;
+                self.pending = None;
+                let block = &self.cfg.blocks[&self.order[*p as usize]];
+                if self.count_blocks {
+                    if let Some(i) = block.instrs.first() {
+                        self.count_at(i.ip() as u32);
+                    }
+                }
+                self.emit_block(block);
+            }
+            Item::Loop(inner) => {
+                self.i(W::Loop(BlockType::Empty));
+                self.labels.push(Label::Loop(inner[0].first()));
+                for it in inner[1..].iter().rev() {
+                    self.i(W::Block(BlockType::Empty));
+                    self.labels.push(Label::Block(it.first()));
+                }
+                self.emit_item(&inner[0]);
+                for it in &inner[1..] {
+                    self.i(W::End);
+                    self.labels.pop();
+                    self.emit_item(it);
+                }
+                self.i(W::End);
+                self.labels.pop();
+            }
+        }
     }
 
     fn emit_block(&mut self, block: &Block) {
@@ -1103,11 +1180,9 @@ impl<'a> FuncEmit<'a> {
                 // jmp [idx*4 + table]: the index register selects the case.
                 self.materialize(live_out);
                 let ix = instr.memory_index();
-                let cases: Vec<u32> = targets.iter().map(|t| self.index[t]).collect();
-                let depth = self.loop_depth();
-                // Each case: set blk and branch to the loop. Use a nested block ladder;
-                // the index is pushed inside the innermost block (operands do not cross blocks).
-                let n = cases.len() as u32;
+                // Each case branches to its block. Use a nested block ladder; the index is
+                // pushed inside the innermost block (operands do not cross blocks).
+                let n = targets.len() as u32;
                 // Outermost block: indices outside the discovered table (Delphi's Move
                 // indexes its table with negative values) jump through memory.
                 self.i(W::Block(BlockType::Empty));
@@ -1116,12 +1191,10 @@ impl<'a> FuncEmit<'a> {
                 }
                 self.read_reg(ix);
                 self.i(W::BrTable(Cow::Owned((0..n).collect()), n));
-                for (k, &case) in cases.iter().enumerate() {
+                for (k, case) in targets.iter().enumerate() {
                     self.i(W::End);
-                    self.c(case);
-                    self.set(L_BLK);
                     let remaining = n - 1 - k as u32;
-                    self.i(W::Br(depth + remaining + 1));
+                    self.goto_within(*case, remaining + 1);
                 }
                 self.i(W::End);
                 self.read_op(instr, 0, false);
@@ -1701,7 +1774,7 @@ impl<'a> FuncEmit<'a> {
                 self.trap(trap::UNIMPLEMENTED, self.ip);
             }
             Femms | Emms | Wait => self.x87(instr),
-            m if format!("{m:?}").starts_with('F') => self.x87(instr),
+            m if crate::cfg::is_x87(m) => self.x87(instr),
             _ => {
                 if !self.sse(instr) {
                     self.unimplemented(instr);
@@ -2352,7 +2425,7 @@ impl<'a> FuncEmit<'a> {
                 | Fucom | Fucomp | Fucompp | Ftst | Fxam | Fld1 | Fldz | Fldpi | Fldl2e | Fldl2t
                 | Fldlg2 | Fldln2 | Frndint | Fsqrt | Fsin | Fcos | Fsincos | Fptan | Fpatan | Fscale | Fprem | Fprem1 | Fyl2x | Fyl2xp1
                 | F2xm1 | Fxtract | Ficom | Ficomp => return true,
-                m if format!("{m:?}").starts_with('F') => return false,
+                m if crate::cfg::is_x87(m) => return false,
                 Emms | Femms | Wait => return false,
                 _ if i.flow_control() != iced_x86::FlowControl::Next => return false,
                 _ => {}

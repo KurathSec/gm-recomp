@@ -69,9 +69,13 @@ pub struct Engine {
     pub tsc: u64,
     pub bad_functions: HashSet<u32>,
     /// Functions discovery found that nothing has called yet, for `translate_idle`
-    /// (popped from the end), and its estimate of the time one takes (µs).
-    pub idle_queue: Option<Vec<u32>>,
-    pub idle_us_per_fn: u64,
+    /// (popped from the end) with their sizes (bytes up to the next one), and its
+    /// estimate of the time a byte takes (ns).
+    pub idle_queue: Option<Vec<(u32, u32)>>,
+    pub idle_ns_per_byte: u64,
+    /// Functions translated code calls directly that are not translated yet: likely
+    /// next, so `translate_idle` takes them first (popped from the end).
+    pub idle_next: Vec<u32>,
     /// Functions translated ahead by `translate_idle`, and its calls.
     pub idle_done: usize,
     pub idle_calls: usize,
@@ -79,6 +83,8 @@ pub struct Engine {
     pub recent: VecDeque<[u32; 4]>,
     pub recent_cap: usize,
     pub dispatches: u64,
+    /// API calls so far (as the process's count, but readable while it is lent out).
+    pub api_calls: u64,
     /// `rt.resolve` calls that found a translated function (indirect and cross-module
     /// calls).
     pub resolves: u64,
@@ -98,10 +104,13 @@ pub struct Engine {
     pub no_inline: bool,
     /// Translated code counts events in `abi::COUNTERS` (debugging).
     pub count: bool,
+    pub count_blocks: bool,
     /// Host time spent running the other guest threads (while the current one waits).
     pub thread_us: u64,
     /// Host time spent translating ahead (`translate_idle`).
     pub idle_us: u64,
+    /// Callees considered for inlining, kept from one translation to the next.
+    pub inline_cache: Option<std::collections::HashMap<(u32, u8), Option<std::rc::Rc<recomp::cfg::Cfg>>>>,
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
     /// a session can be replayed (`harness run --replay`).
     pub monitor: bool,
@@ -125,7 +134,8 @@ impl Engine {
             tsc: 0,
             bad_functions: HashSet::default(),
             idle_queue: None,
-            idle_us_per_fn: 0,
+            idle_ns_per_byte: 0,
+            idle_next: Vec::new(),
             idle_done: 0,
             idle_calls: 0,
             recent: VecDeque::new(),
@@ -140,8 +150,11 @@ impl Engine {
             no_x87_inline: false,
             no_inline: false,
             count: false,
+            count_blocks: false,
             thread_us: 0,
             idle_us: 0,
+            api_calls: 0,
+            inline_cache: None,
             monitor: false,
         }
     }
@@ -418,6 +431,7 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
         let e = m.engine_ref();
         (e.trace, e.depth, e.max_api_calls)
     };
+    m.engine().api_calls += 1;
     let (func, nargs, pop, calls) = {
         let Some(p) = m.engine().p.as_mut() else { return stop(m, "process not available".into()) };
         p.api_calls += 1;
@@ -678,16 +692,18 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
     let mods = std::mem::take(&mut m.engine().mods);
     let mut failed = Vec::new();
     let mut errors = Vec::new();
+    let cache = m.engine().inline_cache.take().unwrap_or_default();
     let out = {
         let mem = CodeMem(&*m);
         let probes = m.engine_ref().probes.clone();
         let no_x87_inline = m.engine_ref().no_x87_inline;
         let count = m.engine_ref().count;
+        let count_blocks = m.engine_ref().count_blocks;
         let no_inline = m.engine_ref().no_inline;
         // calls to translated functions use their table index (watched ones report)
         let watch = m.engine_ref().watch.clone();
         let known = |a: u32| if watch.contains(&a) { None } else { funcs.get(&a).copied() };
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, no_inline });
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, count_blocks, no_inline }).with_cache(cache);
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = std::collections::HashMap::new();
@@ -732,8 +748,13 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
                 let _ = tr.add_function(a, &info);
             }
         }
-        tr.finish()
+        let cache = tr.take_cache();
+        let frontier: Vec<u32> = tr.entries().flat_map(|e| tr.direct_targets(e)).filter(|t| !funcs.contains_key(t)).collect();
+        (tr.finish(), cache, frontier)
     };
+    let (out, cache, frontier) = out;
+    m.engine().inline_cache = Some(cache);
+    m.engine().idle_next.extend(frontier);
     m.engine().funcs = funcs;
     m.engine().mods = mods;
     for e in errors {
@@ -793,49 +814,84 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
 /// sees no difference. Returns how many were translated.
 pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
     if m.engine_ref().idle_queue.is_none() {
-        let mut q: Vec<u32> = m.engine_ref().mods.iter().flat_map(|md| md.functions.iter().copied()).collect();
-        q.sort_unstable_by(|a, b| b.cmp(a));
+        // (address, bytes up to the next function or the module's end)
+        let mut q: Vec<(u32, u32)> = Vec::new();
+        for md in &m.engine_ref().mods {
+            for (k, &a) in md.sorted.iter().enumerate() {
+                let end = md.sorted.get(k + 1).copied().unwrap_or(md.base + md.size);
+                q.push((a, end.saturating_sub(a).clamp(1, 0x10000)));
+            }
+        }
+        q.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         let e = m.engine();
         e.idle_queue = Some(q);
-        if e.idle_us_per_fn == 0 {
-            e.idle_us_per_fn = 200;
+        if e.idle_ns_per_byte == 0 {
+            e.idle_ns_per_byte = 1000;
         }
     }
     let mut done = 0;
     loop {
-        let now = m.now_us();
-        // what fits in the time left by the running estimate, in small batches (a
-        // function can take far more than the average)
-        // (modules of at least 8: browsers bound how many there are)
-        let per = m.engine_ref().idle_us_per_fn.max(20);
-        let n = (deadline_us.saturating_sub(now) / per).min(32) as usize;
-        if n < 8 {
-            break;
-        }
-        let batch: Vec<u32> = {
+        // what fits in the time left by the running estimate (half again: a slow
+        // compile can exceed it), in modules of 4 to 16 functions (browsers bound how
+        // many modules there are); a function too large for the time a wait leaves is
+        // left to be translated when it runs
+        let budget_ns = deadline_us.saturating_sub(m.now_us()) * 1000;
+        let per = m.engine_ref().idle_ns_per_byte.max(1) * 3 / 2;
+        let (batch, bytes) = {
             let e = m.engine();
             let q = e.idle_queue.as_mut().expect("queue built above");
-            let mut b = Vec::with_capacity(n);
-            while b.len() < n {
-                match q.pop() {
-                    Some(a) if !e.funcs.contains_key(&a) && !e.bad_functions.contains(&a) => b.push(a),
-                    Some(_) => {}
-                    None => break,
+            let (mut b, mut bytes) = (Vec::new(), 0u64);
+            // the call graph's frontier first, sized like the queue's entries
+            while let Some(a) = e.idle_next.pop() {
+                if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || b.iter().any(|&(x, _)| x == a) {
+                    continue;
                 }
+                let Some(md) = e.mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
+                let k = md.sorted.partition_point(|&f| f <= a);
+                let size = md.sorted.get(k).copied().unwrap_or(md.base + md.size).saturating_sub(a).clamp(1, 0x10000);
+                if (bytes + size as u64) * per > budget_ns || b.len() >= 16 {
+                    e.idle_next.push(a);
+                    break;
+                }
+                b.push((a, size));
+                bytes += size as u64;
             }
-            b
+            while b.len() < 16 {
+                let Some(&(a, size)) = q.last() else { break };
+                if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) {
+                    q.pop();
+                    continue;
+                }
+                if size as u64 * per > budget_ns.max(4_000_000) {
+                    q.pop(); // too large to translate ahead
+                    continue;
+                }
+                if (bytes + size as u64) * per > budget_ns {
+                    break;
+                }
+                q.pop();
+                b.push((a, size));
+                bytes += size as u64;
+            }
+            (b, bytes)
         };
-        if batch.is_empty() {
+        let last = m.engine_ref().idle_queue.as_ref().is_some_and(|q| q.is_empty());
+        if batch.is_empty() || batch.len() < 4 && !last {
+            // too few for a module: back on the queue for a longer wait
+            let q = m.engine().idle_queue.as_mut().unwrap();
+            q.extend(batch.into_iter().rev());
             break;
         }
+        let batch: Vec<u32> = batch.into_iter().map(|(a, _)| a).collect();
         // Failures are not recorded: a function can fail now and translate when it
         // runs (code a packer has not unpacked yet).
         let t = m.now_us();
         let _ = translate_batch(m, &batch, batch.len());
-        // keep the estimate current (it includes the host's compile and instantiate)
-        let took = (m.now_us() - t) / batch.len() as u64;
+        // keep the estimate current (it includes the host's compile and instantiate):
+        // up halfway (one slow compile should not stop it for good), down slowly
+        let took = (m.now_us() - t) * 1000 / bytes.max(1);
         let e = m.engine();
-        e.idle_us_per_fn = (e.idle_us_per_fn * 3 + took) / 4;
+        e.idle_ns_per_byte = if took > e.idle_ns_per_byte { (e.idle_ns_per_byte + took) / 2 } else { (e.idle_ns_per_byte * 7 + took) / 8 };
         done += batch.len();
     }
     let e = m.engine();
