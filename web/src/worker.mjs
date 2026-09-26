@@ -22,7 +22,8 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'clock', ahead = true, script = [], persist = true, monitor = false, replay = null } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing } = data;
+  if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
     const base = `/games/${encodeURIComponent(game)}/`;
@@ -84,10 +85,15 @@ self.onmessage = async ({ data }) => {
     const audioRing = { sab: new SharedArrayBuffer(8 + ringFrames * 8), frames: ringFrames };
     self.postMessage({ type: 'audio', sab: audioRing.sab, frames: ringFrames, rate: 48000 });
     const onStats = (stats) => self.postMessage({ type: 'stats', ...stats });
-    const onSlow = monitor ? (frame, busy, interval, clockMs) => self.postMessage({ type: 'monitor', line: `slow ${frame} guest ${busy.toFixed(1)} interval ${interval.toFixed(1)} clock ${clockMs.toFixed(0)}` }) : undefined;
+    const onSlow = monitor
+      ? (frame, busy, interval, clockMs, d) => {
+          const f = (v) => v.toFixed(1);
+          self.postMessage({ type: 'monitor', line: `slow ${frame} guest ${f(busy)} interval ${f(interval)} clock ${clockMs.toFixed(0)} waits ${d.waits} waited ${f(d.waited)} late ${f(d.late)} threads ${f(d.threads)} ahead ${f(d.ahead)} translate ${f(d.translate)}` });
+        }
+      : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log
     const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing });
     await saving;
     self.postMessage({ type: 'done', status });
   } catch (e) {

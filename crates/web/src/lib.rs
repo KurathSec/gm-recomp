@@ -57,6 +57,9 @@ unsafe extern "C" {
     fn fs_persist(data: *const u8, len: usize);
     /// Starts fetching the MIDI SoundFont; it arrives through `soundfont_add`.
     fn soundfont_request();
+    /// Hands over the key events the page wrote to the shared input ring since the
+    /// last call (through `input_key`).
+    fn input_drain();
 }
 
 /// Hands the game's file changes to the page (web/src/host.mjs `onSave`): per entry
@@ -312,7 +315,7 @@ impl Machine for Web {
         let slack = unsafe { gpu_slack(ms) };
         if slack > 0.8 {
             let deadline = self.now_us() + ((slack - 0.3) * 1000.0) as u64;
-            runtime::engine::translate_idle(self, deadline);
+            runtime::engine::translate_idle_timed(self, deadline);
         }
         unsafe { gpu_pace(ms) }
     }
@@ -328,6 +331,7 @@ impl Machine for Web {
 
 impl Web {
     fn take_input() -> Vec<runtime::InputEvent> {
+        unsafe { input_drain() };
         std::mem::take(&mut state().input)
     }
 }
@@ -631,6 +635,17 @@ pub extern "C" fn run() -> i32 {
         log(&l);
     }
     if r.is_ok() { 0 } else { 1 }
+}
+
+/// Host time the runtime spent so far (µs) on: 0 the other guest threads, 1
+/// translating ahead, 2 translating in all (live statistics for the page).
+#[unsafe(no_mangle)]
+pub extern "C" fn stat_us(which: u32) -> f64 {
+    state().engine.as_ref().map_or(0.0, |e| match which {
+        0 => e.thread_us,
+        1 => e.idle_us,
+        _ => e.translate_us,
+    } as f64)
 }
 
 /// Queues an input event of a recorded session (`kind` 0 key: a = vk, b = scan,

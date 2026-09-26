@@ -33,7 +33,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
  *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -56,6 +56,18 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // Live statistics (onStats): this window's samples.
   const epochNow = () => performance.timeOrigin + performance.now();
   let pendingInputs = [];
+  // this frame's waits (count, ms waited, latest wake) and the runtime's counters at its start
+  let waits = { n: 0, ms: 0, late: 0 };
+  let marks = [0, 0, 0];
+  const frameDetail = () => {
+    const now = [0, 1, 2].map((k) => rt.exports.stat_us(k) / 1000);
+    const d = { waits: waits.n, waited: waits.ms, late: waits.late, threads: now[0] - marks[0], ahead: now[1] - marks[1], translate: now[2] - marks[2] };
+    return d;
+  };
+  const frameReset = () => {
+    waits = { n: 0, ms: 0, late: 0 };
+    if (onSlow) marks = [0, 1, 2].map((k) => rt.exports.stat_us(k) / 1000);
+  };
   let win = { start: performance.now(), frames: 0, intervals: [], busy: [], late: 0, inputs: [], wake: [] };
   let lastPresentReal = 0;
   let lastClockMs = 0;
@@ -68,8 +80,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       const target = clockMs - lastClockMs;
       if (target > 0 && interval > target * 1.5) win.late++;
       // monitor: frames that took long or reached the screen late (the frame number
-      // is the one being presented)
-      if (onSlow && ((busy ?? 0) > 12 || (target > 0 && interval > target + 4))) onSlow(gpu.frames + 1, busy ?? 0, interval, clockMs);
+      // is the one being presented), with where the time went
+      if (onSlow && ((busy ?? 0) > 12 || (target > 0 && interval > target + (self.slowMs ?? 4)))) onSlow(gpu.frames + 1, busy ?? 0, interval, clockMs, frameDetail());
     }
     lastPresentReal = t;
     lastClockMs = clockMs;
@@ -115,6 +127,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   };
   const show = (clockMs, x, y, w, h, dw, dh, busy) => {
     collect(performance.now(), clockMs, busy);
+    frameReset();
     const resized = canvas.width !== dw || canvas.height !== dh;
     gpu.present(x, y, w, h, dw, dh);
     if (resized && onResize) onResize(dw, dh);
@@ -177,7 +190,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     const wake = async (t) => {
       const before = performance.now();
       await sleepUntil(t);
-      if (onStats && t > before) win.wake.push(performance.now() - t);
+      const after = performance.now();
+      if (onStats && t > before) win.wake.push(after - t);
+      waits.n++;
+      waits.ms += after - before;
+      waits.late = Math.max(waits.late, after - t);
     };
     const guestTime = () => {
       const busy = resumed ? performance.now() - resumed : undefined;
@@ -188,7 +205,40 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       }
       return busy;
     };
-    if (pace && pacing === 'clock') {
+    if (pace && pacing === 'sync' && never) {
+      // Waits block the worker (Atomics.wait ends on time; an event-loop timer can
+      // be late by several ms); each frame then yields once so the canvas shows it
+      // and messages arrive.
+      if (ahead) gpuImports.gpu_slack = (clockMs) => due(clockMs) - performance.now();
+      gpuImports.gpu_pace = (clockMs) => {
+        const at = due(clockMs);
+        const before = performance.now();
+        if (at - before < 1) return;
+        Atomics.wait(never, 0, 0, at - before);
+        const after = performance.now();
+        if (onStats) win.wake.push(after - at);
+        waits.n++;
+        waits.ms += after - before;
+        waits.late = Math.max(waits.late, after - at);
+        resumed = after;
+      };
+      const channel = new MessageChannel();
+      let wakeUp = null;
+      channel.port1.onmessage = () => wakeUp?.();
+      gpuImports.gpu_present = new WebAssembly.Suspending((clockMs, x, y, w, h, dw, dh) => {
+        const frame = show(clockMs, x, y, w, h, dw, dh, guestTime());
+        const r = onFrame ? onFrame(frame, gpu) : undefined;
+        return Promise.resolve(r).then(
+          () =>
+            new Promise((res) => {
+              wakeUp = res;
+              channel.port2.postMessage(0);
+            }),
+        ).then(() => {
+          resumed = performance.now();
+        });
+      });
+    } else if (pace && pacing === 'clock') {
       if (ahead) gpuImports.gpu_slack = (clockMs) => due(clockMs) - performance.now();
       gpuImports.gpu_pace = new WebAssembly.Suspending((clockMs) => {
         const at = due(clockMs);
@@ -221,7 +271,21 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     }
   }
 
+  // Key events the page writes to a shared ring as they happen (see index.html):
+  // read at the guest's every message poll, also while the worker blocks in a wait.
+  const keyRing = inputRing && { idx: new Int32Array(inputRing, 0, 2), ev: new Int32Array(inputRing, 8, 256 * 3), when: new Float64Array(inputRing, 8 + 256 * 12, 256) };
   const host = {
+    input_drain() {
+      if (!keyRing) return;
+      const w = Atomics.load(keyRing.idx, 0);
+      for (let r = Atomics.load(keyRing.idx, 1); r !== w; r = (r + 1) | 0) {
+        const k = (r & 255) * 3;
+        const down = keyRing.ev[k + 2];
+        if (down) pendingInputs.push(keyRing.when[r & 255]);
+        rt.exports.input_key(keyRing.ev[k], keyRing.ev[k + 1], down);
+      }
+      Atomics.store(keyRing.idx, 1, w);
+    },
     print(ptr, len) {
       print(dec.decode(mem().subarray(ptr, ptr + len)));
     },

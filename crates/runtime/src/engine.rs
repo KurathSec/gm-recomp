@@ -100,6 +100,8 @@ pub struct Engine {
     pub count: bool,
     /// Host time spent running the other guest threads (while the current one waits).
     pub thread_us: u64,
+    /// Host time spent translating ahead (`translate_idle`).
+    pub idle_us: u64,
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
     /// a session can be replayed (`harness run --replay`).
     pub monitor: bool,
@@ -139,6 +141,7 @@ impl Engine {
             no_inline: false,
             count: false,
             thread_us: 0,
+            idle_us: 0,
             monitor: false,
         }
     }
@@ -839,6 +842,15 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
     e.idle_calls += 1;
     e.idle_done += done;
     done
+}
+
+/// `translate_idle`, with its host time counted (`Engine::idle_us`).
+pub fn translate_idle_timed<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
+    let t = m.now_us();
+    let n = translate_idle(m, deadline_us);
+    let dt = m.now_us() - t;
+    m.engine().idle_us += dt;
+    n
 }
 
 /// Translates every function discovery found in the loaded modules.

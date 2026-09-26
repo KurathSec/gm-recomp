@@ -109,9 +109,11 @@
 
     <script type="module">
       import { deleteSaves, exportSaves, loadSaves, openSaves, parseSaves, storeSaves } from './src/saves.mjs';
+      import { KEYS } from './src/keys.mjs';
 
       // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
-      // &stats (overlay) &pacing=jit|asap (other frame pacing; the default follows the guest's clock)
+      // &stats (overlay) &pacing=clock|jit|asap (other frame pacing; the default follows the
+      // guest's clock with blocking waits)
       // &nopace=1 &script=100:Enter:1,105:Enter:0 (or f:mouse:x:y:b) &audio=1 &nosave=1
       // &monitor: the dev server records the session (start, saves, input as the guest
       // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
@@ -371,7 +373,7 @@
         };
         statusEl.textContent = 'Downloading…';
         const offscreen = screen.transferControlToOffscreen();
-        const pacing = ['asap', 'jit'].includes(q.get('pacing')) ? q.get('pacing') : 'clock';
+        const pacing = ['asap', 'jit', 'clock'].includes(q.get('pacing')) ? q.get('pacing') : 'sync';
         const ahead = !q.has('noahead');
         // a recorded session to replay: its date, saves and input
         let replay = null;
@@ -389,7 +391,26 @@
           }
         }
         monitorSend(`start game=${game} epoch=${runEpoch} ua=${navigator.userAgent.replaceAll(' ', '_')}`);
-        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay }, [offscreen]);
+        const slowMs = q.has('slow') ? Number(q.get('slow')) : undefined;
+        // Keys go to the worker through a shared ring (written here as they happen, read
+        // at the guest's message polls): [write, read], then 256 × [vk, scan, down] and
+        // 256 event times.
+        const inputRing = new SharedArrayBuffer(8 + 256 * 12 + 256 * 8);
+        const ringIdx = new Int32Array(inputRing, 0, 2);
+        const ringEv = new Int32Array(inputRing, 8, 256 * 3);
+        const ringWhen = new Float64Array(inputRing, 8 + 256 * 12, 256);
+        const sendKey = (code, down, numlock, when) => {
+          const k = KEYS[code];
+          if (!k) return;
+          const wr = Atomics.load(ringIdx, 0);
+          if (((wr - Atomics.load(ringIdx, 1)) | 0) >= 256) return; // the guest is not reading
+          const i = wr & 255;
+          // the NumLock state decides what the keypad sends (see the runtime's numpad_key)
+          ringEv.set([k[0], k[1] | (numlock ? 0x200 : 0), down ? 1 : 0], i * 3);
+          ringWhen[i] = when ?? performance.timeOrigin + performance.now();
+          Atomics.store(ringIdx, 0, (wr + 1) | 0);
+        };
+        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.
@@ -400,13 +421,13 @@
             if (gameKeys.test(e.code) && !e.metaKey && e.code !== 'F11') e.preventDefault();
             if (e.repeat) return;
             const numlock = e.getModifierState ? e.getModifierState('NumLock') : true;
-            w.postMessage({ type: 'key', code: e.code, down: type === 'keydown', numlock, t: performance.timeOrigin + e.timeStamp });
+            sendKey(e.code, type === 'keydown', numlock, performance.timeOrigin + e.timeStamp);
           });
         }
         window.addEventListener('blur', () => {
           // Releasing everything avoids keys stuck down after switching away.
           for (const code of ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space', 'KeyZ', 'KeyX', 'KeyR', 'KeyS'])
-            w.postMessage({ type: 'key', code, down: false });
+            sendKey(code, false, true);
         });
         const mouse = (e) => {
           const r = screen.getBoundingClientRect();
@@ -442,6 +463,11 @@
         };
         requestAnimationFrame(pollPads);
         screen.addEventListener('contextmenu', (e) => e.preventDefault());
+        // &keytest=ms:code:1|0,...: real key events at those times (tests of the input path)
+        for (const k of (q.get('keytest') ?? '').split(',').filter(Boolean)) {
+          const [ms, code, down] = k.split(':');
+          setTimeout(() => window.dispatchEvent(new KeyboardEvent(down === '1' ? 'keydown' : 'keyup', { code, bubbles: true })), Number(ms));
+        }
       }
     </script>
   </body>
