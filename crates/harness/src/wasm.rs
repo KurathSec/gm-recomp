@@ -97,7 +97,7 @@ impl Runner {
         let tables = HashMap::new();
         let entries_owned: Vec<u32> = entries.to_vec();
         let is_fn = move |a: u32| entries_owned.contains(&a);
-        let info = FuncInfo { jump_tables: &tables, is_function: &is_fn };
+        let info = FuncInfo { jump_tables: &tables, is_function: &is_fn, translated: &|_| None };
         tr.add_function(CODE_BASE, &info).map_err(|e| anyhow!("{e}"))?;
         for &e in entries {
             tr.add_function(e, &info).map_err(|e| anyhow!("{e}"))?;

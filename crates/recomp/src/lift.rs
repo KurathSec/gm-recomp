@@ -834,6 +834,19 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// Calls the guest function at a static address.
+    /// Leaves the table index of the function at `target` (not in this module) in
+    /// L_R0: known when it was translated before this one, else looked up.
+    fn static_index(&mut self, target: u32) {
+        match self.cfg.known.get(&target) {
+            Some(&i) => self.c(i),
+            None => {
+                self.c(target);
+                self.resolve();
+            }
+        }
+        self.set(L_R0);
+    }
+
     fn call_static(&mut self, target: u32) {
         self.count(crate::abi::COUNT_CALLS);
         // the callee reads flags at entry: they go over in the globals
@@ -846,9 +859,7 @@ impl<'a> FuncEmit<'a> {
             self.i(W::Call(idx));
         } else {
             // resolved before the arguments are taken: an API run there changes them
-            self.c(target);
-            self.resolve();
-            self.set(L_R0);
+            self.static_index(target);
             self.push_regs();
             self.get(L_R0);
             self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
@@ -946,9 +957,7 @@ impl<'a> FuncEmit<'a> {
             self.push_regs();
             self.i(W::ReturnCall(idx));
         } else {
-            self.c(target);
-            self.resolve();
-            self.set(L_R0);
+            self.static_index(target);
             self.push_regs();
             self.get(L_R0);
             self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
@@ -1148,9 +1157,7 @@ impl<'a> FuncEmit<'a> {
                     self.push_regs();
                     self.i(W::Call(idx));
                 } else {
-                    self.c(*target);
-                    self.resolve();
-                    self.set(L_R0);
+                    self.static_index(*target);
                     self.push_regs();
                     self.get(L_R0);
                     self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });

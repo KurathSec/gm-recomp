@@ -15,6 +15,9 @@ pub struct FuncInfo<'a> {
     pub jump_tables: &'a HashMap<u32, Vec<u32>>,
     /// Addresses known to start functions; direct jumps there are tail calls.
     pub is_function: &'a dyn Fn(u32) -> bool,
+    /// The function table index of a function translated already: calls to it need
+    /// not look it up.
+    pub translated: &'a dyn Fn(u32) -> Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +95,8 @@ pub struct Cfg {
     /// Direct call target -> the flags its entry reads before writing them (callers
     /// hand those over: the CRT's x87 wrappers test flags a previous call returned).
     pub call_flags: HashMap<u32, u8>,
+    /// Direct call and jump targets translated already -> their table index.
+    pub known: HashMap<u32, u32>,
 }
 
 const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
@@ -129,6 +134,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
     let mut fop: HashMap<u32, u16> = HashMap::new();
     let mut ret_targets = Vec::new();
     let mut call_flags = HashMap::new();
+    let mut known = HashMap::new();
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
@@ -247,6 +253,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                             Term::Cond { taken, next: n } => Term::Cond { taken: key(taken), next: key(n) },
                             Term::TailCall(t) => {
                                 call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t));
+                                if let Some(i) = (info.translated)(t) {
+                                    known.insert(t, i);
+                                }
                                 Term::InlineTail { target: t, ret_to: next, ret_key: next }
                             }
                             Term::InlineCall { entry: e } => Term::InlineCall { entry: key(e) },
@@ -258,6 +267,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                     }
                     fop.extend(callee.fop);
                     call_flags.extend(callee.call_flags);
+                    known.extend(callee.known);
                     queue.push_back(next);
                     term = Term::InlineCall { entry: key(target) };
                 }
@@ -265,6 +275,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                     if instr.flow_control() == FlowControl::Call && instr.op0_kind() == OpKind::NearBranch32 {
                         let t = instr.near_branch_target() as u32;
                         call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t));
+                        if let Some(i) = (info.translated)(t) {
+                            known.insert(t, i);
+                        }
                     }
                     ip = next;
                     continue;
@@ -279,6 +292,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
                     // unpacks there) goes through the dispatcher, so the target is
                     // translated when it runs, not from the bytes it has now.
                     term = if target != entry && ((info.is_function)(target) || zero_filled(mem, target)) { Term::TailCall(target) } else { Term::Jump(target) };
+                    if let (Term::TailCall(t), Some(i)) = (&term, (info.translated)(target)) {
+                        known.insert(*t, i);
+                    }
                 }
                 FlowControl::IndirectBranch => {
                     term = match info.jump_tables.get(&(instr.ip() as u32)) {
@@ -298,7 +314,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8) -> Res
         queue.extend(block.successors());
         blocks.insert(start, block);
     }
-    Ok(Cfg { entry, blocks, fop, ret_targets, call_flags })
+    Ok(Cfg { entry, blocks, fop, ret_targets, call_flags, known })
 }
 
 /// The flags the code at `entry` reads before writing them, following its first
