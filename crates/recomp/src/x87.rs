@@ -370,6 +370,11 @@ const XC: u32 = 6;
 const Q: u32 = 7; // i64
 const X: u32 = 8; // f64
 const Y: u32 = 9;
+const R: u32 = 10;
+
+/// Set in `ip` when the instruction's C1 is overwritten before anything reads the
+/// status word (the next x87 instruction in its block writes it).
+pub const IP_C1_DEAD: u32 = 0x8000_0000;
 
 /// Builds one function body.
 struct B(Function);
@@ -379,7 +384,14 @@ impl B {
         B(Function::new(locals))
     }
     fn form() -> Self {
-        B::new(vec![(5, ValType::I32), (1, ValType::I64), (2, ValType::F64)])
+        B::new(vec![(5, ValType::I32), (1, ValType::I64), (3, ValType::F64)])
+    }
+    /// The quick lane applies: C1 dead here, PE set already (sticky: an inexact result
+    /// changes nothing), rounding to nearest (what f64 and f32 do).
+    fn quick(&mut self) -> &mut Self {
+        self.g(IP).c(31).i(W::I32ShrU);
+        self.g(F).i(W::I32Load16U(ma(fb::SW))).c(SW_PE_SHIFT).i(W::I32ShrU).i(W::I32And);
+        self.g(F).i(W::I32Load16U(ma(fb::CW))).c(0xC00).i(W::I32And).i(W::I32Eqz).i(W::I32And)
     }
     fn i(&mut self, ins: W) -> &mut Self {
         self.0.instruction(&ins);
@@ -558,7 +570,7 @@ impl B {
         self.rc_at(F, into)
     }
     fn set_fip(&mut self) -> &mut Self {
-        self.g(F).g(IP).i(W::I32Store(ma(fb::FIP)))
+        self.g(F).g(IP).c(!IP_C1_DEAD).i(W::I32And).i(W::I32Store(ma(fb::FIP)))
     }
     /// XB = (y != x), XC = XB && |y| > |x|: inexact, and rounded up in magnitude.
     fn inexact_flags(&mut self, x: u32, y: u32) -> &mut Self {
@@ -677,6 +689,10 @@ fn form_body(form: Form) -> Function {
                     b.abs_cmp(X, F32_MAX, W::F64Gt).abs_cmp(X, INF, W::F64Ne).i(W::I32And).fail_if();
                     // near or below the single-precision underflow threshold
                     b.abs_cmp(X, F32_TINY, W::F64Lt).g(X).k(0.0).i(W::F64Ne).i(W::I32And).fail_if();
+                    // quick: rounded to nearest as wasm does; PE stays set, C1 is dead
+                    b.quick().i(W::If(BlockType::Empty));
+                    b.g(A).g(X).i(W::F32DemoteF64).i(W::F32Store(ma(0)));
+                    b.i(W::Else);
                     b.g(X).i(W::F32DemoteF64).i(W::F64PromoteF32).s(Y);
                     // directed rounding: one step toward X when Y lies on the wrong side
                     // (chop: beyond it in magnitude, up: below it, down: above it)
@@ -691,6 +707,7 @@ fn form_body(form: Form) -> Function {
                     b.inexact_flags(X, Y);
                     b.g(A).g(Y).i(W::F32DemoteF64).i(W::F32Store(ma(0)));
                     b.sw_inexact();
+                    b.i(W::End);
                 }
                 _ => {
                     // Float80: the double's image, or the register's own image
@@ -781,6 +798,27 @@ fn form_body(form: Form) -> Function {
             }
             b.load_st(PA, X);
             let (x, y) = if reversed { (Y, X) } else { (X, Y) };
+            // quick (precision 53 bits): the f64 result when it is a normal number (or an
+            // exact zero sum), with PE set already and C1 dead
+            b.g(F).i(W::I32Load(ma(fb::FAST))).c(fb::FAST_ARITH).i(W::I32And).c(0).i(W::I32Ne).quick().i(W::I32And).i(W::If(BlockType::Empty));
+            b.g(x).g(y).i(match op {
+                Op::Add => W::F64Add,
+                Op::Sub => W::F64Sub,
+                Op::Mul => W::F64Mul,
+                Op::Div => W::F64Div,
+            });
+            b.s(R);
+            b.abs_cmp(R, MIN_NORMAL, W::F64Ge).abs_cmp(R, INF, W::F64Lt).i(W::I32And);
+            if matches!(op, Op::Add | Op::Sub) {
+                b.g(R).k(0.0).i(W::F64Eq).i(W::I32Or);
+            }
+            b.i(W::If(BlockType::Empty));
+            b.store_st(PA, R);
+            if pop {
+                b.pop_st();
+            }
+            b.set_fip().c(0).i(W::Return);
+            b.i(W::End).i(W::End);
             b.g(x).g(y);
             if op == Op::Sub {
                 b.i(W::F64Neg);

@@ -2307,7 +2307,7 @@ impl<'a> FuncEmit<'a> {
                     crate::x87::Arg::St(i) => self.c(i),
                     crate::x87::Arg::None => self.c(0),
                 }
-                self.c(self.ip);
+                self.c(self.ip | if self.c1_dead() { crate::x87::IP_C1_DEAD } else { 0 });
                 self.i(W::Call(abi::RT_FUNCS.len() as u32 + k));
                 self.tee(L_T1);
                 self.get(L_T1);
@@ -2336,6 +2336,29 @@ impl<'a> FuncEmit<'a> {
         } else {
             self.i(W::Drop);
         }
+    }
+
+    /// Whether the C1 this x87 instruction leaves is overwritten before anything can
+    /// read the status word: a later x87 instruction in the block that writes C1 comes
+    /// first (non-x87 instructions in between leave the x87 state alone).
+    fn c1_dead(&self) -> bool {
+        use Mnemonic::*;
+        let block = &self.cfg.blocks[&self.order[self.cur_block]];
+        let Some(k) = block.instrs.iter().position(|i| i.ip() as u32 == self.ip) else { return false };
+        for i in &block.instrs[k + 1..] {
+            match i.mnemonic() {
+                Fld | Fild | Fst | Fstp | Fist | Fistp | Fisttp | Fadd | Faddp | Fiadd | Fsub | Fsubp | Fisub | Fsubr | Fsubrp | Fisubr
+                | Fmul | Fmulp | Fimul | Fdiv | Fdivp | Fidiv | Fdivr | Fdivrp | Fidivr | Fxch | Fchs | Fabs | Fcom | Fcomp | Fcompp
+                | Fucom | Fucomp | Fucompp | Fcomi | Fcomip | Fucomi | Fucomip | Ftst | Fxam | Fld1 | Fldz | Fldpi | Fldl2e | Fldl2t
+                | Fldlg2 | Fldln2 | Frndint | Fsqrt | Fsin | Fcos | Fsincos | Fptan | Fpatan | Fscale | Fprem | Fprem1 | Fyl2x | Fyl2xp1
+                | F2xm1 | Fxtract | Ficom | Ficomp => return true,
+                m if format!("{m:?}").starts_with('F') => return false,
+                Emms | Femms | Wait => return false,
+                _ if i.flow_control() != iced_x86::FlowControl::Next => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// `rt.fpu` for one instruction; leaves its i32 result on the stack.
