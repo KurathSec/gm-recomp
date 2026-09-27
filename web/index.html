@@ -34,14 +34,16 @@
       #library h1 { margin: 0; font: 600 26px/1.2 ui-monospace, monospace; letter-spacing: -0.02em; }
       #library h1 span { color: var(--accent); }
       #library .lede { margin: 6px 0 28px; color: var(--muted); }
-      #games { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-      #games a {
+      #games, #localgames { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+      #games a, #localgames a {
         display: flex; flex-direction: column; gap: 10px; height: 100%; padding: 16px; text-decoration: none;
         background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
       }
-      #games a:hover { border-color: var(--accent); }
-      #games .title { font-weight: 600; font-size: 16px; }
-      #games .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+      #games a:hover, #localgames a:hover { border-color: var(--accent); }
+      #games .title, #localgames .title { font-weight: 600; font-size: 16px; }
+      #games .meta, #localgames .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; align-items: center; }
+      #library .import { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0 0 16px; }
+      #importstatus { color: var(--muted); font-size: 13px; }
       .badge { font: 12px/1 ui-monospace, monospace; padding: 4px 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); }
       .badge.saved { color: var(--accent); border-color: currentColor; }
       #games li.unsupported a { opacity: 0.55; }
@@ -82,8 +84,13 @@
     <main id="library" hidden>
       <h1>gm<span>recomp</span></h1>
       <p class="lede">GameMaker games, recompiled from their original executables to run in the browser.</p>
+      <p class="import">
+        <label class="button" title="A zip or 7z of the game as it was released (an IExpress package inside is unwrapped)">Import a game…<input id="importgame" type="file" accept=".zip,.7z,application/zip,application/x-7z-compressed" hidden /></label>
+        <span id="importstatus"></span>
+      </p>
+      <ul id="localgames"></ul>
       <ul id="games"></ul>
-      <p id="empty" hidden>No games yet. Import some with <code>importer import … --out web/public/games</code>.</p>
+      <p id="empty" hidden>No games yet. Import one above, or with <code>importer import … --out web/public/games</code>.</p>
     </main>
 
     <div id="player" hidden>
@@ -108,7 +115,7 @@
     </div>
 
     <script type="module">
-      import { deleteSaves, exportSaves, loadSaves, openSaves, parseSaves, storeSaves } from './src/saves.mjs';
+      import { deleteGame, deleteSaves, exportSaves, listGames, loadGame, loadSaves, openSaves, parseSaves, storeGame, storeSaves } from './src/saves.mjs';
       import { KEYS } from './src/keys.mjs';
 
       // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
@@ -119,6 +126,8 @@
       // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
       // &replay=<session>: plays a recorded session again (its date, saves and input)
       // &noprofile: no translation profile (functions earlier sessions needed, translated ahead)
+      // ?zip=<url>: imports the game in that archive (zip or 7z) into this browser and plays it;
+      // &local plays a game imported in this browser
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
 
@@ -134,8 +143,41 @@
         return e.kind;
       }
 
-      if (game) play(game);
+      const local = q.has('local');
+      if (q.get('zip')) importFrom(q.get('zip'));
+      else if (game) play(game);
       else library();
+
+      /** Imports an archive (bytes) into this browser; returns the game's slug. */
+      async function importGame(bytes, name, progress) {
+        const { importArchive } = await import('./src/import.mjs');
+        const { manifest, files } = await importArchive(bytes, name, progress);
+        if (!runnable(manifest.engine)) throw new Error(`${manifest.title}: ${engineLabel(manifest.engine)} games are not supported`);
+        progress(`storing ${manifest.title}`);
+        await storeGame(await openSaves(), manifest.slug, { manifest, files });
+        return manifest.slug;
+      }
+
+      async function importFrom(url) {
+        document.getElementById('player').hidden = false;
+        const status = document.getElementById('status');
+        try {
+          status.textContent = `Downloading ${url}…`;
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const bytes = new Uint8Array(await r.arrayBuffer());
+          const name = decodeURIComponent(new URL(url, location.href).pathname.split('/').pop() || 'game.zip');
+          const slug = await importGame(bytes, name, (t) => (status.textContent = t));
+          // (the other options stay)
+          const next = new URLSearchParams(q);
+          next.delete('zip');
+          next.set('game', slug);
+          next.set('local', '');
+          location.replace(`?${next}`);
+        } catch (e) {
+          status.textContent = `Import failed: ${e.message ?? e}`;
+        }
+      }
 
       async function library() {
         document.getElementById('library').hidden = false;
@@ -171,6 +213,51 @@
           list.append(li);
           badges.set(g.slug, badge);
         }
+        // Games imported in this browser, and importing more.
+        const importStatus = document.getElementById('importstatus');
+        document.getElementById('importgame').addEventListener('change', async (ev) => {
+          const file = ev.target.files[0];
+          if (!file) return;
+          try {
+            const slug = await importGame(new Uint8Array(await file.arrayBuffer()), file.name, (t) => (importStatus.textContent = t));
+            location.href = `?game=${encodeURIComponent(slug)}&local`;
+          } catch (e) {
+            importStatus.textContent = `Import failed: ${e.message ?? e}`;
+          }
+        });
+        try {
+          const db = await openSaves();
+          const localList = document.getElementById('localgames');
+          for (const m of await listGames(db)) {
+            const li = document.createElement('li');
+            const a = document.createElement('a');
+            a.href = `?game=${encodeURIComponent(m.slug)}&local`;
+            const t = document.createElement('span');
+            t.className = 'title';
+            t.textContent = m.title || m.slug;
+            const meta = document.createElement('span');
+            meta.className = 'meta';
+            for (const text of [engineLabel(m.engine), 'imported here']) {
+              const b = document.createElement('span');
+              b.className = 'badge';
+              b.textContent = text;
+              meta.append(b);
+            }
+            const del = document.createElement('button');
+            del.textContent = 'Remove';
+            del.title = 'Remove this imported game (its saves stay)';
+            del.addEventListener('click', async (e) => {
+              e.preventDefault();
+              await deleteGame(db, m.slug);
+              li.remove();
+            });
+            meta.append(del);
+            a.append(t, meta);
+            li.append(a);
+            localList.append(li);
+          }
+          if (localList.children.length) document.getElementById('empty').hidden = true;
+        } catch {}
         // Mark the games that have saves (after the list is up).
         try {
           const db = await openSaves();
@@ -218,8 +305,7 @@
         }
 
         let title = game;
-        fetch(`games/${encodeURIComponent(game)}/manifest.json`)
-          .then((r) => r.json())
+        (local ? openSaves().then((db) => loadGame(db, game)).then((g) => g.manifest) : fetch(`games/${encodeURIComponent(game)}/manifest.json`).then((r) => r.json()))
           .then((m) => {
             title = m.title || game;
             document.getElementById('name').textContent = title;
@@ -411,7 +497,7 @@
           ringWhen[i] = when ?? performance.timeOrigin + performance.now();
           Atomics.store(ringIdx, 0, (wr + 1) | 0);
         };
-        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing, useProfile: !q.has('noprofile') }, [offscreen]);
+        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing, useProfile: !q.has('noprofile'), local }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.

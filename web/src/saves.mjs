@@ -5,9 +5,9 @@
 
 export function openSaves() {
   return new Promise((resolve, reject) => {
-    const r = indexedDB.open('gmrecomp', 2);
+    const r = indexedDB.open('gmrecomp', 3);
     r.onupgradeneeded = () => {
-      for (const name of ['saves', 'profiles']) if (!r.result.objectStoreNames.contains(name)) r.result.createObjectStore(name);
+      for (const name of ['saves', 'profiles', 'games']) if (!r.result.objectStoreNames.contains(name)) r.result.createObjectStore(name);
     };
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
@@ -91,5 +91,39 @@ export function loadProfile(db, game) {
 export function storeProfile(db, game, pairs) {
   const tx = db.transaction('profiles', 'readwrite');
   tx.objectStore('profiles').put(pairs, game);
+  return committed(tx);
+}
+
+// Games imported in the browser (import.mjs): per slug, {manifest, files: [path, bytes][]}.
+
+export function storeGame(db, slug, game) {
+  const tx = db.transaction('games', 'readwrite');
+  tx.objectStore('games').put(game, slug);
+  return committed(tx);
+}
+
+export function loadGame(db, slug) {
+  return done(db.transaction('games').objectStore('games').get(slug));
+}
+
+/** The imported games' manifests. */
+export function listGames(db) {
+  return new Promise((resolve, reject) => {
+    const out = [];
+    const r = db.transaction('games').objectStore('games').openCursor();
+    r.onsuccess = () => {
+      const c = r.result;
+      if (!c) return resolve(out);
+      out.push(c.value.manifest);
+      c.continue();
+    };
+    r.onerror = () => reject(r.error);
+  });
+}
+
+export function deleteGame(db, slug) {
+  const tx = db.transaction(['games', 'profiles'], 'readwrite');
+  tx.objectStore('games').delete(slug);
+  tx.objectStore('profiles').delete(slug);
   return committed(tx);
 }

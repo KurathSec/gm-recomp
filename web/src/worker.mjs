@@ -2,7 +2,7 @@
 // Messages to the page: {type: 'log', line} and {type: 'done', status}.
 import { runGame } from './host.mjs';
 import { KEYS } from './keys.mjs';
-import { applySaves, loadProfile, loadSaves, openSaves, storeProfile, storeSaves } from './saves.mjs';
+import { applySaves, loadGame, loadProfile, loadSaves, openSaves, storeProfile, storeSaves } from './saves.mjs';
 
 let input = null;
 const early = [];
@@ -22,22 +22,33 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false } = data;
   if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
-    const base = `/games/${encodeURIComponent(game)}/`;
-    const manifest = await (await fetch(`${base}manifest.json`)).json();
+    let manifest;
+    let downloaded;
     const t0 = performance.now();
-    const downloaded = await Promise.all(
-      manifest.files.map(async (f) => {
-        const r = await fetch(`${base}files/${f.path.split('/').map(encodeURIComponent).join('/')}`);
-        if (!r.ok) throw new Error(`${f.path}: HTTP ${r.status}`);
-        const mtime = Date.parse(r.headers.get('last-modified') ?? '') || 0;
-        return [f.path, new Uint8Array(await r.arrayBuffer()), mtime];
-      }),
-    );
-    post(`downloaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    if (local) {
+      // imported in this browser (import.mjs)
+      const g = await loadGame(await openSaves(), game);
+      if (!g) throw new Error(`no imported game ${game}`);
+      manifest = g.manifest;
+      downloaded = g.files.map(([path, data]) => [path, data, 0]);
+      post(`loaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    } else {
+      const base = `/games/${encodeURIComponent(game)}/`;
+      manifest = await (await fetch(`${base}manifest.json`)).json();
+      downloaded = await Promise.all(
+        manifest.files.map(async (f) => {
+          const r = await fetch(`${base}files/${f.path.split('/').map(encodeURIComponent).join('/')}`);
+          if (!r.ok) throw new Error(`${f.path}: HTTP ${r.status}`);
+          const mtime = Date.parse(r.headers.get('last-modified') ?? '') || 0;
+          return [f.path, new Uint8Array(await r.arrayBuffer()), mtime];
+        }),
+      );
+      post(`downloaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    }
     let db = null;
     let files = downloaded;
     if (persist) {

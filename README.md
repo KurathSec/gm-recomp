@@ -37,6 +37,24 @@ The page lists the imported games; a game plays at its own speed with keyboard,
 mouse and game controllers, sound starts with the first click or key press, and
 saves are kept in the browser (export/import from the game page).
 
+Games can also be imported in the browser, from the archive they are stored as:
+"Import a game…" on the page, or `?zip=<url>` (for example a link to the archive in
+object storage), which imports and starts it. A zip or 7z works, with an IExpress
+package inside unwrapped (RAR archives and NSIS installers still need the native
+importer). The game is kept in the browser and plays with `?game=<slug>&local`.
+This needs two extra builds:
+
+```sh
+# the importer for the page (served at /import/)
+CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target wasm32-unknown-unknown -p webimport --target-dir target/wasm-import
+# the system DLLs it may add (served at /system32/; from Wine's PE builds)
+web/tools/system32.sh
+```
+
+The browser also remembers which code each game needed and translates it right
+after the first frame of the next session (`?noprofile` turns that off), so later
+sessions do not stall the first time they reach a room or effect.
+
 ## How it works
 
 ```
@@ -47,9 +65,10 @@ browser worker: runtime.wasm (Rust: engine, HLE APIs, x87 model) + cpu glue + x8
    │ virtual clock, deterministic threads   │ sound mix ──► SharedArrayBuffer ring ──► AudioWorklet
 ```
 
-- `crates/recomp`: the x86 → wasm translator (lazy flags, register locals, a
-  `br_table` dispatcher per function, SSE on wasm SIMD, x87 fast paths in a shared
-  module with an exact 80-bit model behind them).
+- `crates/recomp`: the x86 → wasm translator (lazy flags, register locals, blocks
+  laid out so loops are wasm loops and other jumps forward branches, small callees
+  inlined, SSE on wasm SIMD, common x87 instructions inline with an exact 80-bit
+  model behind them).
 - `crates/fpu`: the x87 model (rustc_apfloat; bit-exact in every precision and
   rounding mode).
 - `crates/runtime`: PE loader, process state, the HLE layer (`hle/`), the engine
@@ -58,7 +77,8 @@ browser worker: runtime.wasm (Rust: engine, HLE APIs, x87 model) + cpu glue + x8
   renderer, audio worklet.
 - `crates/harness`: runs the same runtime natively on wasmtime (games headless, state
   hashes, WAV output, traces) and the CPU differential tests against the host CPU.
-- `crates/importer`: unpacks games, detects the engine, inventories modules and APIs.
+- `crates/importer`: unpacks games, detects the engine, inventories modules and APIs;
+  `crates/webimport`: the same unpacking and detection for the page.
 
 Runs are deterministic: the clock is virtual, threads are scheduled cooperatively,
 and the same input gives the same state hash in the harness, Node, Chrome and Firefox.

@@ -35,6 +35,10 @@ const mounts = [
   ['/runtime/', join(repoRoot, 'target/wasm/wasm32-unknown-unknown/release')],
   ['/monitor/', join(repoRoot, 'target/monitor')],
   ['/games/', join(webRoot, 'public/games')],
+  // the browser importer (crates/webimport, built without debug info) and the system
+  // DLLs it may add (tools/system32.sh)
+  ['/import/', join(repoRoot, 'target/wasm-import/wasm32-unknown-unknown/release')],
+  ['/system32/', join(webRoot, 'public/system32')],
   ['/', webRoot],
 ];
 

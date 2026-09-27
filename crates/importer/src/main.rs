@@ -88,8 +88,19 @@ fn supply_system_dlls(files_dir: &Path, system: &Path, shaders: bool) -> Result<
             fs::create_dir_all(&sysdir)?;
             let dst = sysdir.join(&name);
             fs::copy(&src, &dst)?;
-            // Wine's builds carry DWARF; the runtime needs none of it.
+            // Wine's builds carry DWARF; the runtime needs none of it. objcopy stamps
+            // the PE header with the time and a new checksum: the original's keep
+            // imports (and web/tools/system32.sh's copies) the same from run to run.
             let _ = std::process::Command::new("objcopy").arg("--strip-debug").arg(&dst).status();
+            if let (Ok(orig), Ok(mut out)) = (fs::read(&src), fs::read(&dst)) {
+                let pe = u32::from_le_bytes(orig[0x3c..0x40].try_into().unwrap()) as usize;
+                for o in [pe + 8, pe + 24 + 64] {
+                    if o + 4 <= orig.len().min(out.len()) {
+                        out[o..o + 4].copy_from_slice(&orig[o..o + 4]);
+                    }
+                }
+                fs::write(&dst, out)?;
+            }
             supplied.push(name);
             queue.push(dst);
         }

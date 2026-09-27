@@ -1,0 +1,16 @@
+[package]
+name = "webimport"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cab = "0.6"
+encoding_rs = "0.8.42"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+pe = { version = "0.1.0", path = "../pe" }
+runtime = { version = "0.1.0", path = "../runtime" }
+serde_json = "1.0.154"
+sevenz-rust2 = { version = "0.24", default-features = false }
