@@ -35,10 +35,36 @@ pub(crate) const L_V0: u32 = 28;
 pub(crate) const L_V1: u32 = 29;
 pub(crate) const L_MM: u32 = 30; // MMX register access: x87 block address, mantissa
 pub(crate) const L_MQ: u32 = 31;
+// Inline x87 (`x87_inline_form`): the block's address, TOP and what may run inline
+// (`fpu::block::FAST` bits, `X87_QUICK`; 0 after a fallback), as read at the last
+// sync; a register's slot; f64 operands and result.
+pub(crate) const L_XF: u32 = 32;
+pub(crate) const L_XT: u32 = 33;
+pub(crate) const L_XQ: u32 = 34;
+pub(crate) const L_XP: u32 = 35;
+pub(crate) const L_XA: u32 = 36;
+pub(crate) const L_XB: u32 = 37;
+pub(crate) const L_XR: u32 = 38;
 /// Locals after the parameters: the eight registers are the function's parameters
 /// (locals 0..7) and its results (`types::FUNC`).
-pub const LOCALS: [(u32, ValType); 6] =
-    [(17, ValType::I32), (2, ValType::I64), (1, ValType::F64), (2, ValType::V128), (1, ValType::I32), (1, ValType::I64)];
+pub const LOCALS: [(u32, ValType); 8] = [
+    (17, ValType::I32),
+    (2, ValType::I64),
+    (1, ValType::F64),
+    (2, ValType::V128),
+    (1, ValType::I32),
+    (1, ValType::I64),
+    (4, ValType::I32),
+    (3, ValType::F64),
+];
+/// `L_XQ` bit: the precision flag is set and rounding is to nearest (with C1 dead,
+/// the x87 helpers' quick lane).
+const X87_QUICK: u32 = 16;
+
+/// A memory operand at a fixed offset (the x87 block's fields).
+fn xma(off: u32) -> MemArg {
+    MemArg { offset: off as u64, align: 0, memory_index: 0 }
+}
 
 pub(crate) fn mem0() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
@@ -56,6 +82,11 @@ enum Dst {
     Mem,
     None,
 }
+
+const X87_UNKNOWN: u8 = 0;
+/// Holds an f64 (`fpu::block::VALID` without an extended image).
+const X87_F64: u8 = 1;
+const X87_EMPTY: u8 = 2;
 
 /// A label around the code being emitted, by what a branch to it continues at.
 enum Label {
@@ -87,6 +118,13 @@ pub struct FuncEmit<'a> {
     pub probe: bool,
     /// Call the `x87` module's fast paths before `rt.fpu`.
     pub x87_inline: bool,
+    /// The inline x87 locals need reading again (block start, after calls and x87
+    /// instructions that ran out of line).
+    x87_sync: bool,
+    /// What the inline x87 code knows of each register since the last sync, by slot
+    /// relative to TOP then (`X87_*`), and TOP relative to it.
+    x87_known: [u8; 8],
+    x87_top: u32,
     pub resolve_cache: bool,
     pub count: bool,
     pub count_blocks: bool,
@@ -123,6 +161,9 @@ impl<'a> FuncEmit<'a> {
             pending: None,
             probe: false,
             x87_inline: true,
+            x87_sync: true,
+            x87_known: [X87_UNKNOWN; 8],
+            x87_top: 0,
             resolve_cache: false,
             count: false,
             count_blocks: false,
@@ -1104,6 +1145,7 @@ impl<'a> FuncEmit<'a> {
             need = (need & !def) | used;
         }
         let last = block.instrs.len().saturating_sub(1);
+        self.x87_sync = true;
         for (k, instr) in block.instrs.iter().enumerate() {
             self.ip = instr.ip() as u32;
             self.next_ip = instr.next_ip() as u32;
@@ -1113,6 +1155,10 @@ impl<'a> FuncEmit<'a> {
                 self.emit_terminator(instr, &block.term, live_out);
             } else {
                 self.emit_instr(instr);
+            }
+            // calls (other code, APIs, other threads) and MMX change the x87 state
+            if instr.mnemonic() == Mnemonic::Call || (0..instr.op_count()).any(|n| instr.op_kind(n) == OpKind::Register && instr.op_register(n).is_mm()) {
+                self.x87_sync = true;
             }
         }
         if let Term::Fall(next) = block.term {
@@ -2363,8 +2409,574 @@ impl<'a> FuncEmit<'a> {
     }
 
     fn x87(&mut self, instr: &Instruction) {
-        use Mnemonic::*;
         self.count(crate::abi::COUNT_X87);
+        if self.x87_inline && self.x87_inline_form(instr) {
+            return;
+        }
+        self.x87_out_of_line(instr);
+        self.x87_sync = true;
+    }
+
+    /// The x87 helpers' fast paths of common instructions, inline: no call, and the
+    /// block address, TOP and the fast-path conditions read once per run of x87 code
+    /// (`x87_sync`). An instruction a check rejects runs out of line as before, and
+    /// the rest of the run then does too (`L_XQ` = 0), so what the code knows of the
+    /// registers (`x87_known`) holds whenever it runs inline. The inline paths are the
+    /// helpers' own (precision 53 bits, quick lane only for rounding results), so
+    /// both give the same state. False for instructions without one.
+    fn x87_inline_form(&mut self, instr: &Instruction) -> bool {
+        use crate::x87::{ASrc, Arg, CSrc, Form, Op, Src};
+        use fpu::block as fb;
+        let Some((k, arg)) = crate::x87::form_of(instr) else { return false };
+        let form = crate::x87::FORMS[k as usize];
+        let c1_dead = self.c1_dead();
+        let mem_ok = |s: Src| matches!(s, Src::M32 | Src::M64 | Src::I16 | Src::I32);
+        let need = match form {
+            Form::Load(s) if mem_ok(s) => fb::FAST_MOVE,
+            Form::LoadSt | Form::Const(_) | Form::Store(Src::M64, _) | Form::StoreSt(_) | Form::Chs | Form::Abs | Form::Xch => fb::FAST_MOVE,
+            Form::Store(Src::M32, _) => fb::FAST_INEXACT | X87_QUICK,
+            Form::Arith(_, _, src, _) if c1_dead && (matches!(src, ASrc::Mem(s) if mem_ok(s)) || !matches!(src, ASrc::Mem(_))) => fb::FAST_ARITH | X87_QUICK,
+            Form::Cmp(src, _, _) if matches!(src, CSrc::Mem(s) if mem_ok(s)) || !matches!(src, CSrc::Mem(_)) => fb::FAST_MOVE,
+            Form::StoreInt(Src::I16 | Src::I32, crate::x87::IntMode::Fist | crate::x87::IntMode::Fistp) => fb::FAST_INEXACT | X87_QUICK,
+            Form::Fnstsw(_) => 0,
+            _ => return false,
+        };
+        let st = match arg {
+            Arg::St(i) => i,
+            _ => 0,
+        };
+        if self.x87_sync {
+            self.x87_sync = false;
+            self.x87_known = [X87_UNKNOWN; 8];
+            self.x87_top = 0;
+            self.i(W::GlobalGet(Global::FsBase as u32));
+            self.c(fb::OFFSET);
+            self.i(W::I32Sub);
+            self.set(L_XF);
+            self.get(L_XF);
+            self.i(W::I32Load(xma(fb::TOP)));
+            self.set(L_XT);
+            // XQ = FAST | quick (PE set and RC nearest) << 4
+            self.get(L_XF);
+            self.i(W::I32Load(xma(fb::FAST)));
+            self.get(L_XF);
+            self.i(W::I32Load16U(xma(fb::SW)));
+            self.c(5);
+            self.i(W::I32ShrU);
+            self.get(L_XF);
+            self.i(W::I32Load16U(xma(fb::CW)));
+            self.c(0xC00);
+            self.i(W::I32And);
+            self.i(W::I32Eqz);
+            self.i(W::I32And);
+            self.c(1);
+            self.i(W::I32And);
+            self.c(X87_QUICK.trailing_zeros());
+            self.i(W::I32Shl);
+            self.i(W::I32Or);
+            self.set(L_XQ);
+        }
+        if let Form::Fnstsw(mem) = form {
+            // the status word with TOP (no conditions: it reads the state as it is)
+            self.get(L_XF);
+            self.i(W::I32Load16U(xma(fb::SW)));
+            self.get(L_XF);
+            self.i(W::I32Load(xma(fb::TOP)));
+            self.c(11);
+            self.i(W::I32Shl);
+            self.i(W::I32Or);
+            self.set(L_T1);
+            if mem {
+                self.addr(instr);
+                self.get(L_T1);
+                self.i(W::I32Store16(mem0()));
+            } else {
+                self.write_reg_from(Register::AX, L_T1);
+            }
+            return true;
+        }
+        let eflags = matches!(form, Form::Cmp(_, true, _));
+        if eflags {
+            self.materialize(flags::ALL);
+        }
+        self.i(W::Block(BlockType::Empty)); // done
+        self.i(W::Block(BlockType::Empty)); // out of line
+        self.depth += 2;
+        self.get(L_XQ);
+        self.c(need);
+        self.i(W::I32And);
+        self.c(need);
+        self.i(W::I32Ne);
+        self.i(W::BrIf(0));
+        match form {
+            Form::Load(s) => {
+                self.x_mem_value(instr, s, L_XA);
+                self.x_need_empty(7);
+                self.x_push(L_XA);
+                self.x_c1_fip(c1_dead, true);
+            }
+            Form::LoadSt => {
+                self.x_need_f64(st);
+                self.x_load(st, L_XA);
+                self.x_need_empty(7);
+                self.x_push(L_XA);
+                self.x_c1_fip(c1_dead, true);
+            }
+            Form::Const(one) => {
+                self.x_need_empty(7);
+                self.i(W::F64Const(if one { 1.0f64 } else { 0.0 }.into()));
+                self.set(L_XA);
+                self.x_push(L_XA);
+                self.x_c1_fip(c1_dead, true);
+            }
+            Form::Store(s, pop) => {
+                self.x_need_f64(0);
+                self.x_load(0, L_XA);
+                if s == Src::M32 {
+                    // beyond the largest single, or near or below its underflow threshold
+                    self.get(L_XA);
+                    self.i(W::F64Abs);
+                    self.i(W::F64Const(crate::x87::F32_MAX.into()));
+                    self.i(W::F64Gt);
+                    self.get(L_XA);
+                    self.i(W::F64Abs);
+                    self.i(W::F64Const(f64::INFINITY.into()));
+                    self.i(W::F64Ne);
+                    self.i(W::I32And);
+                    self.i(W::BrIf(0));
+                    self.get(L_XA);
+                    self.i(W::F64Abs);
+                    self.i(W::F64Const(crate::x87::F32_TINY.into()));
+                    self.i(W::F64Lt);
+                    self.get(L_XA);
+                    self.i(W::F64Const(0.0f64.into()));
+                    self.i(W::F64Ne);
+                    self.i(W::I32And);
+                    self.i(W::BrIf(0));
+                    self.addr(instr);
+                    self.get(L_XA);
+                    self.i(W::F32DemoteF64);
+                    self.i(W::F32Store(mem0()));
+                    if !c1_dead {
+                        // C1: rounded up in magnitude (PE is set already)
+                        self.get(L_XF);
+                        self.get(L_XF);
+                        self.i(W::I32Load16U(xma(fb::SW)));
+                        self.c(!crate::x87::SW_C1 & 0xffff);
+                        self.i(W::I32And);
+                        self.get(L_XA);
+                        self.i(W::F32DemoteF64);
+                        self.i(W::F64PromoteF32);
+                        self.i(W::F64Abs);
+                        self.get(L_XA);
+                        self.i(W::F64Abs);
+                        self.i(W::F64Gt);
+                        self.c(9);
+                        self.i(W::I32Shl);
+                        self.i(W::I32Or);
+                        self.i(W::I32Store16(xma(fb::SW)));
+                        self.x_c1_fip(c1_dead, false);
+                    }
+                } else {
+                    self.addr(instr);
+                    self.get(L_XA);
+                    self.i(W::F64Store(mem0()));
+                    self.x_c1_fip(c1_dead, true);
+                }
+                if pop {
+                    self.x_pop();
+                }
+            }
+            Form::StoreSt(pop) => {
+                self.x_need_f64(0);
+                self.x_load(0, L_XA);
+                self.x_store(st, L_XA);
+                self.x_set_kind(st, fb::VALID);
+                self.x87_known[((self.x87_top + st) & 7) as usize] = X87_F64;
+                self.x_c1_fip(c1_dead, true);
+                if pop {
+                    self.x_pop();
+                }
+            }
+            Form::StoreInt(s, mode) => {
+                // rounded to nearest (with PE set already: an inexact result leaves it)
+                self.x_need_f64(0);
+                self.x_load(0, L_XA);
+                self.get(L_XA);
+                self.i(W::F64Nearest);
+                self.set(L_XB);
+                let (lo, hi) = if s == Src::I16 { (-32768.0f64, 32767.0f64) } else { (-2147483648.0, 2147483647.0) };
+                self.get(L_XB);
+                self.i(W::F64Const(lo.into()));
+                self.i(W::F64Ge);
+                self.get(L_XB);
+                self.i(W::F64Const(hi.into()));
+                self.i(W::F64Le);
+                self.i(W::I32And);
+                self.i(W::I32Eqz);
+                self.i(W::BrIf(0));
+                self.addr(instr);
+                self.get(L_XB);
+                self.i(W::I32TruncF64S);
+                self.i(if s == Src::I16 { W::I32Store16(mem0()) } else { W::I32Store(mem0()) });
+                if !c1_dead {
+                    // C1: rounded up in magnitude
+                    self.get(L_XF);
+                    self.get(L_XF);
+                    self.i(W::I32Load16U(xma(fb::SW)));
+                    self.c(!crate::x87::SW_C1 & 0xffff);
+                    self.i(W::I32And);
+                    self.get(L_XB);
+                    self.get(L_XA);
+                    self.i(W::F64Ne);
+                    self.get(L_XB);
+                    self.i(W::F64Abs);
+                    self.get(L_XA);
+                    self.i(W::F64Abs);
+                    self.i(W::F64Gt);
+                    self.i(W::I32And);
+                    self.c(9);
+                    self.i(W::I32Shl);
+                    self.i(W::I32Or);
+                    self.i(W::I32Store16(xma(fb::SW)));
+                }
+                if mode == crate::x87::IntMode::Fistp {
+                    self.x_pop();
+                }
+                self.x_c1_fip(c1_dead, false);
+            }
+            Form::Chs | Form::Abs => {
+                self.x_need_f64(0);
+                self.x_load(0, L_XA);
+                self.get(L_XA);
+                self.i(if form == Form::Chs { W::F64Neg } else { W::F64Abs });
+                self.set(L_XA);
+                self.x_store(0, L_XA);
+                self.x_c1_fip(c1_dead, true);
+            }
+            Form::Xch => {
+                self.x_need_f64(0);
+                self.x_need_f64(st);
+                self.x_load(0, L_XA);
+                self.x_load(st, L_XB);
+                self.x_store(0, L_XB);
+                self.x_store(st, L_XA);
+                self.x_c1_fip(c1_dead, true);
+            }
+            Form::Arith(op, rev, src, pop) => {
+                // XA = the destination's value, XB = the other operand
+                let dest = match src {
+                    ASrc::Mem(s) => {
+                        self.x_need_f64(0);
+                        self.x_mem_value(instr, s, L_XB);
+                        0
+                    }
+                    ASrc::St0Sti => {
+                        self.x_need_f64(0);
+                        self.x_need_f64(st);
+                        self.x_load(st, L_XB);
+                        0
+                    }
+                    ASrc::StiSt0 => {
+                        self.x_need_f64(st);
+                        self.x_need_f64(0);
+                        self.x_load(0, L_XB);
+                        st
+                    }
+                };
+                self.x_load(dest, L_XA);
+                let (x, y) = if rev { (L_XB, L_XA) } else { (L_XA, L_XB) };
+                self.get(x);
+                self.get(y);
+                self.i(match op {
+                    Op::Add => W::F64Add,
+                    Op::Sub => W::F64Sub,
+                    Op::Mul => W::F64Mul,
+                    Op::Div => W::F64Div,
+                });
+                self.set(L_XR);
+                // a normal result, or an exact zero: a sum, a product with a zero
+                // factor, a quotient of zero or by an infinity (any other zero
+                // underflowed, where the 80-bit unit's wider exponent keeps a value)
+                self.get(L_XR);
+                self.i(W::F64Abs);
+                self.i(W::F64Const(crate::x87::MIN_NORMAL.into()));
+                self.i(W::F64Ge);
+                self.get(L_XR);
+                self.i(W::F64Abs);
+                self.i(W::F64Const(f64::INFINITY.into()));
+                self.i(W::F64Lt);
+                self.i(W::I32And);
+                self.get(L_XR);
+                self.i(W::F64Const(0.0f64.into()));
+                self.i(W::F64Eq);
+                match op {
+                    Op::Add | Op::Sub => {}
+                    Op::Mul => {
+                        self.get(x);
+                        self.i(W::F64Const(0.0f64.into()));
+                        self.i(W::F64Eq);
+                        self.get(y);
+                        self.i(W::F64Const(0.0f64.into()));
+                        self.i(W::F64Eq);
+                        self.i(W::I32Or);
+                        self.i(W::I32And);
+                    }
+                    Op::Div => {
+                        self.get(x);
+                        self.i(W::F64Const(0.0f64.into()));
+                        self.i(W::F64Eq);
+                        self.get(y);
+                        self.i(W::F64Abs);
+                        self.i(W::F64Const(f64::INFINITY.into()));
+                        self.i(W::F64Eq);
+                        self.i(W::I32Or);
+                        self.i(W::I32And);
+                    }
+                }
+                self.i(W::I32Or);
+                self.i(W::I32Eqz);
+                self.i(W::BrIf(0));
+                self.x_store(dest, L_XR);
+                if pop {
+                    self.x_pop();
+                }
+            }
+            Form::Cmp(src, eflags, pops) => {
+                self.x_need_f64(0);
+                match src {
+                    CSrc::Mem(s) => self.x_mem_value(instr, s, L_XB),
+                    CSrc::Zero => {
+                        self.i(W::F64Const(0.0f64.into()));
+                        self.set(L_XB);
+                    }
+                    CSrc::Sti => {
+                        self.x_need_f64(st);
+                        self.x_load(st, L_XB);
+                    }
+                }
+                self.x_load(0, L_XA);
+                // T2 = st0 < other, T3 = equal (no NaNs here)
+                self.get(L_XA);
+                self.get(L_XB);
+                self.i(W::F64Lt);
+                self.set(L_T2);
+                self.get(L_XA);
+                self.get(L_XB);
+                self.i(W::F64Eq);
+                self.set(L_T3);
+                if !eflags {
+                    self.get(L_XF);
+                    self.get(L_XF);
+                    self.i(W::I32Load16U(xma(fb::SW)));
+                    self.c(!(crate::x87::SW_CC | crate::x87::SW_C1) & 0xffff);
+                    self.i(W::I32And);
+                    self.get(L_T2);
+                    self.c(8);
+                    self.i(W::I32Shl);
+                    self.get(L_T3);
+                    self.c(14);
+                    self.i(W::I32Shl);
+                    self.i(W::I32Or);
+                    self.i(W::I32Or);
+                    self.i(W::I32Store16(xma(fb::SW)));
+                }
+                for _ in 0..pops {
+                    self.x_pop();
+                }
+                self.x_c1_fip(c1_dead, false);
+                if eflags {
+                    // (fcomi leaves the condition codes, C1 too, as they are)
+                    self.get(L_T2);
+                    self.set(L_FLAG);
+                    self.get(L_T3);
+                    self.set(L_FLAG + 3);
+                    for f in [1, 2, 4, 5] {
+                        self.c(0);
+                        self.set(L_FLAG + f);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        self.i(W::Br(1));
+        self.i(W::End);
+        self.depth -= 1;
+        self.x87_out_of_line(instr);
+        self.c(0);
+        self.set(L_XQ);
+        self.i(W::End);
+        self.depth -= 1;
+        true
+    }
+
+    /// Pushes the slot of ST(i) as the inline code sees TOP.
+    fn x_slot(&mut self, i: u32) {
+        self.get(L_XT);
+        if i != 0 {
+            self.c(i);
+            self.i(W::I32Add);
+            self.c(7);
+            self.i(W::I32And);
+        }
+    }
+
+    fn x_rel(&self, i: u32) -> usize {
+        ((self.x87_top + i) & 7) as usize
+    }
+
+    /// Goes out of line unless ST(i) holds an f64.
+    fn x_need_f64(&mut self, i: u32) {
+        if self.x87_known[self.x_rel(i)] == X87_F64 {
+            return;
+        }
+        self.get(L_XF);
+        self.x_slot(i);
+        self.i(W::I32Add);
+        self.i(W::I32Load8U(xma(fpu::block::KIND)));
+        self.c(fpu::block::VALID as u32);
+        self.i(W::I32Ne);
+        self.i(W::BrIf(0));
+        let r = self.x_rel(i);
+        self.x87_known[r] = X87_F64;
+    }
+
+    /// Goes out of line unless ST(i) is empty (ST(7): where a push goes).
+    fn x_need_empty(&mut self, i: u32) {
+        if self.x87_known[self.x_rel(i)] == X87_EMPTY {
+            return;
+        }
+        self.get(L_XF);
+        self.x_slot(i);
+        self.i(W::I32Add);
+        self.i(W::I32Load8U(xma(fpu::block::KIND)));
+        self.c(fpu::block::VALID as u32);
+        self.i(W::I32And);
+        self.i(W::BrIf(0));
+    }
+
+    fn x_reg_addr(&mut self, i: u32) {
+        self.get(L_XF);
+        self.x_slot(i);
+        self.c(3);
+        self.i(W::I32Shl);
+        self.i(W::I32Add);
+    }
+
+    fn x_load(&mut self, i: u32, into: u32) {
+        self.x_reg_addr(i);
+        self.i(W::F64Load(xma(fpu::block::REGS)));
+        self.set(into);
+    }
+
+    fn x_store(&mut self, i: u32, from: u32) {
+        self.x_reg_addr(i);
+        self.get(from);
+        self.i(W::F64Store(xma(fpu::block::REGS)));
+    }
+
+    fn x_set_kind(&mut self, i: u32, kind: u8) {
+        self.get(L_XF);
+        self.x_slot(i);
+        self.i(W::I32Add);
+        self.c(kind as u32);
+        self.i(W::I32Store8(xma(fpu::block::KIND)));
+    }
+
+    /// Pushes the f64 in `from` (the target was checked empty).
+    fn x_push(&mut self, from: u32) {
+        self.x_slot(7);
+        self.set(L_XT);
+        self.x_store(0, from);
+        self.x_set_kind(0, fpu::block::VALID);
+        self.get(L_XF);
+        self.get(L_XT);
+        self.i(W::I32Store(xma(fpu::block::TOP)));
+        self.x87_top = (self.x87_top + 7) & 7;
+        let r = self.x_rel(0);
+        self.x87_known[r] = X87_F64;
+    }
+
+    /// Pops ST(0), which holds an f64 (its kind becomes empty).
+    fn x_pop(&mut self) {
+        self.x_set_kind(0, 0);
+        self.x_slot(1);
+        self.set(L_XT);
+        self.get(L_XF);
+        self.get(L_XT);
+        self.i(W::I32Store(xma(fpu::block::TOP)));
+        let r = self.x_rel(0);
+        self.x87_known[r] = X87_EMPTY;
+        self.x87_top = (self.x87_top + 1) & 7;
+    }
+
+    /// The memory operand as a register value into `into`; out of line for NaNs and
+    /// denormals (they raise IE or DE).
+    fn x_mem_value(&mut self, instr: &Instruction, src: crate::x87::Src, into: u32) {
+        use crate::x87::Src;
+        self.addr(instr);
+        match src {
+            Src::M32 | Src::M64 => {
+                if src == Src::M32 {
+                    self.i(W::F32Load(mem0()));
+                    self.i(W::F64PromoteF32);
+                } else {
+                    self.i(W::F64Load(mem0()));
+                }
+                self.set(into);
+                self.get(into);
+                self.i(W::F64Abs);
+                self.i(W::F64Const(if src == Src::M32 { crate::x87::F32_MIN_NORMAL } else { crate::x87::MIN_NORMAL }.into()));
+                self.i(W::F64Ge);
+                self.get(into);
+                self.i(W::F64Const(0.0f64.into()));
+                self.i(W::F64Eq);
+                self.i(W::I32Or);
+                self.i(W::I32Eqz);
+                self.i(W::BrIf(0));
+            }
+            Src::I16 => {
+                self.i(W::I32Load16S(mem0()));
+                self.i(W::F64ConvertI32S);
+                self.set(into);
+            }
+            Src::I32 => {
+                self.i(W::I32Load(mem0()));
+                self.i(W::F64ConvertI32S);
+                self.set(into);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// C1 = 0 (when `clear`) and FIP = this instruction, unless the next x87
+    /// instruction overwrites both first.
+    fn x_c1_fip(&mut self, c1_dead: bool, clear: bool) {
+        use fpu::block as fb;
+        if c1_dead {
+            return;
+        }
+        if clear {
+            self.get(L_XF);
+            self.get(L_XF);
+            self.i(W::I32Load16U(xma(fb::SW)));
+            self.c(!crate::x87::SW_C1 & 0xffff);
+            self.i(W::I32And);
+            self.i(W::I32Store16(xma(fb::SW)));
+        }
+        self.get(L_XF);
+        self.c(self.ip);
+        self.i(W::I32Store(xma(fb::FIP)));
+    }
+
+    /// An x87 instruction through the `x87` module's helper for its form, or `rt.fpu`.
+    fn x87_out_of_line(&mut self, instr: &Instruction) {
+        use Mnemonic::*;
+        self.count(crate::abi::COUNT_X87_HELPER);
+        if self.count_blocks {
+            // (as blocks, with the top bit flipped)
+            self.count_at(self.ip ^ 0x8000_0000);
+        }
         let writes_flags = matches!(instr.mnemonic(), Fcomi | Fcomip | Fucomi | Fucomip);
         let writes_ax = instr.mnemonic() == Fnstsw && !(0..instr.op_count()).any(|n| instr.op_kind(n) == OpKind::Memory);
         if writes_flags {

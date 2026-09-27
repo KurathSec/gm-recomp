@@ -23,7 +23,8 @@ pub const COUNT_X87: u32 = 2;
 pub const COUNT_RESOLVES: u32 = 3;
 pub const COUNT_JUMPS: u32 = 4;
 pub const COUNT_LOOPS: u32 = 5;
-pub const COUNT_NAMES: [&str; 6] = ["function entries", "calls", "x87 instructions", "resolve probes", "jumps", "via dispatcher"];
+pub const COUNT_X87_HELPER: u32 = 6;
+pub const COUNT_NAMES: [&str; 7] = ["function entries", "calls", "x87 instructions", "resolve probes", "jumps", "via dispatcher", "x87 out of line"];
 /// With counting: entries per function, a table of [entry address, count] slots
 /// indexed by `resolve_slot`-style hashing (`ENTRY_SLOTS` of them).
 pub const ENTRY_COUNTS: u32 = COUNTERS + 0x1000;

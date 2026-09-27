@@ -284,7 +284,7 @@ impl<C: Cx> Machine for Wt<'_, C> {
                             }
                         }
                         slots.sort_unstable_by(|a, b| b.cmp(a));
-                        let top: Vec<String> = slots.iter().take(if std::env::var("GMR_COUNT").is_ok_and(|v| v == "blocks") { 40 } else { 12 }).map(|(n, f)| format!("{f:#x}:{n}")).collect();
+                        let top: Vec<String> = slots.iter().take(if std::env::var("GMR_COUNT").is_ok_and(|v| v == "blocks") { 400 } else { 12 }).map(|(n, f)| format!("{f:#x}:{n}")).collect();
                         counts.push_str(&format!("\n    top {}", top.join(" ")));
                     }
                 }

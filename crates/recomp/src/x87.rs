@@ -28,18 +28,18 @@ use wasm_encoder::{
 pub const MODULE: &str = "x87";
 
 const SW_PE_SHIFT: u32 = 5;
-const SW_C1: u32 = 1 << 9;
-const SW_CC: u32 = 0x4700;
+pub(crate) const SW_C1: u32 = 1 << 9;
+pub(crate) const SW_CC: u32 = 0x4700;
 
-const MIN_NORMAL: f64 = f64::MIN_POSITIVE;
+pub(crate) const MIN_NORMAL: f64 = f64::MIN_POSITIVE;
 /// 2^e as f64 (normal range).
 const fn pow2(e: i64) -> f64 {
     f64::from_bits(((1023 + e) as u64) << 52)
 }
-const F32_MIN_NORMAL: f64 = pow2(-126);
+pub(crate) const F32_MIN_NORMAL: f64 = pow2(-126);
 /// Below this, rounding to single might reach the subnormal range.
-const F32_TINY: f64 = pow2(-125);
-const F32_MAX: f64 = f32::MAX as f64;
+pub(crate) const F32_TINY: f64 = pow2(-125);
+pub(crate) const F32_MAX: f64 = f32::MAX as f64;
 /// Limits that keep the error-term computations free of overflow and underflow.
 const SPLIT_MAX: f64 = pow2(995);
 const ADD_MAX: f64 = pow2(1020);
