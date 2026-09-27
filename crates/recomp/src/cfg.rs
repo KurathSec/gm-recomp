@@ -2,7 +2,8 @@
 //! plus the branch structure the emitter turns into wasm control flow.
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use crate::fasthash::HashMap;
+use std::collections::{BTreeMap, VecDeque};
 
 /// Read access to the guest image, by virtual address.
 pub trait GuestMem {
@@ -12,7 +13,7 @@ pub trait GuestMem {
 
 pub struct FuncInfo<'a> {
     /// Resolved `jmp [idx*4+table]` sites: site address -> targets.
-    pub jump_tables: &'a HashMap<u32, Vec<u32>>,
+    pub jump_tables: &'a std::collections::HashMap<u32, Vec<u32>>,
     /// Addresses known to start functions; direct jumps there are tail calls.
     pub is_function: &'a dyn Fn(u32) -> bool,
     /// The function table index of a function translated already: calls to it need
@@ -145,10 +146,10 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
     let mut next_key = INLINE_KEYS;
     let mut budget = INLINE_BUDGET;
     let mut blocks: BTreeMap<u32, Block> = BTreeMap::new();
-    let mut fop: HashMap<u32, u16> = HashMap::new();
+    let mut fop: HashMap<u32, u16> = HashMap::default();
     let mut ret_targets = Vec::new();
-    let mut call_flags = HashMap::new();
-    let mut known = HashMap::new();
+    let mut call_flags = HashMap::default();
+    let mut known = HashMap::default();
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
@@ -254,7 +255,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                     // their own; its returns and tail jumps come back here
                     let target = instr.near_branch_target() as u32;
                     sites += 1;
-                    let mut keys = HashMap::new();
+                    let mut keys = HashMap::default();
                     for &k in callee.blocks.keys() {
                         keys.insert(k, next_key);
                         next_key += 1;

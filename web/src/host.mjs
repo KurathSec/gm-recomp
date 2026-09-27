@@ -32,8 +32,12 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(stats: object) => void} [o.onStats]  twice a second while rendering: frame rate, real frame
  *   interval, guest time per frame, late frames, and input latency (event to the Present of the frame
  *   that read it; key/mouse calls pass the event's time as performance.timeOrigin + timeStamp)
+ * @param {Uint32Array} [o.profile]  [address, code hash] pairs of functions earlier sessions needed,
+ *   in the order they did: translated ahead while the game waits
+ * @param {(pairs: Uint32Array) => void} [o.onProfile]  functions this session needed that the profile
+ *   lacked (every few seconds and at the end), to add to it
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -132,9 +136,24 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     if (startReal === undefined || now - (startReal + clockMs) > 250) startReal = now - clockMs;
     return startReal + clockMs;
   };
+  // functions this session needed that the profile lacked, handed out from `sent` on
+  let sent = 0;
+  const flushProfile = () => {
+    if (!onProfile) return;
+    const n = rt.exports.demand_len();
+    if (n <= sent) return;
+    const pairs = new Uint32Array(2 * (n - sent));
+    for (let i = sent; i < n; i++) {
+      pairs[2 * (i - sent)] = rt.exports.demand_at(i, 0);
+      pairs[2 * (i - sent) + 1] = rt.exports.demand_at(i, 1);
+    }
+    sent = n;
+    onProfile(pairs);
+  };
   const show = (clockMs, x, y, w, h, dw, dh, busy) => {
     collect(performance.now(), clockMs, busy);
     frameReset();
+    if (gpu.frames % 250 === 249) flushProfile();
     const resized = canvas.width !== dw || canvas.height !== dh;
     gpu.present(x, y, w, h, dw, dh);
     if (resized && onResize) onResize(dw, dh);
@@ -469,7 +488,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   if (monitor) x.set_monitor(1);
   // [kind, frame, clock, a, b, c]: a recorded session's input
   for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);
+  if (profile) for (let i = profile.length - 2; i >= 0; i -= 2) x.profile_push(profile[i], profile[i + 1]);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
+  flushProfile();
   if (gpu) print(`draw calls: ${(gpuMs / 1000).toFixed(2)}s in all, ${(gpuMs / Math.max(1, gpu.frames)).toFixed(2)} ms per frame`);
   if (slackStats.n) print(`slack: ${slackStats.n} asks, estimate ${(slackStats.est / slackStats.n).toFixed(2)} ms, frame left ${(slackStats.left / slackStats.n).toFixed(2)} ms`);
   print(`modules instantiated: ${modules} (${(moduleBytes / 1048576).toFixed(1)} MB; compile ${(compileMs / 1000).toFixed(2)}s, instantiate ${(instantiateMs / 1000).toFixed(2)}s)`);

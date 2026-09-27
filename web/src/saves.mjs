@@ -5,8 +5,10 @@
 
 export function openSaves() {
   return new Promise((resolve, reject) => {
-    const r = indexedDB.open('gmrecomp', 1);
-    r.onupgradeneeded = () => r.result.createObjectStore('saves');
+    const r = indexedDB.open('gmrecomp', 2);
+    r.onupgradeneeded = () => {
+      for (const name of ['saves', 'profiles']) if (!r.result.objectStoreNames.contains(name)) r.result.createObjectStore(name);
+    };
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
   });
@@ -76,4 +78,18 @@ export function parseSaves(text, game) {
   if (j.game !== game) throw new Error(`these saves are for ${j.game}`);
   const bytes = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
   return j.files.map((f) => ({ path: f.path, mtime: f.mtime, data: f.data === null ? null : bytes(f.data) }));
+}
+
+// Translation profiles: per game, [address, code hash] pairs (Uint32Array) of the
+// functions sessions translated when they ran, in the order they first did. The next
+// session translates them ahead while the game waits (see host.mjs `profile`).
+
+export function loadProfile(db, game) {
+  return done(db.transaction('profiles').objectStore('profiles').get(game)).then((v) => (v instanceof Uint32Array ? v : null));
+}
+
+export function storeProfile(db, game, pairs) {
+  const tx = db.transaction('profiles', 'readwrite');
+  tx.objectStore('profiles').put(pairs, game);
+  return committed(tx);
 }

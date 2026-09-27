@@ -118,6 +118,7 @@
       // &monitor: the dev server records the session (start, saves, input as the guest
       // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
       // &replay=<session>: plays a recorded session again (its date, saves and input)
+      // &noprofile: no translation profile (functions earlier sessions needed, translated ahead)
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
 
@@ -410,7 +411,7 @@
           ringWhen[i] = when ?? performance.timeOrigin + performance.now();
           Atomics.store(ringIdx, 0, (wr + 1) | 0);
         };
-        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing }, [offscreen]);
+        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing, useProfile: !q.has('noprofile') }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.

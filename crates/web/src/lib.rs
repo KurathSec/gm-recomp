@@ -610,7 +610,7 @@ pub extern "C" fn run() -> i32 {
         },
         format!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)"),
         format!(
-            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.1}s; {} ahead in {} waits, {:.1}s, ~{} ns/byte)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.2}s; {} ahead in {} waits, {:.2}s, ~{} ns/byte; profile {} left)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
@@ -621,6 +621,7 @@ pub extern "C" fn run() -> i32 {
             e.idle_calls,
             e.idle_us as f64 / 1e6,
             e.idle_ns_per_byte,
+            e.profile.len(),
             p.now_ms()
         ),
     ];
@@ -651,6 +652,25 @@ pub extern "C" fn stat_us(which: u32) -> f64 {
         3 => e.api_calls,
         _ => e.dispatches,
     } as f64)
+}
+
+/// Queues a function earlier sessions needed, with its code hash; entries go in
+/// last needed first (see `Engine::profile`).
+#[unsafe(no_mangle)]
+pub extern "C" fn profile_push(addr: u32, hash: u32) {
+    engine::profile_push(&mut Web, addr, hash);
+}
+
+/// How many functions this session has translated when they ran (`Engine::demand`).
+#[unsafe(no_mangle)]
+pub extern "C" fn demand_len() -> u32 {
+    state().engine.as_ref().map_or(0, |e| e.demand.len() as u32)
+}
+
+/// Entry `i` of `Engine::demand`: its address (`which` 0) or code hash (1).
+#[unsafe(no_mangle)]
+pub extern "C" fn demand_at(i: u32, which: u32) -> u32 {
+    state().engine.as_ref().and_then(|e| e.demand.get(i as usize)).map_or(0, |&(a, h)| if which == 0 { a } else { h })
 }
 
 /// Queues an input event of a recorded session (`kind` 0 key: a = vk, b = scan,

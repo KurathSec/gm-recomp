@@ -76,6 +76,22 @@ pub struct Engine {
     /// Functions translated code calls directly that are not translated yet: likely
     /// next, so `translate_idle` takes them first (popped from the end).
     pub idle_next: Vec<u32>,
+    /// Functions earlier sessions translated when they ran, with a hash of their first
+    /// bytes (`code_hash`), in reverse order of need: `translate_idle` takes them
+    /// first, once the first frame is out (packers have unpacked by then) and when the
+    /// code there is still the same.
+    pub profile: Vec<(u32, u32)>,
+    /// Functions translated this session when they ran, with their code hash, for
+    /// the next session's profile (those already in it left out).
+    pub demand: Vec<(u32, u32)>,
+    pub profile_known: HashSet<u32>,
+    /// Frames presented as of the last input poll (readable while the process is lent
+    /// out).
+    pub frames_seen: u64,
+    /// The profile's burst ran (see `translate_idle`).
+    pub profile_burst: bool,
+    /// The functions the last `translate_batch` translated.
+    pub last_batch: Vec<u32>,
     /// Functions translated ahead by `translate_idle`, and its calls.
     pub idle_done: usize,
     pub idle_calls: usize,
@@ -110,7 +126,7 @@ pub struct Engine {
     /// Host time spent translating ahead (`translate_idle`).
     pub idle_us: u64,
     /// Callees considered for inlining, kept from one translation to the next.
-    pub inline_cache: Option<std::collections::HashMap<(u32, u8), Option<std::rc::Rc<recomp::cfg::Cfg>>>>,
+    pub inline_cache: Option<recomp::fasthash::HashMap<(u32, u8), Option<std::rc::Rc<recomp::cfg::Cfg>>>>,
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
     /// a session can be replayed (`harness run --replay`).
     pub monitor: bool,
@@ -136,6 +152,12 @@ impl Engine {
             idle_queue: None,
             idle_ns_per_byte: 0,
             idle_next: Vec::new(),
+            profile: Vec::new(),
+            demand: Vec::new(),
+            profile_known: HashSet::default(),
+            frames_seen: 0,
+            profile_burst: false,
+            last_batch: Vec::new(),
             idle_done: 0,
             idle_calls: 0,
             recent: VecDeque::new(),
@@ -380,6 +402,7 @@ impl<M: Machine> Host for M {
     }
 
     fn poll_input(&mut self, frame: u64, clock_us: u64) -> Vec<crate::hle::InputEvent> {
+        self.engine().frames_seen = frame;
         self.take_input(frame, clock_us)
     }
 
@@ -788,6 +811,7 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
     for ((entry, _), idx) in out.functions.iter().zip(indices) {
         e.funcs.insert(*entry, idx);
     }
+    e.last_batch = out.functions.iter().map(|(entry, _)| *entry).collect();
     e.translated += out.functions.len();
     e.modules += 1;
     e.translate_us += now - t;
@@ -830,6 +854,31 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         }
     }
     let mut done = 0;
+    // The first wait after the first frame (packers have unpacked; a loading screen is
+    // up): the profile at once, for up to PROFILE_BURST_US, so the frames that need it
+    // later find it ready.
+    let e = m.engine();
+    if e.frames_seen > 0 && !e.profile_burst && !e.profile.is_empty() {
+        e.profile_burst = true;
+        let t = m.now_us();
+        let end = t + PROFILE_BURST_US;
+        let mut skipped = [0; 3];
+        while m.now_us() < end {
+            let batch = profile_batch(m, 16, &mut skipped);
+            if batch.is_empty() {
+                break;
+            }
+            let _ = translate_batch(m, &batch, batch.len());
+            done += batch.len();
+        }
+        let left = m.engine_ref().profile.len();
+        let ms = (m.now_us() - t) / 1000;
+        m.print(&format!(
+            "translation profile: {done} functions translated in {ms} ms ({} translated already, {} not mapped, {} changed, {left} left)",
+            skipped[0], skipped[1], skipped[2]
+        ));
+        return done;
+    }
     loop {
         // what fits in the time left by the running estimate (half again: a slow
         // compile can exceed it), in modules of 4 to 16 functions (browsers bound how
@@ -837,11 +886,43 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         // left to be translated when it runs
         let budget_ns = deadline_us.saturating_sub(m.now_us()) * 1000;
         let per = m.engine_ref().idle_ns_per_byte.max(1) * 3 / 2;
+        // the next profile entries go when their code is not what the profile saw
+        let n = m.engine_ref().profile.len();
+        let lo = n.saturating_sub(16);
+        let same: Vec<(u32, u32)> = m.engine_ref().profile[lo..].iter().copied().filter(|&(a, h)| code_hash(&*m, a) == Some(h)).collect();
+        let e = m.engine();
+        e.profile.truncate(lo);
+        e.profile.extend(same);
         let (batch, bytes) = {
             let e = m.engine();
             let q = e.idle_queue.as_mut().expect("queue built above");
             let (mut b, mut bytes) = (Vec::new(), 0u64);
-            // the call graph's frontier first, sized like the queue's entries
+            // what earlier sessions needed, then the call graph's frontier, sized like
+            // the queue's entries
+            let started = e.frames_seen > 0;
+            while started && b.len() < 16 {
+                let Some(&(a, _)) = e.profile.last() else { break };
+                let Some(md) = e.mods.iter().find(|md| a >= md.base && a < md.base + md.size) else {
+                    e.profile.pop();
+                    continue;
+                };
+                if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || b.iter().any(|&(x, _)| x == a) {
+                    e.profile.pop();
+                    continue;
+                }
+                let k = md.sorted.partition_point(|&f| f <= a);
+                let size = md.sorted.get(k).copied().unwrap_or(md.base + md.size).saturating_sub(a).clamp(1, 0x10000);
+                if size as u64 * per > budget_ns.max(4_000_000) {
+                    e.profile.pop(); // too large to translate ahead
+                    continue;
+                }
+                if (bytes + size as u64) * per > budget_ns {
+                    break;
+                }
+                e.profile.pop();
+                b.push((a, size));
+                bytes += size as u64;
+            }
             while let Some(a) = e.idle_next.pop() {
                 if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || b.iter().any(|&(x, _)| x == a) {
                     continue;
@@ -952,7 +1033,56 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
     }
     let i = m.engine_ref().funcs.get(&addr).copied().ok_or_else(|| format!("translation of {addr:#x} produced no function"))?;
     cache_resolved(m, addr, i);
+    // for the next session's profile: the whole batch (what this function calls came
+    // with it)
+    for a in std::mem::take(&mut m.engine().last_batch) {
+        if !m.engine_ref().profile_known.contains(&a) {
+            if let Some(h) = code_hash(m, a) {
+                let e = m.engine();
+                e.profile_known.insert(a);
+                e.demand.push((a, h));
+            }
+        }
+    }
     Ok(i)
+}
+
+/// How long the profile's burst may hold the first frame up.
+const PROFILE_BURST_US: u64 = 2_000_000;
+
+/// Up to `max` profile entries whose code is what the profile saw (others are
+/// dropped), taken off the profile.
+fn profile_batch<M: Machine>(m: &mut M, max: usize, skipped: &mut [usize; 3]) -> Vec<u32> {
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((a, h)) = m.engine().profile.pop() else { break };
+        let e = m.engine_ref();
+        if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || out.contains(&a) {
+            skipped[0] += 1;
+        } else if !e.mods.iter().any(|md| a >= md.base && a < md.base + md.size) {
+            skipped[1] += 1;
+        } else if code_hash(&*m, a) != Some(h) {
+            skipped[2] += 1;
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// FNV-1a of the 32 bytes at `addr`: what a profile entry expects to find there.
+pub fn code_hash<M: Machine>(m: &M, addr: u32) -> Option<u32> {
+    let mut b = [0u8; 32];
+    m.read(addr, &mut b).ok()?;
+    Some(b.iter().fold(0x811c_9dc5u32, |h, &x| (h ^ x as u32).wrapping_mul(0x0100_0193)))
+}
+
+/// Queues a profile entry: they go in last needed first (`profile` is a stack).
+pub fn profile_push<M: Machine>(m: &mut M, addr: u32, hash: u32) {
+    let e = m.engine();
+    if e.profile_known.insert(addr) {
+        e.profile.push((addr, hash));
+    }
 }
 
 /// Return addresses on the guest stack (values just after a call instruction in a

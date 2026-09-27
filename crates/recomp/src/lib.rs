@@ -2,6 +2,7 @@
 
 pub mod abi;
 pub mod cfg;
+pub mod fasthash;
 pub mod flags;
 pub mod layout;
 pub mod lift;
@@ -10,7 +11,8 @@ pub mod x87;
 
 use abi::{GLOBALS, RT_FUNCS, types};
 use cfg::{Cfg, FuncInfo, GuestMem};
-use std::collections::{BTreeMap, HashMap};
+use crate::fasthash::HashMap;
+use std::collections::BTreeMap;
 use wasm_encoder::{
     CodeSection, EntityType, ExportKind, ExportSection, FunctionSection, GlobalType, ImportSection, MemoryType, Module,
     RefType, TableType, TypeSection, ValType,

@@ -6,7 +6,7 @@
 //! keep the address order, where earlier blocks are reached through the dispatcher.
 
 use crate::cfg::{Cfg, Term};
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 
 /// The emission structure over positions in `Layout::order`.
 pub enum Item {
@@ -155,6 +155,7 @@ fn structured(cfg: &Cfg) -> Option<Layout> {
     let mut back: Vec<Vec<bool>> = succ.iter().map(|s| vec![false; s.len()]).collect();
     let mut header_loop = vec![usize::MAX; n];
     let mut bodies: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut sources: Vec<Vec<usize>> = Vec::new();
     for &u in &rpo {
         for (k, &v) in succ[u].iter().enumerate() {
             if rpo_num[v] > rpo_num[u] {
@@ -167,14 +168,21 @@ fn structured(cfg: &Cfg) -> Option<Layout> {
             if header_loop[v] == usize::MAX {
                 header_loop[v] = bodies.len();
                 bodies.push((v, vec![v]));
+                sources.push(Vec::new());
             }
-            let l = header_loop[v];
-            let mut work = vec![u];
-            while let Some(x) = work.pop() {
-                if !bodies[l].1.contains(&x) {
-                    bodies[l].1.push(x);
-                    work.extend(preds[x].iter().copied());
-                }
+            sources[header_loop[v]].push(u);
+        }
+    }
+    // each body: what reaches a back edge's source without passing the header
+    let mut stamp = vec![usize::MAX; n];
+    for (l, (h, body)) in bodies.iter_mut().enumerate() {
+        stamp[*h] = l;
+        let mut work = std::mem::take(&mut sources[l]);
+        while let Some(x) = work.pop() {
+            if stamp[x] != l {
+                stamp[x] = l;
+                body.push(x);
+                work.extend(preds[x].iter().copied());
             }
         }
     }

@@ -11,7 +11,7 @@ use crate::cfg::{Block, Cfg, Term};
 use crate::flags::{self, FlagOp};
 use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use crate::fasthash::HashMap;
 use wasm_encoder::{BlockType, Function, Instruction as W, MemArg, ValType};
 
 // Local indices.
@@ -180,20 +180,22 @@ impl<'a> FuncEmit<'a> {
         self.f.instruction(&ins);
     }
 
+    // (the commonest instructions straight into the sink: encoding through
+    // `Instruction` showed in translation profiles)
     pub(crate) fn c(&mut self, v: u32) {
-        self.i(W::I32Const(v as i32));
+        self.f.instructions().i32_const(v as i32);
     }
 
     pub(crate) fn get(&mut self, l: u32) {
-        self.i(W::LocalGet(l));
+        self.f.instructions().local_get(l);
     }
 
     pub(crate) fn set(&mut self, l: u32) {
-        self.i(W::LocalSet(l));
+        self.f.instructions().local_set(l);
     }
 
     pub(crate) fn tee(&mut self, l: u32) {
-        self.i(W::LocalTee(l));
+        self.f.instructions().local_tee(l);
     }
 
     // ---- prologue / epilogue -------------------------------------------------
@@ -3136,7 +3138,7 @@ fn effects_at(cfg: &Cfg, block: &Block, k: usize) -> (u8, u8) {
 
 /// Flags live into and out of each block.
 fn liveness(cfg: &Cfg) -> (HashMap<u32, u8>, HashMap<u32, u8>) {
-    let mut usedef: HashMap<u32, (u8, u8)> = HashMap::new();
+    let mut usedef: HashMap<u32, (u8, u8)> = HashMap::default();
     for (&start, b) in &cfg.blocks {
         let (mut used, mut def) = (0u8, 0u8);
         for k in 0..b.instrs.len() {

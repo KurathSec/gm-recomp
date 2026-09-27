@@ -4,6 +4,7 @@
 //        [--replay target/monitor/<session>.log] (a session the page recorded: its date,
 //        saves and input; `node --cpu-prof` then profiles it)
 //        [--profile from:to [--profile-out file.cpuprofile]] (a CPU profile of these frames only)
+//        [--translation-profile file] (read, then extended with what this run needed)
 import { readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { writeFileSync } from 'node:fs';
@@ -77,7 +78,22 @@ const onFrame = (frame) => {
     session.disconnect();
   }
 };
-const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory), replay: replay.input });
+const tpFile = opt('--translation-profile', null);
+let tp = null;
+if (tpFile) {
+  try {
+    const b = await readFile(tpFile);
+    tp = new Uint32Array(b.buffer, b.byteOffset, b.byteLength >> 2);
+  } catch {}
+}
+const onProfile = (pairs) => {
+  const merged = new Uint32Array((tp?.length ?? 0) + pairs.length);
+  if (tp) merged.set(tp);
+  merged.set(pairs, tp?.length ?? 0);
+  tp = merged;
+};
+const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory), replay: replay.input, profile: tp, onProfile: tpFile ? onProfile : undefined });
+if (tpFile && tp) await writeFile(tpFile, new Uint8Array(tp.buffer, tp.byteOffset, tp.byteLength));
 if (dumpMem) await writeFile(dumpMem, new Uint8Array(guest.buffer));
 console.log(`status ${status}, ${((performance.now() - t) / 1000).toFixed(1)}s total`);
 process.exit(status);

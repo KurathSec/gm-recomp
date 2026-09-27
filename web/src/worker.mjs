@@ -2,7 +2,7 @@
 // Messages to the page: {type: 'log', line} and {type: 'done', status}.
 import { runGame } from './host.mjs';
 import { KEYS } from './keys.mjs';
-import { applySaves, loadSaves, openSaves, storeSaves } from './saves.mjs';
+import { applySaves, loadProfile, loadSaves, openSaves, storeProfile, storeSaves } from './saves.mjs';
 
 let input = null;
 const early = [];
@@ -22,7 +22,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true } = data;
   if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
@@ -58,6 +58,28 @@ self.onmessage = async ({ data }) => {
     }
     // a replayed session starts from its saves
     if (replay) files = applySaves(files, replay.saves);
+    // the translation profile: what earlier sessions needed, and what this one adds
+    let profile = null;
+    let profileDb = null;
+    if (useProfile) {
+      try {
+        profileDb = db ?? (await openSaves());
+        profile = await loadProfile(profileDb, game);
+        if (profile) post(`translation profile: ${profile.length / 2} functions`);
+      } catch (e) {
+        post(`translation profile unavailable: ${e}`);
+        profileDb = null;
+      }
+    }
+    let profileSaving = Promise.resolve();
+    const onProfile = (pairs) => {
+      if (!profileDb) return;
+      const merged = new Uint32Array((profile?.length ?? 0) + pairs.length);
+      if (profile) merged.set(profile);
+      merged.set(pairs, profile?.length ?? 0);
+      profile = merged;
+      profileSaving = profileSaving.then(() => storeProfile(profileDb, game, merged)).catch((e) => post(`storing the translation profile failed: ${e}`));
+    };
     let saving = Promise.resolve();
     const onSave = (changes) => {
       if (db) saving = saving.then(() => storeSaves(db, game, changes)).catch((e) => post(`saving failed: ${e}`));
@@ -93,8 +115,9 @@ self.onmessage = async ({ data }) => {
       : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log
     const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile });
     await saving;
+    await profileSaving;
     self.postMessage({ type: 'done', status });
   } catch (e) {
     post(`error: ${e && e.stack ? e.stack : e}`);
