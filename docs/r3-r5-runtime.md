@@ -253,8 +253,10 @@ the new room's code is translated then).
   and whenever control goes back to the dispatcher, whose `call` (the browser's
   glue, the harness) passes them in and out. Calls hand over no flags (no calling
   convention passes them; the callee's come back through the globals at `ret`, for
-  Delphi's string compares), so flag computations before calls are dead code now,
-  and a function loads only the flags its entry block reads. Counting with
+  Delphi's string compares), except those the callee's entry reads before writing
+  (`cfg::Cfg::call_flags`: the CRT's x87 wrappers test the ZF a previous call left),
+  so most flag computations before calls are dead code, and a function loads only
+  the flags its entry block reads. Counting with
   `GMR_COUNT=1` (per frame with `GMR_FRAME_MS=0`) showed what dominates: a GMS
   death (YoYoYo engine, blood) runs ~830 000 guest calls per frame.
 - x87 fast paths for 64-bit precision when the result is exact (the CRT's modf and
@@ -270,11 +272,76 @@ the new room's code is translated then).
   and by address; `node --cpu-prof web/tools/run-node.mjs ...` profiles the browser
   build by translated function (`f_<address>`).
 
+Measured on recorded play sessions (`?replay=`: 3055 with a death,
+Vandal's seventh floor):
+
+- Block layout (`recomp::layout`): blocks are emitted in a loop-aware topological
+  order (reverse postorder, each natural loop contiguous behind its header) instead
+  of by address, so a forward jump is a `br` out of nested blocks and a back edge a
+  `br` to a wasm `loop`; inlined callees follow their call site. Before, every taken
+  jump went through the function's `br_table` dispatcher (one indirect branch shared
+  by all of them). Irreducible functions keep the address order. A 3055 death frame:
+  dispatcher jumps 2.17 M -> ~100, harness 11.9 -> 9.1 ms.
+- Inline x87 (`lift::x87_inline_form`): loads, stores, fist/fistp, fxch, fchs/fabs,
+  the four operations, compares and fnstsw run the helpers' fast path in the
+  translated function. The block address, TOP and the fast-path conditions are read
+  once per run of x87 code; registers written earlier in the run skip their tag
+  checks; anything a check rejects runs out of line as before, and so does the rest
+  of the run. Exact zero products and quotients stay inline (silent audio samples
+  sent the mixer out of line). Out-of-line x87 per audio frame 307 k -> 73 k of 1 M;
+  GMS's audio thread per frame Chrome 3.45 -> 2.35 ms, Firefox 3.2 -> 2.2 ms.
+- `fldpi` and the other load constants were parsed from decimal strings on every
+  execution (5 % of a Vandal death frame in V8); they are parsed once.
+- Translation profiles: the page keeps, per game (IndexedDB), the functions sessions
+  translated when they ran, with a hash of their first 32 bytes; the next session
+  translates them at its first wait after the first frame (packers have unpacked by
+  then), at most 2 s, skipping any whose code differs (`engine::profile_batch`).
+  3055's room-load frames 76 and 104: ~70 ms -> ~25 ms (the game's own loading),
+  for a ~75 ms burst at frame 10. `?noprofile` turns it off.
+- Ahead translation fits a batch's cost as fixed + per byte (`fit_idle_cost`); the
+  per-byte rate alone had folded in each module's fixed compile cost and overstated
+  small batches threefold, so waits rarely fit a module. 3055 first session: ahead
+  translation 0.19 -> 1.25 s (Firefox), 1.1 k -> 7.6 k functions; frame 76 72 -> 26 ms.
+- Host work per frame: the renderer compares a draw's state word by word (it built a
+  ~60-number string key per draw); `run_threads` reads the host clock only when a
+  thread will run (it was ~1 100 calls out of wasm per frame); the pacing estimate
+  is sorted once per frame; memcpy copies inside guest memory in one step (glue
+  `gcopy`). Firefox, Vandal steady state: busy time -16 %, median 2.50 -> 2.08 ms.
+- Steady state now (second half of the Vandal replay): Firefox median 1.9-2.1 ms,
+  p95 6.2-6.5 ms; Chrome median 1.3 ms, p95 4.6 ms; frame intervals 20.13 ms mean,
+  1.4 ms standard deviation in both. A 3055 death frame: Chrome ~6.4 ms, Firefox
+  ~7.1 ms, of which the audio thread ~2.2-2.4 ms.
+- Diagnostics: `GMR_COUNT=blocks` (hot blocks, and out-of-line x87 instructions with
+  the top address bit flipped), `GMR_API_COUNT=1`, monitor lines with API calls and
+  dispatches per frame, `run-node.mjs --profile from:to` (a CPU profile of a frame
+  range), `run-browser.sh` with `FFPREFS`, `web/memtest/callbench.html` (call
+  costs by kind).
+
+## Importing in the browser
+
+`crates/webimport` (built to `/import/webimport.wasm`) does what the native importer
+does, in memory, for a zip or 7z: unpack (names in UTF-8, Shift-JIS or cp437; a single
+top folder stripped), unwrap an IExpress package (its cabinet, MSZIP or LZX, through
+the `cab` crate), choose the entry exe, detect the runner, and name the system DLLs
+to add, which the page fetches from `/system32/` (`web/tools/system32.sh`: Wine's PE
+builds, debug sections stripped, PE timestamp and checksum kept so imports are
+reproducible) until nothing new is needed. `web/src/import.mjs` drives it; the game
+is stored in IndexedDB (`saves.mjs`, store `games`) and plays with
+`?game=<slug>&local`; `?zip=<url>` imports and starts one. Against the natively
+imported corpus every zip and 7z source gives the same entry, runner and files, and
+3055 and 8309 the same state hashes. RAR archives and NSIS installers still need the
+native importer (7z).
+
 ## Known gaps
 
 - Shaded draws are verified with the test program above, not yet in a game scene.
-- CPUID does not report MMX (MMX is not lifted); code with an SSE or scalar fallback
-  takes it.
+- CPUID does not report MMX (MMX is lifted, for code that uses it without asking);
+  code with an SSE or scalar fallback takes that.
+- GMS 1.4 runs at 49.7-49.9 fps instead of 50: it measures each frame from a
+  timestamp taken after the frame's own clock reads, and every
+  QueryPerformanceCounter advances the virtual clock 1-4 µs (so spin-waits end), so
+  20.03 ms per frame in menus, ~20.13 ms in play. Sub-microsecond steps for reads
+  outside a spin would fix it; it changes every GMS game's state hashes.
 - x87 deviations in rare edges: fsqrt of extended-precision denormals, fidivr with
   precision control 01 (see `r1-cpu.md`).
 - No networking: ws2_32 reports the network as not ready, wininet fails to open; Steam is not loaded.
