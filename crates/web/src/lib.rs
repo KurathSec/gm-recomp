@@ -629,7 +629,7 @@ pub extern "C" fn run() -> i32 {
         },
         format!("state hash: {hash:016x} ({chunks} non-zero 64K chunks)"),
         format!(
-            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.2}s; {} ahead in {} waits, {:.2}s, ~{} ns/byte; profile {} left)  virtual time: {}ms",
+            "frames presented: {}  api calls: {}  dispatches: {}  resolves: {}  translated functions: {} ({:.2}s; {} ahead in {} waits, {:.2}s, ~{} µs + {} ns/byte; profile {} left)  virtual time: {}ms",
             p.frames_presented,
             p.api_calls,
             e.dispatches,
@@ -639,6 +639,7 @@ pub extern "C" fn run() -> i32 {
             e.idle_done,
             e.idle_calls,
             e.idle_us as f64 / 1e6,
+            e.idle_fixed_ns / 1000,
             e.idle_ns_per_byte,
             e.profile.len(),
             p.now_ms()

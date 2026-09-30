@@ -73,6 +73,12 @@ pub struct Engine {
     /// estimate of the time a byte takes (ns).
     pub idle_queue: Option<Vec<(u32, u32)>>,
     pub idle_ns_per_byte: u64,
+    /// Fixed cost of an idle batch (ns): a module's compile and instantiate cost a
+    /// share no matter its size, which a rate per byte alone overstated for small
+    /// batches, so few fit in a wait.
+    pub idle_fixed_ns: u64,
+    /// Recent idle batches (bytes, ns), which the two are fitted to.
+    pub idle_samples: std::collections::VecDeque<(u64, u64)>,
     /// Functions translated code calls directly that are not translated yet: likely
     /// next, so `translate_idle` takes them first (popped from the end).
     pub idle_next: Vec<u32>,
@@ -153,6 +159,8 @@ impl Engine {
             bad_functions: HashSet::default(),
             idle_queue: None,
             idle_ns_per_byte: 0,
+            idle_fixed_ns: 500_000,
+            idle_samples: std::collections::VecDeque::new(),
             idle_next: Vec::new(),
             profile: Vec::new(),
             demand: Vec::new(),
@@ -864,7 +872,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         let e = m.engine();
         e.idle_queue = Some(q);
         if e.idle_ns_per_byte == 0 {
-            e.idle_ns_per_byte = 1000;
+            e.idle_ns_per_byte = 600;
         }
     }
     let mut done = 0;
@@ -898,8 +906,9 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         // compile can exceed it), in modules of 4 to 16 functions (browsers bound how
         // many modules there are); a function too large for the time a wait leaves is
         // left to be translated when it runs
-        let budget_ns = deadline_us.saturating_sub(m.now_us()) * 1000;
-        let per = m.engine_ref().idle_ns_per_byte.max(1) * 3 / 2;
+        // (estimates with a quarter in reserve: a slow compile can exceed them)
+        let budget_ns = (deadline_us.saturating_sub(m.now_us()) * 1000).saturating_sub(m.engine_ref().idle_fixed_ns * 5 / 4);
+        let per = m.engine_ref().idle_ns_per_byte.max(1) * 5 / 4;
         // the next profile entries go when their code is not what the profile saw
         let n = m.engine_ref().profile.len();
         let lo = n.saturating_sub(16);
@@ -984,15 +993,45 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         let _ = translate_batch(m, &batch, batch.len());
         // keep the estimate current (it includes the host's compile and instantiate):
         // up halfway (one slow compile should not stop it for good), down slowly
-        let took = (m.now_us() - t) * 1000 / bytes.max(1);
+        let took = (m.now_us() - t) * 1000;
         let e = m.engine();
-        e.idle_ns_per_byte = if took > e.idle_ns_per_byte { (e.idle_ns_per_byte + took) / 2 } else { (e.idle_ns_per_byte * 7 + took) / 8 };
+        e.idle_samples.push_back((bytes, took));
+        if e.idle_samples.len() > 32 {
+            e.idle_samples.pop_front();
+        }
+        fit_idle_cost(e);
         done += batch.len();
     }
     let e = m.engine();
     e.idle_calls += 1;
     e.idle_done += done;
     done
+}
+
+/// Fits `idle_fixed_ns` + `idle_ns_per_byte` × bytes to the recent idle batches
+/// (least squares), keeping both in sane bounds; with too few samples or sizes too
+/// alike for a slope, the rate follows the batches' average with the fixed cost.
+fn fit_idle_cost(e: &mut Engine) {
+    let n = e.idle_samples.len() as f64;
+    if n < 1.0 {
+        return;
+    }
+    let (sb, st) = e.idle_samples.iter().fold((0.0, 0.0), |(b, t), &(x, y)| (b + x as f64, t + y as f64));
+    let (mb, mt) = (sb / n, st / n);
+    let (mut cov, mut var) = (0.0, 0.0);
+    for &(x, y) in &e.idle_samples {
+        cov += (x as f64 - mb) * (y as f64 - mt);
+        var += (x as f64 - mb) * (x as f64 - mb);
+    }
+    let (fixed, per) = if n >= 6.0 && var > 0.0 && cov > 0.0 {
+        let per = cov / var;
+        (mt - per * mb, per)
+    } else {
+        let fixed = e.idle_fixed_ns as f64;
+        (fixed, (mt - fixed).max(0.0) / mb.max(1.0))
+    };
+    e.idle_ns_per_byte = (per as u64).clamp(100, 20_000);
+    e.idle_fixed_ns = (fixed.max(0.0) as u64).clamp(100_000, 3_000_000);
 }
 
 /// `translate_idle`, with its host time counted (`Engine::idle_us`).
