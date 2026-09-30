@@ -101,6 +101,8 @@ pub struct Engine {
     pub dispatches: u64,
     /// API calls so far (as the process's count, but readable while it is lent out).
     pub api_calls: u64,
+    /// Calls per API id, when wanted (debugging; `GMR_API_COUNT` in the harness).
+    pub api_hist: Option<Vec<u64>>,
     /// `rt.resolve` calls that found a translated function (indirect and cross-module
     /// calls).
     pub resolves: u64,
@@ -176,6 +178,7 @@ impl Engine {
             thread_us: 0,
             idle_us: 0,
             api_calls: 0,
+            api_hist: None,
             inline_cache: None,
             monitor: false,
         }
@@ -460,6 +463,12 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
         (e.trace, e.depth, e.max_api_calls)
     };
     m.engine().api_calls += 1;
+    if let Some(h) = m.engine().api_hist.as_mut() {
+        if h.len() <= id.0 as usize {
+            h.resize(id.0 as usize + 1, 0);
+        }
+        h[id.0 as usize] += 1;
+    }
     let (func, nargs, pop, calls) = {
         let Some(p) = m.engine().p.as_mut() else { return stop(m, "process not available".into()) };
         p.api_calls += 1;

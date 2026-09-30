@@ -563,7 +563,7 @@ fn dev_present(c: &mut Ctx) -> ApiResult {
     let n = c.p.frames_presented;
     let draws = c.p.draw_calls;
     c.p.draw_calls = 0;
-    c.p.log(format!("Present #{n} ({draws} draw calls, t={}ms)", c.p.now_ms()));
+    c.p.log(format!("Present #{n} ({draws} draw calls, t={}ms, {} µs)", c.p.now_ms(), c.p.clock_us));
     let (src, dst, hwnd) = (c.arg(1), c.arg(2), c.arg(3));
     let (bw, bh) = c.p.d3d9.backbuffer;
     let rect = |c: &Ctx, p: u32| {

@@ -400,6 +400,10 @@ pub fn run(opts: RunOpts) -> Result<()> {
     eng.count = std::env::var_os("GMR_COUNT").is_some();
     // GMR_COUNT=blocks: as top, by block
     eng.count_blocks = std::env::var("GMR_COUNT").is_ok_and(|v| v == "blocks");
+    // GMR_API_COUNT=1: calls per API (the most called at the end).
+    if std::env::var_os("GMR_API_COUNT").is_some() {
+        eng.api_hist = Some(Vec::new());
+    }
     // GMR_FPU_PROFILE=1: count x87 instructions by mnemonic.
     if std::env::var_os("GMR_FPU_PROFILE").is_some() {
         eng.fpu_profile = Some(Default::default());
@@ -532,6 +536,12 @@ pub fn run(opts: RunOpts) -> Result<()> {
             p.now_ms()
         );
         eprintln!("x87 instructions via rt.fpu: {}", e.fpu_ops);
+        if let Some(h) = &e.api_hist {
+            let mut v: Vec<(u64, usize)> = h.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| (*n, i)).collect();
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            let top: Vec<String> = v.iter().take(25).map(|(n, i)| format!("{} {n}", p.registry.entries[*i].clone_name())).collect();
+            eprintln!("most called APIs: {}", top.join(", "));
+        }
         if let Some(h) = &e.fpu_profile {
             let mut forms: std::collections::HashMap<iced_x86::Code, u64> = Default::default();
             for (&(form, _), &n) in h {
