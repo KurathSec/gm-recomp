@@ -54,6 +54,12 @@ pub trait Guest {
     fn write_u64(&mut self, addr: u32, v: u64) -> Result<(), Fault> {
         self.write(addr, &v.to_le_bytes())
     }
+    /// Copies `size` bytes from `src` to `dst` (overlapping ranges as memmove).
+    fn copy_within(&mut self, dst: u32, src: u32, size: u32) -> Result<(), Fault> {
+        let mut buf = vec![0u8; size as usize];
+        self.read(src, &mut buf)?;
+        self.write(dst, &buf)
+    }
     fn fill(&mut self, addr: u32, size: u32, byte: u8) -> Result<(), Fault> {
         let chunk = vec![byte; 65536];
         let mut done = 0;

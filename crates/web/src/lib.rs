@@ -171,10 +171,12 @@ struct Glue {
     /// Calls the translated function at a table index with the registers in the
     /// globals, and puts the ones it returns there.
     call: extern "C" fn(u32),
+    /// gcopy(dst, src, len) within guest memory.
+    gcopy: extern "C" fn(u32, u32, u32),
 }
 
 /// Export order of the glue accessors; JS places them in the table in this order.
-const GLUE_FUNCS: [&str; 10] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call"];
+const GLUE_FUNCS: [&str; 11] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call", "gcopy"];
 
 struct State {
     engine: Option<Engine>,
@@ -252,6 +254,16 @@ impl Guest for Web {
             return Err(Fault { addr, write: true });
         }
         (glue().fill)(addr, byte as u32, size);
+        Ok(())
+    }
+    fn copy_within(&mut self, dst: u32, src: u32, size: u32) -> Result<(), Fault> {
+        if !self.in_bounds(src, size as usize) {
+            return Err(Fault { addr: src, write: false });
+        }
+        if !self.in_bounds(dst, size as usize) {
+            return Err(Fault { addr: dst, write: true });
+        }
+        (glue().gcopy)(dst, src, size);
         Ok(())
     }
 }
@@ -470,6 +482,12 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     f.instruction(&I::End);
     code.function(&f);
 
+    // gcopy(dst, src, len): within guest memory
+    funcs.function(0);
+    let mut f = Function::new([]);
+    f.instruction(&I::LocalGet(0)).instruction(&I::LocalGet(1)).instruction(&I::LocalGet(2)).instruction(&I::MemoryCopy { src_mem: 1, dst_mem: 1 }).instruction(&I::End);
+    code.function(&f);
+
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_NAME, ExportKind::Memory, 1);
     for (i, (_, name, _)) in GLOBALS.iter().enumerate() {
@@ -538,6 +556,7 @@ pub extern "C" fn glue_install(base: u32) {
             vget: std::mem::transmute(f(7)),
             vset: std::mem::transmute(f(8)),
             call: std::mem::transmute(f(9)),
+            gcopy: std::mem::transmute(f(10)),
         });
     }
 }

@@ -28,6 +28,18 @@ const RS = { ZENABLE: 7, FILLMODE: 8, ZWRITEENABLE: 14, ALPHATESTENABLE: 15, SRC
 const TSS = { COLOROP: 1, COLORARG1: 2, COLORARG2: 3, ALPHAOP: 4, ALPHAARG1: 5, ALPHAARG2: 6, ADDRESSU: 13, ADDRESSV: 14,
   MAGFILTER: 16, MINFILTER: 17, MIPFILTER: 18 };
 
+// DrawCall words whose change ends a batch (everything but the vertices; the
+// transforms, D.world to D.proj + 16, only for untransformed vertices).
+const KEY_WORDS = Int32Array.from([
+  D.texture, D.texture + 1, D.targetW, D.targetH, ...[0, 1, 2, 3, 4, 5].map((i) => D.viewport + i),
+  ...[RS.ZENABLE, RS.ZWRITEENABLE, RS.ALPHATESTENABLE, RS.SRCBLEND, RS.DESTBLEND, RS.CULLMODE, RS.ZFUNC, RS.ALPHAREF,
+    RS.ALPHAFUNC, RS.ALPHABLENDENABLE, RS.FOGENABLE, RS.FOGCOLOR, RS.FOGTABLEMODE, RS.FOGSTART, RS.FOGEND, RS.FOGDENSITY,
+    RS.TEXTUREFACTOR, RS.FOGVERTEXMODE, RS.COLORWRITEENABLE, RS.BLENDOP, RS.SEPARATEALPHABLENDENABLE, RS.SRCBLENDALPHA,
+    RS.DESTBLENDALPHA, RS.BLENDOPALPHA].map((i) => D.rs + i),
+  ...[1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18].flatMap((i) => [D.tss0 + i, D.tss1 + i]),
+]);
+const MATRIX_WORDS = D.proj + 16 - D.world;
+
 // Canonical batch vertex: x y z w | diffuse | specular | u0 v0 | u1 v1 (10 words)
 const VW = 10;
 const MAX_BATCH = 65536 * 3;
@@ -224,7 +236,12 @@ export class D3DGL {
     this.bu = new Uint32Array(this.batch);
     this.count = 0;
     this.mode = gl.TRIANGLES;
-    this.key = '';
+    // the state the batch was drawn with (draw): mode, rhw and KEY_WORDS then the
+    // transforms; `keyValid` false when the GL state may differ from it
+    this.keyValid = false;
+    this.keyMode = 0;
+    this.keyRhw = false;
+    this.keyWords = new Uint32Array(KEY_WORDS.length + MATRIX_WORDS);
     this.textures = new Map(); // id -> {tex, w, h, levels, uploaded, params, fbo, depth}
     this.white = this.makeTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.white);
@@ -348,7 +365,7 @@ export class D3DGL {
     }
     gl.clear(bits);
     gl.disable(gl.SCISSOR_TEST);
-    this.key = '';
+    this.keyValid = false;
   }
 
   /** One DrawCall record at `ptr` in runtime memory. */
@@ -360,21 +377,18 @@ export class D3DGL {
     const mode = prim === 1 ? this.gl.POINTS : prim <= 3 ? this.gl.LINES : this.gl.TRIANGLES;
     const fvf = w[D.fvf];
     const rhw = (fvf & 0xe) === 0x4;
-    // State that ends a batch: everything except the vertices.
-    const rs = (i) => w[D.rs + i];
-    const t0 = (i) => w[D.tss0 + i];
-    const t1 = (i) => w[D.tss1 + i];
-    let key = `${mode}|${rhw}|${w[D.texture]}|${w[D.texture + 1]}|${w[D.targetW]}x${w[D.targetH]}|`;
-    for (let i = 0; i < 6; i++) key += f[D.viewport + i] + ',';
-    for (const i of [RS.ZENABLE, RS.ZWRITEENABLE, RS.ALPHATESTENABLE, RS.SRCBLEND, RS.DESTBLEND, RS.CULLMODE, RS.ZFUNC, RS.ALPHAREF,
-      RS.ALPHAFUNC, RS.ALPHABLENDENABLE, RS.FOGENABLE, RS.FOGCOLOR, RS.FOGTABLEMODE, RS.FOGSTART, RS.FOGEND, RS.FOGDENSITY,
-      RS.TEXTUREFACTOR, RS.FOGVERTEXMODE, RS.COLORWRITEENABLE, RS.BLENDOP, RS.SEPARATEALPHABLENDENABLE, RS.SRCBLENDALPHA,
-      RS.DESTBLENDALPHA, RS.BLENDOPALPHA]) key += rs(i) + ',';
-    for (const i of [1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18]) key += t0(i) + ',' + t1(i) + ',';
-    if (!rhw) for (let i = D.world; i < D.proj + 16; i++) key += w[i] + ',';
-    if (key !== this.key || this.count + 6 * w[D.vertexCount] > MAX_BATCH) {
+    // the same state as the batch so far (compared word by word: every draw asks)
+    const k = this.keyWords;
+    let same = this.keyValid && this.keyMode === mode && this.keyRhw === rhw;
+    for (let i = 0; same && i < KEY_WORDS.length; i++) same = w[KEY_WORDS[i]] === k[i];
+    if (!rhw) for (let i = 0; same && i < MATRIX_WORDS; i++) same = w[D.world + i] === k[KEY_WORDS.length + i];
+    if (!same || this.count + 6 * w[D.vertexCount] > MAX_BATCH) {
       this.flush();
-      this.key = key;
+      this.keyValid = true;
+      this.keyMode = mode;
+      this.keyRhw = rhw;
+      for (let i = 0; i < KEY_WORDS.length; i++) k[i] = w[KEY_WORDS[i]];
+      k.set(w.subarray(D.world, D.world + MATRIX_WORDS), KEY_WORDS.length);
       this.applyState(w, f, mode, rhw);
     }
     this.appendVertices(w, prim);
@@ -507,7 +521,7 @@ export class D3DGL {
       off += sz === 0 ? 8 : sz === 1 ? 12 : sz === 2 ? 16 : 4;
     }
     const rhw = posKind === 0x4;
-    const put = (vi) => {
+    let put = (vi) => {
       const p = base + vi * stride;
       const o = this.count * VW;
       this.bf[o] = g8.getFloat32(p, true);
@@ -522,6 +536,31 @@ export class D3DGL {
       this.bf[o + 9] = uv.length > 1 ? g8.getFloat32(p + uv[1] + 4, true) : this.bf[o + 7];
       this.count++;
     };
+    // Vertices at 4-byte boundaries (nearly all): word views instead of a DataView
+    if (((base | stride | Math.max(diffuse, 0) | Math.max(specular, 0) | uv.reduce((a, b) => a | b, 0)) & 3) === 0) {
+      if (this.gbuf !== buf) {
+        this.gbuf = buf;
+        this.gf = new Float32Array(buf);
+        this.gu = new Uint32Array(buf);
+      }
+      const gf = this.gf, gu = this.gu, bf = this.bf, bu = this.bu;
+      const sw = stride >> 2, dw = diffuse >> 2, sp = specular >> 2, u0 = uv.length > 0 ? uv[0] >> 2 : -1, u1 = uv.length > 1 ? uv[1] >> 2 : -1;
+      put = (vi) => {
+        const p = (base >> 2) + vi * sw;
+        const o = this.count * VW;
+        bf[o] = gf[p];
+        bf[o + 1] = gf[p + 1];
+        bf[o + 2] = gf[p + 2];
+        bf[o + 3] = rhw ? gf[p + 3] : 1;
+        bu[o + 4] = dw >= 0 ? gu[p + dw] : 0xffffffff;
+        bu[o + 5] = sp >= 0 ? gu[p + sp] : 0;
+        bf[o + 6] = u0 >= 0 ? gf[p + u0] : 0;
+        bf[o + 7] = u0 >= 0 ? gf[p + u0 + 1] : 0;
+        bf[o + 8] = u1 >= 0 ? gf[p + u1] : bf[o + 6];
+        bf[o + 9] = u1 >= 0 ? gf[p + u1 + 1] : bf[o + 7];
+        this.count++;
+      };
+    }
     const n = w[D.primCount];
     const ip = w[D.indices];
     const isz = w[D.indexSize];
@@ -572,7 +611,7 @@ export class D3DGL {
     gl.colorMask(true, true, true, true);
     gl.blitFramebuffer(sx, sy, sx + sw, sy + sh, dx, dy, dx + dw, dy + dh, gl.COLOR_BUFFER_BIT, linear ? gl.LINEAR : gl.NEAREST);
     this.bindTarget(this.target, this.targetW, this.targetH);
-    this.key = '';
+    this.keyValid = false;
   }
 
   /** GetRenderTargetData: target pixels into guest memory as B, G, R, A bytes. */
@@ -745,7 +784,7 @@ export class D3DGL {
     gl.useProgram(this.prog);
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
-    this.key = '';
+    this.keyValid = false;
   }
 
   /** The back buffer as a PNG (ArrayBuffer). */
@@ -784,7 +823,7 @@ export class D3DGL {
     // Stored rows are D3D rows: source row y is at the top of the canvas.
     gl.blitFramebuffer(x, y, x + w, y + h, 0, dh, dw, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     this.bindTarget(this.target, this.targetW, this.targetH);
-    this.key = '';
+    this.keyValid = false;
     this.frames++;
   }
 

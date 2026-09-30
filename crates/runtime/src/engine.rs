@@ -375,6 +375,11 @@ impl<M: Machine> Host for M {
     }
 
     fn run_threads(&mut self, p: &mut Process) {
+        // (timed only when a thread will run: this is asked a thousand times a frame,
+        // and reading the host clock is a call out to it)
+        if !threads_ready(p) {
+            return;
+        }
         let t = self.now_us();
         run_threads(self, p);
         let dt = self.now_us() - t;
@@ -1003,14 +1008,15 @@ pub fn translate_all<M: Machine>(m: &mut M, chunk: usize) -> Result<usize, Strin
 }
 
 pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
+    // (API stubs first: most calls that get here are API calls)
+    if let Some(id) = Process::stub_id(addr) {
+        call_api(m, id);
+        return Ok(m.engine_ref().nop_index);
+    }
     if let Some(&i) = m.engine_ref().funcs.get(&addr) {
         m.engine().resolves += 1;
         cache_resolved(m, addr, i);
         return Ok(i);
-    }
-    if let Some(id) = Process::stub_id(addr) {
-        call_api(m, id);
-        return Ok(m.engine_ref().nop_index);
     }
     if (RET_TO_HOST..RET_TO_HOST + 0x1000).contains(&addr) {
         return Err(format!("guest returned to a host frame marker {addr:#x} that is not the innermost one"));
@@ -1240,11 +1246,13 @@ fn run_slice<M: Machine>(m: &mut M) -> Result<SliceEnd, String> {
 
 /// Runs every secondary thread that can run now (from the main thread's blocking
 /// points), each until it blocks again. The main thread's registers are kept.
+/// Whether `run_threads` has a thread to run.
+fn threads_ready(p: &mut Process) -> bool {
+    p.current == 0 && !p.in_scheduler && (1..p.threads.len()).any(|i| crate::hle::threads::ready(p, i, false))
+}
+
 pub fn run_threads<M: Machine>(m: &mut M, p: &mut Process) {
-    if p.current != 0 || p.in_scheduler || p.threads.len() < 2 {
-        return;
-    }
-    if !(1..p.threads.len()).any(|i| crate::hle::threads::ready(p, i, false)) {
+    if !threads_ready(p) {
         return;
     }
     p.in_scheduler = true;

@@ -37,14 +37,13 @@ pub(crate) const L_MM: u32 = 30; // MMX register access: x87 block address, mant
 pub(crate) const L_MQ: u32 = 31;
 // Inline x87 (`x87_inline_form`): the block's address, TOP and what may run inline
 // (`fpu::block::FAST` bits, `X87_QUICK`; 0 after a fallback), as read at the last
-// sync; a register's slot; f64 operands and result.
+// sync; f64 operands and result.
 pub(crate) const L_XF: u32 = 32;
 pub(crate) const L_XT: u32 = 33;
 pub(crate) const L_XQ: u32 = 34;
-pub(crate) const L_XP: u32 = 35;
-pub(crate) const L_XA: u32 = 36;
-pub(crate) const L_XB: u32 = 37;
-pub(crate) const L_XR: u32 = 38;
+pub(crate) const L_XA: u32 = 35;
+pub(crate) const L_XB: u32 = 36;
+pub(crate) const L_XR: u32 = 37;
 /// Locals after the parameters: the eight registers are the function's parameters
 /// (locals 0..7) and its results (`types::FUNC`).
 pub const LOCALS: [(u32, ValType); 8] = [
@@ -54,7 +53,7 @@ pub const LOCALS: [(u32, ValType); 8] = [
     (2, ValType::V128),
     (1, ValType::I32),
     (1, ValType::I64),
-    (4, ValType::I32),
+    (3, ValType::I32),
     (3, ValType::F64),
 ];
 /// `L_XQ` bit: the precision flag is set and rounding is to nearest (with C1 dead,

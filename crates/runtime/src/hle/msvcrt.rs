@@ -520,8 +520,11 @@ pub fn register(r: &mut Registry) {
     r.alias(m, "??_V@YAXPAX@Z", m, "free");
     r.add(m, "memcpy", |c| {
         let (d, s, n) = (c.arg(0), c.arg(1), c.arg(2));
-        let data = read_bytes(c, s, n);
-        let _ = c.host.write(d, &data);
+        if c.host.copy_within(d, s, n).is_err() {
+            // (a range that faults: what can be read, as before)
+            let data = read_bytes(c, s, n);
+            let _ = c.host.write(d, &data);
+        }
         ok(d)
     });
     r.alias(m, "memmove", m, "memcpy");

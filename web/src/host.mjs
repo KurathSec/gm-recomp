@@ -4,7 +4,7 @@
 
 import { D3DGL } from './gpu.mjs';
 
-const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call'];
+const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call', 'gcopy'];
 const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 
 /**
@@ -161,10 +161,15 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   };
   // Recent guest time per frame, for the next frame's start.
   const recent = [];
+  // (asked at every wait: sorted once per frame)
+  let estimated = null;
   const estimate = () => {
     if (!recent.length) return 4;
-    const s = [...recent].sort((a, b) => a - b);
-    return s[Math.floor(s.length * 0.9)];
+    if (estimated === null) {
+      const s = [...recent].sort((a, b) => a - b);
+      estimated = s[Math.floor(s.length * 0.9)];
+    }
+    return estimated;
   };
   const MARGIN_MS = 2;
   let prevClock;
@@ -236,6 +241,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         frameMs.push(busy);
         recent.push(busy);
         if (recent.length > 60) recent.shift();
+        estimated = null;
       }
       return busy;
     };
