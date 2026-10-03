@@ -776,7 +776,10 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
                 queue.extend(tr.direct_targets(a));
             }
         }
-        if let Some(md) = entries.first().and_then(|&e| mods.iter().find(|md| e >= md.base && e < md.base + md.size)).filter(|_| tr.len() < fill) {
+        // then neighbours, unless ahead translation runs (the host waits for real
+        // time): it gets to them, and the call that is waiting does not pay for them
+        let neighbours = m.engine_ref().idle_calls == 0;
+        if let Some(md) = entries.first().and_then(|&e| mods.iter().find(|md| e >= md.base && e < md.base + md.size)).filter(|_| tr.len() < fill && neighbours) {
             let at = md.sorted.partition_point(|&a| a < entries[0]);
             let after = md.sorted[at..].iter();
             let before = md.sorted[..at].iter().rev();
