@@ -502,20 +502,25 @@
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.
         const gameKeys = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|Digit|Escape|Numpad|Page|Home|End|Insert|Delete)/;
+        const held = new Map(); // code -> NumLock state it went down with
         for (const type of ['keydown', 'keyup']) {
           window.addEventListener(type, (e) => {
             if (e.target instanceof HTMLInputElement) return;
             if (gameKeys.test(e.code) && !e.metaKey && e.code !== 'F11') e.preventDefault();
             if (e.repeat) return;
             const numlock = e.getModifierState ? e.getModifierState('NumLock') : true;
+            if (type === 'keydown') held.set(e.code, numlock);
+            else held.delete(e.code);
             sendKey(e.code, type === 'keydown', numlock, performance.timeOrigin + e.timeStamp);
           });
         }
-        window.addEventListener('blur', () => {
-          // Releasing everything avoids keys stuck down after switching away.
-          for (const code of ['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space', 'KeyZ', 'KeyX', 'KeyR', 'KeyS'])
-            sendKey(code, false, true);
-        });
+        // Keys held while the page loses focus never see their keyup: release them then.
+        const releaseHeld = () => {
+          for (const [code, numlock] of held) sendKey(code, false, numlock);
+          held.clear();
+        };
+        window.addEventListener('blur', releaseHeld);
+        document.addEventListener('visibilitychange', () => document.hidden && releaseHeld());
         const mouse = (e) => {
           const r = screen.getBoundingClientRect();
           const buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
