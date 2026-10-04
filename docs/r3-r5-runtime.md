@@ -320,17 +320,17 @@ Vandal's seventh floor):
 ## Importing in the browser
 
 `crates/webimport` (built to `/import/webimport.wasm`) does what the native importer
-does, in memory, for a zip or 7z: unpack (names in UTF-8, Shift-JIS or cp437; a single
-top folder stripped), unwrap an IExpress package (its cabinet, MSZIP or LZX, through
-the `cab` crate), choose the entry exe, detect the runner, and name the system DLLs
+does, in memory, for a zip, 7z or RAR (`sevenz-rust2`, `rars`): unpack (names in UTF-8,
+Shift-JIS or cp437; a single top folder stripped), unwrap an IExpress package (its
+cabinet, MSZIP or LZX, each folder decompressed once), choose the entry exe, detect the runner, and name the system DLLs
 to add, which the page fetches from `/system32/` (`web/tools/system32.sh`: Wine's PE
 builds, debug sections stripped, PE timestamp and checksum kept so imports are
 reproducible) until nothing new is needed. `web/src/import.mjs` drives it; the game
 is stored in IndexedDB (`saves.mjs`, store `games`) and plays with
 `?game=<slug>&local`; `?zip=<url>` imports and starts one. Against the natively
-imported corpus every zip and 7z source gives the same entry, runner and files, and
-3055 and 8309 the same state hashes. RAR archives and NSIS installers still need the
-native importer (7z).
+imported corpus every zip, 7z and RAR source gives the same entry, runner and files
+(byte for byte where checked), and 3055, 8309, Crimson Needle 3 and Campaign (RAR)
+the same state hashes. NSIS installers still need the native importer (7z).
 
 ## Known gaps
 

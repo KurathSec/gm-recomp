@@ -39,9 +39,8 @@ saves are kept in the browser (export/import from the game page).
 
 Games can also be imported in the browser, from the archive they are stored as:
 "Import a game…" on the page, or `?zip=<url>` (for example a link to the archive in
-object storage), which imports and starts it. A zip or 7z works, with an IExpress
-package inside unwrapped (RAR archives and NSIS installers still need the native
-importer). The game is kept in the browser and plays with `?game=<slug>&local`.
+object storage), which imports and starts it. A zip, 7z or RAR works, with an
+IExpress package inside unwrapped (NSIS installers still need the native importer). The game is kept in the browser and plays with `?game=<slug>&local`.
 This needs two extra builds:
 
 ```sh

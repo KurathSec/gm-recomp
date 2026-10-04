@@ -1,6 +1,6 @@
-//! Importing a game in the browser from the archive it is stored as (a zip): what the
-//! native `importer` does, in memory. It unpacks the zip (names in UTF-8, Shift-JIS or
-//! cp437; a single shared top folder stripped), unwraps an IExpress package (its
+//! Importing a game in the browser from the archive it is stored as (zip, 7z or RAR):
+//! what the native `importer` does, in memory. It unpacks the archive (names in UTF-8,
+//! Shift-JIS or cp437; a single shared top folder stripped), unwraps an IExpress package (its
 //! cabinet, MSZIP or LZX), picks the entry exe, identifies the runner and names the
 //! system DLLs the game's modules need that it neither ships nor the runtime
 //! emulates. The page fetches those, adds them under C/Windows/system32 and asks
@@ -168,14 +168,47 @@ pub fn read_7z(data: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String>
     }
 }
 
-/// Unpacks an archive (zip or 7z, by content: renamed ones are common) into a game:
+/// A RAR archive's files and folders (RAR 1.3 to 7, through `rars`), as `read_zip`
+/// gives them.
+pub fn read_rar(data: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String> {
+    use std::sync::{Arc, Mutex};
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let archive = rars::ArchiveReader::read(data).map_err(|e| format!("RAR: {e}"))?;
+    let mut entries: Vec<(String, bool, Arc<Mutex<Vec<u8>>>)> = Vec::new();
+    archive
+        .extract_to(None, |meta| {
+            let name = if meta.name_is_unicode { String::from_utf8_lossy(&meta.name).into_owned() } else { decode_name(&meta.name, false) };
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            entries.push((name, meta.is_directory, buf.clone()));
+            Ok(Box::new(Sink(buf)) as Box<dyn std::io::Write>)
+        })
+        .map_err(|e| format!("RAR: {e}"))?;
+    let mut out = Vec::new();
+    for (name, is_dir, buf) in entries {
+        let parts = safe_parts(&name).filter(|p| !p.is_empty()).ok_or_else(|| format!("unsafe RAR entry name {name:?}"))?;
+        let data = std::mem::take(&mut *buf.lock().unwrap());
+        out.push((parts, is_dir, data));
+    }
+    Ok(out)
+}
+
+/// Unpacks an archive (zip, 7z or RAR, by content: renamed ones are common) into a game:
 /// files with a single shared top folder stripped (its name is the title then), an
 /// IExpress package unwrapped.
 pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     let entries = if archive.starts_with(b"7z\xbc\xaf\x27\x1c") {
         read_7z(archive)?
     } else if archive.starts_with(b"Rar!") {
-        return Err("RAR archives cannot be imported in the browser yet (repack it as a zip or 7z)".into());
+        read_rar(archive)?
     } else {
         read_zip(archive)?
     };

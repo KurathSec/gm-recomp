@@ -1,4 +1,4 @@
-// Importing a game in the browser from its archive (a zip or 7z, as games are stored):
+// Importing a game in the browser from its archive (zip, 7z or RAR, as games are stored):
 // webimport.wasm (crates/webimport) unpacks it, unwraps an IExpress package, picks the
 // entry exe and lists the system DLLs to add; those come from /system32/ (see
 // tools/system32.sh). Imported games live in IndexedDB (saves.mjs `storeGame`) and

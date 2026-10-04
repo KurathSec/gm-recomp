@@ -85,7 +85,7 @@
       <h1>gm<span>recomp</span></h1>
       <p class="lede">GameMaker games, recompiled from their original executables to run in the browser.</p>
       <p class="import">
-        <label class="button" title="A zip or 7z of the game as it was released (an IExpress package inside is unwrapped)">Import a game…<input id="importgame" type="file" accept=".zip,.7z,application/zip,application/x-7z-compressed" hidden /></label>
+        <label class="button" title="A zip, 7z or RAR of the game as it was released (an IExpress package inside is unwrapped)">Import a game…<input id="importgame" type="file" accept=".zip,.7z,.rar,application/zip,application/x-7z-compressed,application/vnd.rar" hidden /></label>
         <span id="importstatus"></span>
       </p>
       <ul id="localgames"></ul>
@@ -126,7 +126,7 @@
       // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
       // &replay=<session>: plays a recorded session again (its date, saves and input)
       // &noprofile: no translation profile (functions earlier sessions needed, translated ahead)
-      // ?zip=<url>: imports the game in that archive (zip or 7z) into this browser and plays it;
+      // ?zip=<url>: imports the game in that archive (zip, 7z or RAR) into this browser and plays it;
       // &local plays a game imported in this browser
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
