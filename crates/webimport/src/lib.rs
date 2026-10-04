@@ -204,6 +204,115 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     Ok(game)
 }
 
+/// A cabinet's files (name with '/' separators, contents). Each folder (a solid
+/// stream, MSZIP or LZX) is decompressed once and the files cut out of it; reading
+/// them one at a time decompressed the folder from its start for each.
+pub fn read_cab(c: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let bad = || "truncated or damaged cabinet".to_string();
+    let u8_at = |o: usize| c.get(o).copied().ok_or_else(bad);
+    let u16_at = |o: usize| c.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])).ok_or_else(bad);
+    let u32_at = |o: usize| c.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or_else(bad);
+    if !c.starts_with(b"MSCF") {
+        return Err("not a cabinet".into());
+    }
+    let files_at = u32_at(16)? as usize;
+    let (n_folders, n_files, flags) = (u16_at(26)? as usize, u16_at(28)? as usize, u16_at(30)?);
+    if flags & 3 != 0 {
+        return Err("a cabinet spanning several files".into());
+    }
+    let mut at = 36;
+    let (mut folder_reserve, mut data_reserve) = (0, 0);
+    if flags & 4 != 0 {
+        let header_reserve = u16_at(36)? as usize;
+        folder_reserve = u8_at(38)? as usize;
+        data_reserve = u8_at(39)? as usize;
+        at = 40 + header_reserve;
+    }
+    // folders: (first data block, blocks, compression)
+    let mut folders = Vec::new();
+    for _ in 0..n_folders {
+        folders.push((u32_at(at)? as usize, u16_at(at + 4)? as usize, u16_at(at + 6)?));
+        at += 8 + folder_reserve;
+    }
+    // files: (name, size, offset in its folder, folder)
+    let mut files = Vec::new();
+    let mut at = files_at;
+    for _ in 0..n_files {
+        let (size, offset, folder, attribs) = (u32_at(at)? as usize, u32_at(at + 4)? as usize, u16_at(at + 8)? as usize, u16_at(at + 14)?);
+        let end = at + 16 + c.get(at + 16..).ok_or_else(bad)?.iter().position(|&b| b == 0).ok_or_else(bad)?;
+        files.push((decode_name(&c[at + 16..end], attribs & 0x80 != 0).replace('\\', "/"), size, offset, folder));
+        at = end + 1;
+    }
+    let mut out = Vec::new();
+    for (fi, &(first, blocks, ctype)) in folders.iter().enumerate() {
+        if !files.iter().any(|f| f.3 == fi) {
+            continue;
+        }
+        let mut stream = Vec::new();
+        let mut lzx = match ctype & 0xf {
+            3 => {
+                use lzxd::WindowSize as W;
+                let w = match (ctype >> 8) & 0x1f {
+                    15 => W::KB32,
+                    16 => W::KB64,
+                    17 => W::KB128,
+                    18 => W::KB256,
+                    19 => W::KB512,
+                    20 => W::MB1,
+                    21 => W::MB2,
+                    22 => W::MB4,
+                    23 => W::MB8,
+                    24 => W::MB16,
+                    25 => W::MB32,
+                    b => return Err(format!("LZX window of 2^{b} bytes")),
+                };
+                Some(lzxd::Lzxd::new(w))
+            }
+            0 | 1 => None,
+            t => return Err(format!("compression type {t} (Quantum) is not supported")),
+        };
+        let mut inflate = flate2::Decompress::new(false);
+        let mut at = first;
+        for _ in 0..blocks {
+            let (packed, unpacked) = (u16_at(at + 4)? as usize, u16_at(at + 6)? as usize);
+            let data = c.get(at + 8 + data_reserve..at + 8 + data_reserve + packed).ok_or_else(bad)?;
+            at += 8 + data_reserve + packed;
+            match (ctype & 0xf, lzx.as_mut()) {
+                (_, Some(l)) => stream.extend_from_slice(l.decompress_next(data, unpacked).map_err(|e| format!("LZX: {e}"))?),
+                (0, None) => stream.extend_from_slice(data),
+                _ => {
+                    // MSZIP: "CK", then a deflate stream that may refer back into the
+                    // previous block (up to 32 KiB), given to it as a stored block
+                    if !data.starts_with(b"CK") {
+                        return Err("MSZIP block without its signature".into());
+                    }
+                    inflate.reset(false);
+                    let dict = &stream[stream.len().saturating_sub(0x8000)..];
+                    if !dict.is_empty() {
+                        let mut chunk = vec![0u8];
+                        chunk.extend_from_slice(&(dict.len() as u16).to_le_bytes());
+                        chunk.extend_from_slice(&(!(dict.len() as u16)).to_le_bytes());
+                        chunk.extend_from_slice(dict);
+                        let mut sink = Vec::with_capacity(dict.len());
+                        inflate.decompress_vec(&chunk, &mut sink, flate2::FlushDecompress::Sync).map_err(|e| format!("MSZIP: {e}"))?;
+                    }
+                    let mut block = Vec::with_capacity(unpacked);
+                    inflate.decompress_vec(&data[2..], &mut block, flate2::FlushDecompress::Finish).map_err(|e| format!("MSZIP: {e}"))?;
+                    if block.len() != unpacked {
+                        return Err("MSZIP block of the wrong size".into());
+                    }
+                    stream.extend_from_slice(&block);
+                }
+            }
+        }
+        for (name, size, offset, _) in files.iter().filter(|f| f.3 == fi) {
+            let data = stream.get(*offset..offset + size).ok_or_else(bad)?;
+            out.push((name.clone(), data.to_vec()));
+        }
+    }
+    Ok(out)
+}
+
 fn rcdata_string(pe: &Pe, name: &str) -> Option<String> {
     let res = pe.resources().ok()?;
     let r = res.iter().find(|r| r.kind == ResId::Id(RT_RCDATA) && r.name == ResId::Name(name.into()))?;
@@ -227,15 +336,7 @@ fn unwrap_iexpress(files: &mut Vec<(String, Vec<u8>)>) -> Result<Option<(String,
         if !cab_bytes.starts_with(b"MSCF") {
             continue;
         }
-        let err = |e: std::io::Error| format!("the IExpress cabinet in {path}: {e}");
-        let mut cabinet = cab::Cabinet::new(std::io::Cursor::new(cab_bytes.to_vec())).map_err(err)?;
-        let names: Vec<String> = cabinet.folder_entries().flat_map(|f| f.file_entries().map(|e| e.name().to_owned()).collect::<Vec<_>>()).collect();
-        let mut unpacked = Vec::new();
-        for n in names {
-            let mut buf = Vec::new();
-            cabinet.read_file(&n).and_then(|mut r| r.read_to_end(&mut buf)).map_err(err)?;
-            unpacked.push((n.replace('\\', "/"), buf));
-        }
+        let unpacked = read_cab(cab_bytes).map_err(|e| format!("the IExpress cabinet in {path}: {e}"))?;
         let info = (path.clone(), rcdata_string(&pe, "RUNPROGRAM").unwrap_or_default().trim().trim_matches('"').to_owned(), rcdata_string(&pe, "TITLE").unwrap_or_default());
         files.remove(i);
         for (p, d) in unpacked {
