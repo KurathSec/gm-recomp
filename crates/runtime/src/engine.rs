@@ -1107,6 +1107,47 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
 /// How long the profile's burst may hold the first frame up.
 const PROFILE_BURST_US: u64 = 2_000_000;
 
+/// Before any guest code runs, the profile entries whose code already is what the
+/// profile saw are translated, in the order they were needed: nothing has run that
+/// could have changed it, so code a packer has yet to unpack cannot match and waits,
+/// with the rest, for the burst after the first frame. Startup then translates in
+/// full batches instead of a call at a time.
+fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
+    if m.engine_ref().profile.is_empty() {
+        return;
+    }
+    sync_modules(m);
+    let t = m.now_us();
+    // (the profile is a stack, first needed last)
+    let entries: Vec<(u32, u32)> = m.engine().profile.drain(..).rev().collect();
+    let (mut now, mut later) = (Vec::new(), Vec::new());
+    for (a, h) in entries {
+        let e = m.engine_ref();
+        let mapped = e.mods.iter().any(|md| a >= md.base && a < md.base + md.size);
+        if mapped && code_hash(&*m, a) == Some(h) {
+            now.push(a);
+        } else {
+            later.push((a, h));
+        }
+    }
+    let mut done = 0;
+    for chunk in now.chunks(16) {
+        if m.now_us() - t > budget_us {
+            break;
+        }
+        let batch: Vec<u32> = chunk.iter().copied().filter(|a| !m.engine_ref().funcs.contains_key(a)).collect();
+        if !batch.is_empty() {
+            let _ = translate_batch(m, &batch, batch.len());
+            done += batch.len();
+        }
+    }
+    later.reverse();
+    m.engine().profile = later;
+    let ms = (m.now_us() - t) / 1000;
+    let left = m.engine_ref().profile.len();
+    m.print(&format!("translation profile: {done} functions translated before the start in {ms} ms ({left} left for after the first frame)"));
+}
+
 /// Up to `max` profile entries whose code is what the profile saw (others are
 /// dropped), taken off the profile.
 fn profile_batch<M: Machine>(m: &mut M, max: usize, skipped: &mut [usize; 3]) -> Vec<u32> {
@@ -1466,6 +1507,7 @@ fn collect_order(name: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>, seen: &mut 
 /// Runs DllMain of the statically imported game DLLs, then the entry point. Ok also
 /// when the run ended through ExitProcess or the frame limit.
 pub fn run_process<M: Machine>(m: &mut M, started: &Started) -> Result<(), String> {
+    profile_prefetch(m, PROFILE_BURST_US);
     for (base, dll_entry, name) in &started.attach {
         m.print(&format!("DllMain({name}) at {dll_entry:#x}"));
         call_from_host(m, *dll_entry, &[*base, 1, 0])?;

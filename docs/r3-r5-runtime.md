@@ -297,7 +297,10 @@ Vandal's seventh floor):
   translates them at its first wait after the first frame (packers have unpacked by
   then), at most 2 s, skipping any whose code differs (`engine::profile_batch`).
   3055's room-load frames 76 and 104: ~70 ms -> ~25 ms (the game's own loading),
-  for a ~75 ms burst at frame 10. `?noprofile` turns it off.
+  for a ~75 ms burst at frame 10. Entries whose code already matches before any
+  guest code runs (a packer's code cannot match until it unpacks) are translated
+  then, in full batches (`engine::profile_prefetch`): 3055's first frame 4.6 ->
+  2.0 s in Firefox. `?noprofile` turns it off.
 - Ahead translation fits a batch's cost as fixed + per byte (`fit_idle_cost`); the
   per-byte rate alone had folded in each module's fixed compile cost and overstated
   small batches threefold, so waits rarely fit a module. 3055 first session: ahead
