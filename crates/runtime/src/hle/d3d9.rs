@@ -1359,10 +1359,10 @@ fn dev_get_render_target_data(c: &mut Ctx) -> ApiResult {
 /// the destination for upload.
 fn copy_bits(c: &mut Ctx, src: (u32, u32), dst: (u32, u32), rows: u32) {
     let n = src.0.min(dst.0);
-    for y in 0..rows {
-        let mut b = vec![0u8; n as usize];
-        let _ = c.host.read(src.1 + y * src.0, &mut b);
-        let _ = c.host.write(dst.1 + y * dst.0, &b);
+    // (equal pitches: one copy of the whole image)
+    let (count, step) = if src.0 == dst.0 { (1, n * rows) } else { (rows, n) };
+    for y in 0..count {
+        let _ = c.host.copy_within(dst.1 + y * dst.0, src.1 + y * src.0, step);
     }
 }
 
