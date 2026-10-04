@@ -150,9 +150,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     sent = n;
     onProfile(pairs);
   };
+  const started = performance.now();
   const show = (clockMs, x, y, w, h, dw, dh, busy) => {
     collect(performance.now(), clockMs, busy);
     frameReset();
+    if (gpu.frames === 0) print(`first frame after ${((performance.now() - started) / 1000).toFixed(2)}s, ${(rt.exports.stat_us(2) / 1e6).toFixed(2)}s of it translating`);
     if (gpu.frames % 250 === 249) flushProfile();
     const resized = canvas.width !== dw || canvas.height !== dh;
     gpu.present(x, y, w, h, dw, dh);

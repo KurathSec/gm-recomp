@@ -161,11 +161,39 @@ pub struct Vm {
     pub min_addr: u32,
     /// Highest usable address + 1 (user space top).
     pub max_addr: u32,
+    /// Every range ever handed out (disjoint, merged): memory outside them was never
+    /// anyone's, so it still holds the zeros it was mapped with.
+    pub used: BTreeMap<u32, u64>,
+    /// The last `alloc` returned a range outside `used` (it needs no zeroing).
+    pub last_fresh: bool,
 }
 
 impl Vm {
     pub fn new() -> Self {
-        Vm { regions: BTreeMap::new(), min_addr: 0x0001_0000, max_addr: 0x7FFE_0000 }
+        Vm { regions: BTreeMap::new(), min_addr: 0x0001_0000, max_addr: 0x7FFE_0000, used: BTreeMap::new(), last_fresh: false }
+    }
+
+    /// Whether any of [start, end) was handed out before.
+    fn used_before(&self, start: u32, end: u64) -> bool {
+        if self.used.range(..=start).next_back().is_some_and(|(_, &e)| e > start as u64) {
+            return true;
+        }
+        self.used.range(start..).next().is_some_and(|(&s, _)| (s as u64) < end)
+    }
+
+    fn mark_used(&mut self, start: u32, end: u64) {
+        let (mut s, mut e) = (start, end);
+        if let Some((&ps, &pe)) = self.used.range(..=s).next_back() {
+            if pe >= s as u64 {
+                s = ps;
+                e = e.max(pe);
+            }
+        }
+        let inside: Vec<u32> = self.used.range(s..).take_while(|kv| *kv.0 as u64 <= e).map(|kv| *kv.0).collect();
+        for k in inside {
+            e = e.max(self.used.remove(&k).unwrap());
+        }
+        self.used.insert(s, e);
     }
 
     fn overlaps(&self, base: u32, size: u32) -> bool {
@@ -225,6 +253,9 @@ impl Vm {
             b
         };
         self.regions.insert(base, Region { size, alloc_base: base, committed: commit, protect, tag });
+        let end = base as u64 + size as u64;
+        self.last_fresh = !self.used_before(base, end);
+        self.mark_used(base, end);
         Some(base)
     }
 
@@ -321,6 +352,26 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_ranges() {
+        let mut vm = Vm::new();
+        let a = vm.alloc(0, 0x3000, true, PAGE_READWRITE, false, "t").unwrap();
+        assert!(vm.last_fresh);
+        assert!(vm.release(a));
+        // the same range again was someone's before
+        let b = vm.alloc(a, 0x1000, true, PAGE_READWRITE, false, "t").unwrap();
+        assert_eq!(b, a);
+        assert!(!vm.last_fresh);
+        // beyond everything handed out so far
+        let c = vm.alloc(0x2000_0000, 0x1000, true, PAGE_READWRITE, false, "t").unwrap();
+        assert!(vm.last_fresh);
+        // overlapping only the end of an earlier range
+        assert!(vm.release(c));
+        assert!(vm.alloc(0x1FFF_0000, 0x11000, true, PAGE_READWRITE, false, "t").is_some());
+        assert!(!vm.last_fresh);
+        assert_eq!(vm.used.len(), 2);
+    }
 
     #[test]
     fn alloc_commit_query() {

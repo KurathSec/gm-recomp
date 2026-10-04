@@ -1469,7 +1469,7 @@ fn virtual_alloc(c: &mut Ctx, addr: u32, size: u32, ty: u32, protect: u32) -> u3
             if c.host.ensure_mapped(base, size.div_ceil(0x1000) * 0x1000).is_err() {
                 return 0;
             }
-            if commit {
+            if commit && !c.p.vm.last_fresh {
                 let _ = c.host.fill(base, size.div_ceil(0x1000) * 0x1000, 0);
             }
             base

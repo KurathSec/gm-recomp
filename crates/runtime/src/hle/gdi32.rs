@@ -90,7 +90,10 @@ fn valloc(c: &mut Ctx, size: u32) -> u32 {
     if c.host.ensure_mapped(a, size).is_err() {
         return 0;
     }
-    let _ = c.host.fill(a, size, 0);
+    // (memory never handed out is zero already: texture storage runs to a gigabyte)
+    if !c.p.vm.last_fresh {
+        let _ = c.host.fill(a, size, 0);
+    }
     a
 }
 
