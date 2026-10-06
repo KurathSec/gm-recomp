@@ -76,18 +76,18 @@ self.onmessage = async ({ data }) => {
       try {
         profileDb = db ?? (await openSaves());
         profile = await loadProfile(profileDb, game);
-        if (profile) post(`translation profile: ${profile.length / 2} functions`);
+        if (profile) post(`translation profile: ${profile.length / 3} functions`);
       } catch (e) {
         post(`translation profile unavailable: ${e}`);
         profileDb = null;
       }
     }
     let profileSaving = Promise.resolve();
-    const onProfile = (pairs) => {
+    const onProfile = (entries) => {
       if (!profileDb) return;
-      const merged = new Uint32Array((profile?.length ?? 0) + pairs.length);
+      const merged = new Uint32Array((profile?.length ?? 0) + entries.length);
       if (profile) merged.set(profile);
-      merged.set(pairs, profile?.length ?? 0);
+      merged.set(entries, profile?.length ?? 0);
       profile = merged;
       profileSaving = profileSaving.then(() => storeProfile(profileDb, game, merged)).catch((e) => post(`storing the translation profile failed: ${e}`));
     };

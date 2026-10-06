@@ -83,13 +83,14 @@ pub struct Engine {
     /// next, so `translate_idle` takes them first (popped from the end).
     pub idle_next: Vec<u32>,
     /// Functions earlier sessions translated when they ran, with a hash of their first
-    /// bytes (`code_hash`), in reverse order of need: `translate_idle` takes them
+    /// bytes (`code_hash`) and the frame they were first needed in, in reverse order of
+    /// need: `translate_idle` takes them
     /// first, once the first frame is out (packers have unpacked by then) and when the
     /// code there is still the same.
-    pub profile: Vec<(u32, u32)>,
+    pub profile: Vec<(u32, u32, u32)>,
     /// Functions translated this session when they ran, with their code hash, for
     /// the next session's profile (those already in it left out).
-    pub demand: Vec<(u32, u32)>,
+    pub demand: Vec<(u32, u32, u32)>,
     pub profile_known: HashSet<u32>,
     /// Frames presented as of the last input poll (readable while the process is lent
     /// out).
@@ -889,7 +890,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         let end = t + PROFILE_BURST_US;
         let mut skipped = [0; 3];
         while m.now_us() < end {
-            let batch = profile_batch(m, 16, &mut skipped);
+            let batch = profile_batch(m, 16, PROFILE_BURST_FRAMES, &mut skipped);
             if batch.is_empty() {
                 break;
             }
@@ -915,7 +916,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         // the next profile entries go when their code is not what the profile saw
         let n = m.engine_ref().profile.len();
         let lo = n.saturating_sub(16);
-        let same: Vec<(u32, u32)> = m.engine_ref().profile[lo..].iter().copied().filter(|&(a, h)| code_hash(&*m, a) == Some(h)).collect();
+        let same: Vec<(u32, u32, u32)> = m.engine_ref().profile[lo..].iter().copied().filter(|&(a, h, _)| code_hash(&*m, a) == Some(h)).collect();
         let e = m.engine();
         e.profile.truncate(lo);
         e.profile.extend(same);
@@ -927,7 +928,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
             // the queue's entries
             let started = e.frames_seen > 0;
             while started && b.len() < 16 {
-                let Some(&(a, _)) = e.profile.last() else { break };
+                let Some(&(a, _, _)) = e.profile.last() else { break };
                 let Some(md) = e.mods.iter().find(|md| a >= md.base && a < md.base + md.size) else {
                     e.profile.pop();
                     continue;
@@ -1097,7 +1098,8 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
             if let Some(h) = code_hash(m, a) {
                 let e = m.engine();
                 e.profile_known.insert(a);
-                e.demand.push((a, h));
+                let frame = e.frames_seen as u32;
+                e.demand.push((a, h, frame));
             }
         }
     }
@@ -1106,6 +1108,9 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
 
 /// How long the profile's burst may hold the first frame up.
 const PROFILE_BURST_US: u64 = 2_000_000;
+/// The burst takes what was needed in the first this many frames; later entries are
+/// translated while the game waits (`translate_idle` takes them before anything else).
+const PROFILE_BURST_FRAMES: u32 = 300;
 
 /// Before any guest code runs, the profile entries whose code already is what the
 /// profile saw are translated, in the order they were needed: nothing has run that
@@ -1118,16 +1123,17 @@ fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
     }
     sync_modules(m);
     let t = m.now_us();
-    // (the profile is a stack, first needed last)
-    let entries: Vec<(u32, u32)> = m.engine().profile.drain(..).rev().collect();
+    // (the profile is a stack, first needed last); what was needed before the first
+    // frame, and matches
+    let entries: Vec<(u32, u32, u32)> = m.engine().profile.drain(..).rev().collect();
     let (mut now, mut later) = (Vec::new(), Vec::new());
-    for (a, h) in entries {
+    for (a, h, frame) in entries {
         let e = m.engine_ref();
         let mapped = e.mods.iter().any(|md| a >= md.base && a < md.base + md.size);
-        if mapped && code_hash(&*m, a) == Some(h) {
+        if frame == 0 && mapped && code_hash(&*m, a) == Some(h) {
             now.push(a);
         } else {
-            later.push((a, h));
+            later.push((a, h, frame));
         }
     }
     let mut done = 0;
@@ -1148,12 +1154,15 @@ fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
     m.print(&format!("translation profile: {done} functions translated before the start in {ms} ms ({left} left for after the first frame)"));
 }
 
-/// Up to `max` profile entries whose code is what the profile saw (others are
-/// dropped), taken off the profile.
-fn profile_batch<M: Machine>(m: &mut M, max: usize, skipped: &mut [usize; 3]) -> Vec<u32> {
+/// Up to `max` profile entries needed by frame `frames` whose code is what the
+/// profile saw (others are dropped), taken off the profile.
+fn profile_batch<M: Machine>(m: &mut M, max: usize, frames: u32, skipped: &mut [usize; 3]) -> Vec<u32> {
     let mut out = Vec::new();
     while out.len() < max {
-        let Some((a, h)) = m.engine().profile.pop() else { break };
+        if m.engine_ref().profile.last().is_none_or(|e| e.2 > frames) {
+            break;
+        }
+        let Some((a, h, _)) = m.engine().profile.pop() else { break };
         let e = m.engine_ref();
         if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || out.contains(&a) {
             skipped[0] += 1;
@@ -1176,10 +1185,10 @@ pub fn code_hash<M: Machine>(m: &M, addr: u32) -> Option<u32> {
 }
 
 /// Queues a profile entry: they go in last needed first (`profile` is a stack).
-pub fn profile_push<M: Machine>(m: &mut M, addr: u32, hash: u32) {
+pub fn profile_push<M: Machine>(m: &mut M, addr: u32, hash: u32, frame: u32) {
     let e = m.engine();
     if e.profile_known.insert(addr) {
-        e.profile.push((addr, hash));
+        e.profile.push((addr, hash, frame));
     }
 }
 

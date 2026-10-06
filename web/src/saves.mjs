@@ -80,17 +80,17 @@ export function parseSaves(text, game) {
   return j.files.map((f) => ({ path: f.path, mtime: f.mtime, data: f.data === null ? null : bytes(f.data) }));
 }
 
-// Translation profiles: per game, [address, code hash] pairs (Uint32Array) of the
-// functions sessions translated when they ran, in the order they first did. The next
-// session translates them ahead while the game waits (see host.mjs `profile`).
+// Translation profiles: per game, {v: 2, data: Uint32Array of [address, code hash,
+// frame first needed]} of the functions sessions translated when they ran, in the
+// order they first did (see host.mjs `profile`). Other versions are ignored.
 
 export function loadProfile(db, game) {
-  return done(db.transaction('profiles').objectStore('profiles').get(game)).then((v) => (v instanceof Uint32Array ? v : null));
+  return done(db.transaction('profiles').objectStore('profiles').get(game)).then((v) => (v?.v === 2 && v.data instanceof Uint32Array ? v.data : null));
 }
 
-export function storeProfile(db, game, pairs) {
+export function storeProfile(db, game, data) {
   const tx = db.transaction('profiles', 'readwrite');
-  tx.objectStore('profiles').put(pairs, game);
+  tx.objectStore('profiles').put({ v: 2, data }, game);
   return committed(tx);
 }
 

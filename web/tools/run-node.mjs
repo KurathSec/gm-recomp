@@ -86,10 +86,10 @@ if (tpFile) {
     tp = new Uint32Array(b.buffer, b.byteOffset, b.byteLength >> 2);
   } catch {}
 }
-const onProfile = (pairs) => {
-  const merged = new Uint32Array((tp?.length ?? 0) + pairs.length);
+const onProfile = (entries) => {
+  const merged = new Uint32Array((tp?.length ?? 0) + entries.length);
   if (tp) merged.set(tp);
-  merged.set(pairs, tp?.length ?? 0);
+  merged.set(entries, tp?.length ?? 0);
   tp = merged;
 };
 const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory), replay: replay.input, profile: tp, onProfile: tpFile ? onProfile : undefined });

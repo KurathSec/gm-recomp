@@ -674,11 +674,11 @@ pub extern "C" fn stat_us(which: u32) -> f64 {
     } as f64)
 }
 
-/// Queues a function earlier sessions needed, with its code hash; entries go in
-/// last needed first (see `Engine::profile`).
+/// Queues a function earlier sessions needed, with its code hash and the frame it was
+/// first needed in; entries go in last needed first (see `Engine::profile`).
 #[unsafe(no_mangle)]
-pub extern "C" fn profile_push(addr: u32, hash: u32) {
-    engine::profile_push(&mut Web, addr, hash);
+pub extern "C" fn profile_push(addr: u32, hash: u32, frame: u32) {
+    engine::profile_push(&mut Web, addr, hash, frame);
 }
 
 /// How many functions this session has translated when they ran (`Engine::demand`).
@@ -687,10 +687,10 @@ pub extern "C" fn demand_len() -> u32 {
     state().engine.as_ref().map_or(0, |e| e.demand.len() as u32)
 }
 
-/// Entry `i` of `Engine::demand`: its address (`which` 0) or code hash (1).
+/// Entry `i` of `Engine::demand`: its address (`which` 0), code hash (1) or frame (2).
 #[unsafe(no_mangle)]
 pub extern "C" fn demand_at(i: u32, which: u32) -> u32 {
-    state().engine.as_ref().and_then(|e| e.demand.get(i as usize)).map_or(0, |&(a, h)| if which == 0 { a } else { h })
+    state().engine.as_ref().and_then(|e| e.demand.get(i as usize)).map_or(0, |&(a, h, f)| [a, h, f][which.min(2) as usize])
 }
 
 /// Queues an input event of a recorded session (`kind` 0 key: a = vk, b = scan,
