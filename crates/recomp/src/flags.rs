@@ -36,9 +36,15 @@ pub fn effects(i: &Instruction) -> (u8, u8) {
         // like Delphi's string compares, reads what the callee set); no calling
         // convention passes flags in, so translated calls do not hand them over.
         Mnemonic::Call => (ALL, 0),
-        // a count in CL may be 0, which leaves every flag as it was
-        Mnemonic::Shl | Mnemonic::Sal | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror | Mnemonic::Rcl | Mnemonic::Rcr
-        | Mnemonic::Shld | Mnemonic::Shrd
+        // A count in CL may be 0, which leaves every flag as it was: a shift defines
+        // nothing for certain, so the flags needed after it are needed before it too
+        // (and no others; the lifter materializes just those on both paths).
+        Mnemonic::Shl | Mnemonic::Sal | Mnemonic::Shr | Mnemonic::Sar
+            if (0..i.op_count()).any(|n| i.op_kind(n) == iced_x86::OpKind::Register && i.op_register(n) == iced_x86::Register::CL) =>
+        {
+            (0, used)
+        }
+        Mnemonic::Rol | Mnemonic::Ror | Mnemonic::Rcl | Mnemonic::Rcr | Mnemonic::Shld | Mnemonic::Shrd
             if (0..i.op_count()).any(|n| i.op_kind(n) == iced_x86::OpKind::Register && i.op_register(n) == iced_x86::Register::CL) =>
         {
             (def, used | def)

@@ -1892,8 +1892,10 @@ impl<'a> FuncEmit<'a> {
                 self.set_pending(op, w);
             }
             None => {
-                // Count in CL: a zero count leaves flags untouched, so decide at run time.
-                self.materialize(flags::ALL);
+                // Count in CL: a zero count leaves flags untouched, so decide at run time;
+                // either way only the flags read later need computing.
+                let needed = self.needed;
+                self.materialize(needed);
                 self.read_dst(dst, w);
                 self.set(L_FA);
                 self.read_reg(Register::CL);
@@ -1911,7 +1913,7 @@ impl<'a> FuncEmit<'a> {
                 self.set(L_FR);
                 self.write_dst(dst, w, L_FR);
                 self.pending = Some((op, w));
-                self.materialize(flags::ALL);
+                self.materialize(needed);
                 self.depth -= 1;
                 self.i(W::End);
                 self.pending = None;
