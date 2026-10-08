@@ -173,10 +173,17 @@ struct Glue {
     call: extern "C" fn(u32),
     /// gcopy(dst, src, len) within guest memory.
     gcopy: extern "C" fn(u32, u32, u32),
+    /// The registers of `Regs` (in its order) to / from runtime memory.
+    rget: extern "C" fn(*mut u32),
+    rset: extern "C" fn(*const u32),
 }
 
+/// The CPU globals of `Regs`, in its field order.
+const REG_GLOBALS: [Global; 10] =
+    [Global::Eax, Global::Ecx, Global::Edx, Global::Ebx, Global::Esp, Global::Ebp, Global::Esi, Global::Edi, Global::Eip, Global::FsBase];
+
 /// Export order of the glue accessors; JS places them in the table in this order.
-const GLUE_FUNCS: [&str; 11] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call", "gcopy"];
+const GLUE_FUNCS: [&str; 13] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call", "gcopy", "rget", "rset"];
 
 struct State {
     engine: Option<Engine>,
@@ -285,6 +292,15 @@ impl Machine for Web {
     }
     fn set_global(&mut self, g: Global, v: u32) {
         (glue().set)(g as u32, v)
+    }
+    fn regs(&mut self) -> runtime::hle::Regs {
+        let mut r = [0u32; 10];
+        (glue().rget)(r.as_mut_ptr());
+        runtime::hle::Regs { eax: r[0], ecx: r[1], edx: r[2], ebx: r[3], esp: r[4], ebp: r[5], esi: r[6], edi: r[7], eip: r[8], fs_base: r[9] }
+    }
+    fn set_regs(&mut self, x: &runtime::hle::Regs) {
+        let r = [x.eax, x.ecx, x.edx, x.ebx, x.esp, x.ebp, x.esi, x.edi, x.eip, x.fs_base];
+        (glue().rset)(r.as_ptr());
     }
     fn xmm(&mut self, i: u32) -> u128 {
         let mut b = [0u8; 16];
@@ -500,6 +516,23 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     f.instruction(&I::LocalGet(0)).instruction(&I::LocalGet(1)).instruction(&I::LocalGet(2)).instruction(&I::MemoryCopy { src_mem: 1, dst_mem: 1 }).instruction(&I::End);
     code.function(&f);
 
+    // rget(rt): the registers of `Regs` into runtime memory; rset(rt): back
+    let mem0 = wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 };
+    funcs.function(6);
+    let mut f = Function::new([]);
+    for (k, g) in REG_GLOBALS.iter().enumerate() {
+        f.instruction(&I::LocalGet(0)).instruction(&I::GlobalGet(*g as u32)).instruction(&I::I32Store(wasm_encoder::MemArg { offset: 4 * k as u64, ..mem0 }));
+    }
+    f.instruction(&I::End);
+    code.function(&f);
+    funcs.function(6);
+    let mut f = Function::new([]);
+    for (k, g) in REG_GLOBALS.iter().enumerate() {
+        f.instruction(&I::LocalGet(0)).instruction(&I::I32Load(wasm_encoder::MemArg { offset: 4 * k as u64, ..mem0 })).instruction(&I::GlobalSet(*g as u32));
+    }
+    f.instruction(&I::End);
+    code.function(&f);
+
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_NAME, ExportKind::Memory, 1);
     for (i, (_, name, _)) in GLOBALS.iter().enumerate() {
@@ -569,6 +602,8 @@ pub extern "C" fn glue_install(base: u32) {
             vset: std::mem::transmute(f(8)),
             call: std::mem::transmute(f(9)),
             gcopy: std::mem::transmute(f(10)),
+            rget: std::mem::transmute(f(11)),
+            rset: std::mem::transmute(f(12)),
         });
     }
 }

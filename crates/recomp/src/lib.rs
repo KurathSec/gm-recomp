@@ -87,6 +87,42 @@ impl<'m> Translator<'m> {
         self.cfgs.keys().copied()
     }
 
+    /// A hash of everything the function at `entry` (added) was translated from: the
+    /// address and bytes of each instruction in it, inlined callees' included, and its
+    /// jump tables' targets. Code that changed since gives another; None if some of it
+    /// cannot be read.
+    pub fn code_hash(&self, entry: u32) -> Option<u32> {
+        let cfg = self.cfgs.get(&entry)?;
+        let mut h = 0x811c_9dc5u32;
+        let mut mix = |b: &[u8]| {
+            for &x in b {
+                h = (h ^ x as u32).wrapping_mul(0x0100_0193);
+            }
+        };
+        for b in cfg.blocks.values() {
+            for i in &b.instrs {
+                let mut buf = [0u8; 16];
+                let n = i.len().min(16);
+                if !self.mem.read(i.ip() as u32, &mut buf[..n]) {
+                    return None;
+                }
+                mix(&(i.ip() as u32).to_le_bytes());
+                mix(&buf[..n]);
+            }
+            if let cfg::Term::Table(targets) = &b.term {
+                for t in targets {
+                    mix(&t.to_le_bytes());
+                }
+            }
+        }
+        Some(h)
+    }
+
+    /// Drops a function added earlier (before `finish`).
+    pub fn remove_function(&mut self, entry: u32) {
+        self.cfgs.remove(&entry);
+    }
+
     /// Functions the one at `entry` (added) calls or jumps to directly.
     pub fn direct_targets(&self, entry: u32) -> Vec<u32> {
         let Some(cfg) = self.cfgs.get(&entry) else { return Vec::new() };

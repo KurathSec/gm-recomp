@@ -293,15 +293,16 @@ Vandal's seventh floor):
 - `fldpi` and the other load constants were parsed from decimal strings on every
   execution (5 % of a Vandal death frame in V8); they are parsed once.
 - Translation profiles: the page keeps, per game (IndexedDB), the functions sessions
-  translated when they ran, with a hash of their first 32 bytes and the frame they
-  were first needed in; the next session translates those of the first 300 frames at
+  translated when they ran, with a hash of everything their translation read (each
+  instruction's address and bytes, inlined callees' included, and jump-table targets)
+  and the frame they were first needed in; the next session translates those of the first 300 frames at
   its first wait after the first frame (packers have unpacked by then), at most 2 s,
-  skipping any whose code differs (`engine::profile_batch`), and the rest while the
-  game waits, before any other ahead translation.
+  dropping any whose code differs (`engine::translate_batch_checked`), and the rest
+  while the game waits, before any other ahead translation.
   3055's room-load frames 76 and 104: ~70 ms -> ~25 ms (the game's own loading),
   for a ~75 ms burst at frame 10. Entries needed before the first frame whose code
-  already matches before any guest code runs (a packer's code cannot match until it
-  unpacks) are translated then, in full batches (`engine::profile_prefetch`): 3055's
+  already matches before any guest code runs (code a packer has yet to unpack, or
+  startup code will patch, cannot match) are translated then, in full batches (`engine::profile_prefetch`): 3055's
   first frame 4.5 -> 1.9 s in Firefox. `?noprofile` turns it off.
 - Ahead translation fits a batch's cost as fixed + per byte (`fit_idle_cost`); the
   per-byte rate alone had folded in each module's fixed compile cost and overstated

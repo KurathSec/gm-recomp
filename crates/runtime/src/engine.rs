@@ -82,11 +82,11 @@ pub struct Engine {
     /// Functions translated code calls directly that are not translated yet: likely
     /// next, so `translate_idle` takes them first (popped from the end).
     pub idle_next: Vec<u32>,
-    /// Functions earlier sessions translated when they ran, with a hash of their first
-    /// bytes (`code_hash`) and the frame they were first needed in, in reverse order of
-    /// need: `translate_idle` takes them
-    /// first, once the first frame is out (packers have unpacked by then) and when the
-    /// code there is still the same.
+    /// Functions earlier sessions translated when they ran, with a hash of everything
+    /// they were translated from (`recomp::Translator::code_hash`) and the frame they
+    /// were first needed in, in reverse order of need: translated before the start
+    /// (`profile_prefetch`), after the first frame or first while the game waits, and
+    /// only when that code is still the same.
     pub profile: Vec<(u32, u32, u32)>,
     /// Functions translated this session when they ran, with their code hash, for
     /// the next session's profile (those already in it left out).
@@ -97,8 +97,9 @@ pub struct Engine {
     pub frames_seen: u64,
     /// The profile's burst ran (see `translate_idle`).
     pub profile_burst: bool,
-    /// The functions the last `translate_batch` translated.
-    pub last_batch: Vec<u32>,
+    /// The functions the last `translate_batch` translated, with their code hashes
+    /// (`recomp::Translator::code_hash`).
+    pub last_batch: Vec<(u32, u32)>,
     /// Functions translated ahead by `translate_idle`, and its calls.
     pub idle_done: usize,
     pub idle_calls: usize,
@@ -203,6 +204,33 @@ pub trait Machine: Guest {
     fn engine_ref(&self) -> &Engine;
     fn global(&mut self, g: Global) -> u32;
     fn set_global(&mut self, g: Global, v: u32);
+    /// The general registers, eip and the FS base (a host may move them at once).
+    fn regs(&mut self) -> Regs {
+        Regs {
+            eax: self.global(Global::Eax),
+            ecx: self.global(Global::Ecx),
+            edx: self.global(Global::Edx),
+            ebx: self.global(Global::Ebx),
+            esp: self.global(Global::Esp),
+            ebp: self.global(Global::Ebp),
+            esi: self.global(Global::Esi),
+            edi: self.global(Global::Edi),
+            eip: self.global(Global::Eip),
+            fs_base: self.global(Global::FsBase),
+        }
+    }
+    fn set_regs(&mut self, r: &Regs) {
+        self.set_global(Global::Eax, r.eax);
+        self.set_global(Global::Ecx, r.ecx);
+        self.set_global(Global::Edx, r.edx);
+        self.set_global(Global::Ebx, r.ebx);
+        self.set_global(Global::Esp, r.esp);
+        self.set_global(Global::Ebp, r.ebp);
+        self.set_global(Global::Esi, r.esi);
+        self.set_global(Global::Edi, r.edi);
+        self.set_global(Global::Eip, r.eip);
+        self.set_global(Global::FsBase, r.fs_base);
+    }
     /// XMM register `i` (thread switches save and restore them).
     fn xmm(&mut self, i: u32) -> u128;
     fn set_xmm(&mut self, i: u32, v: u128);
@@ -231,31 +259,11 @@ pub trait Machine: Guest {
 // ---- registers ---------------------------------------------------------------------------
 
 pub fn read_regs<M: Machine + ?Sized>(m: &mut M) -> Regs {
-    Regs {
-        eax: m.global(Global::Eax),
-        ecx: m.global(Global::Ecx),
-        edx: m.global(Global::Edx),
-        ebx: m.global(Global::Ebx),
-        esp: m.global(Global::Esp),
-        ebp: m.global(Global::Ebp),
-        esi: m.global(Global::Esi),
-        edi: m.global(Global::Edi),
-        eip: m.global(Global::Eip),
-        fs_base: m.global(Global::FsBase),
-    }
+    m.regs()
 }
 
 pub fn write_regs<M: Machine + ?Sized>(m: &mut M, r: &Regs) {
-    m.set_global(Global::Eax, r.eax);
-    m.set_global(Global::Ecx, r.ecx);
-    m.set_global(Global::Edx, r.edx);
-    m.set_global(Global::Ebx, r.ebx);
-    m.set_global(Global::Esp, r.esp);
-    m.set_global(Global::Ebp, r.ebp);
-    m.set_global(Global::Esi, r.esi);
-    m.set_global(Global::Edi, r.edi);
-    m.set_global(Global::Eip, r.eip);
-    m.set_global(Global::FsBase, r.fs_base);
+    m.set_regs(r)
 }
 
 /// Asks translated code to return to the dispatcher, which then stops with `msg`.
@@ -732,7 +740,15 @@ pub const CALL_BATCH: usize = 16;
 /// the first one, until the module holds `fill`. Returns the entries that could not
 /// be translated.
 pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> Result<Vec<u32>, String> {
+    translate_batch_checked(m, entries, fill, &[]).map(|(failed, _)| failed)
+}
+
+/// `translate_batch`, leaving out the entries of `expect` ([address, code hash]) whose
+/// code hashes otherwise now (code an earlier session saw, since changed). Returns the
+/// entries that failed and those left out.
+pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usize, expect: &[(u32, u32)]) -> Result<(Vec<u32>, Vec<u32>), String> {
     let t = m.now_us();
+    let mut mismatched = Vec::new();
     let shared = m.engine_ref().shared_memory;
     let funcs = std::mem::take(&mut m.engine().funcs);
     let mods = std::mem::take(&mut m.engine().mods);
@@ -759,6 +775,12 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
             if let Err(e) = tr.add_function(entry, &info) {
                 errors.push(format!("translate {entry:#x}: {e}"));
                 failed.push(entry);
+            }
+        }
+        for &(a, h) in expect {
+            if tr.entries().any(|e| e == a) && tr.code_hash(a) != Some(h) {
+                tr.remove_function(a);
+                mismatched.push(a);
             }
         }
         // callees, breadth first; one that fails is left for when it is called
@@ -799,9 +821,10 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
         }
         let cache = tr.take_cache();
         let frontier: Vec<u32> = tr.entries().flat_map(|e| tr.direct_targets(e)).filter(|t| !funcs.contains_key(t)).collect();
-        (tr.finish(), cache, frontier)
+        let hashes: Vec<(u32, u32)> = tr.entries().map(|e| (e, tr.code_hash(e).unwrap_or(0))).collect();
+        (tr.finish(), cache, frontier, hashes)
     };
-    let (out, cache, frontier) = out;
+    let (out, cache, frontier, hashes) = out;
     m.engine().inline_cache = Some(cache);
     m.engine().idle_next.extend(frontier);
     m.engine().funcs = funcs;
@@ -810,7 +833,7 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
         m.print(&e);
     }
     if out.functions.is_empty() {
-        return Ok(failed);
+        return Ok((failed, mismatched));
     }
     let names: Vec<String> = out.functions.iter().map(|(_, n)| n.clone()).collect();
     // GMR_DUMP_FN=hex: write the module that holds this function (debugging)
@@ -829,7 +852,7 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
             let (a, b) = entries.split_at(entries.len() / 2);
             failed.extend(translate_batch(m, a, a.len())?);
             failed.extend(translate_batch(m, b, b.len())?);
-            return Ok(failed);
+            return Ok((failed, mismatched));
         }
     };
     let now = m.now_us();
@@ -837,7 +860,7 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
     for ((entry, _), idx) in out.functions.iter().zip(indices) {
         e.funcs.insert(*entry, idx);
     }
-    e.last_batch = out.functions.iter().map(|(entry, _)| *entry).collect();
+    e.last_batch = hashes;
     e.translated += out.functions.len();
     e.modules += 1;
     e.translate_us += now - t;
@@ -855,7 +878,7 @@ pub fn translate_batch<M: Machine>(m: &mut M, entries: &[u32], fill: usize) -> R
             m.print(&l);
         }
     }
-    Ok(failed)
+    Ok((failed, mismatched))
 }
 
 /// Translates functions discovery found before anything calls them, in batches, until
@@ -894,8 +917,11 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
             if batch.is_empty() {
                 break;
             }
-            let _ = translate_batch(m, &batch, batch.len());
-            done += batch.len();
+            let addrs: Vec<u32> = batch.iter().map(|&(a, _)| a).collect();
+            if let Ok((_, changed)) = translate_batch_checked(m, &addrs, addrs.len(), &batch) {
+                skipped[2] += changed.len();
+                done += addrs.len() - changed.len();
+            }
         }
         let left = m.engine_ref().profile.len();
         let ms = (m.now_us() - t) / 1000;
@@ -913,13 +939,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         // (estimates with a quarter in reserve: a slow compile can exceed them)
         let budget_ns = (deadline_us.saturating_sub(m.now_us()) * 1000).saturating_sub(m.engine_ref().idle_fixed_ns * 5 / 4);
         let per = m.engine_ref().idle_ns_per_byte.max(1) * 5 / 4;
-        // the next profile entries go when their code is not what the profile saw
-        let n = m.engine_ref().profile.len();
-        let lo = n.saturating_sub(16);
-        let same: Vec<(u32, u32, u32)> = m.engine_ref().profile[lo..].iter().copied().filter(|&(a, h, _)| code_hash(&*m, a) == Some(h)).collect();
-        let e = m.engine();
-        e.profile.truncate(lo);
-        e.profile.extend(same);
+        let mut expect = Vec::new();
         let (batch, bytes) = {
             let e = m.engine();
             let q = e.idle_queue.as_mut().expect("queue built above");
@@ -928,7 +948,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
             // the queue's entries
             let started = e.frames_seen > 0;
             while started && b.len() < 16 {
-                let Some(&(a, _, _)) = e.profile.last() else { break };
+                let Some(&(a, h, _)) = e.profile.last() else { break };
                 let Some(md) = e.mods.iter().find(|md| a >= md.base && a < md.base + md.size) else {
                     e.profile.pop();
                     continue;
@@ -948,6 +968,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
                 }
                 e.profile.pop();
                 b.push((a, size));
+                expect.push((a, h));
                 bytes += size as u64;
             }
             while let Some(a) = e.idle_next.pop() {
@@ -994,7 +1015,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
         // Failures are not recorded: a function can fail now and translate when it
         // runs (code a packer has not unpacked yet).
         let t = m.now_us();
-        let _ = translate_batch(m, &batch, batch.len());
+        let _ = translate_batch_checked(m, &batch, batch.len(), &expect);
         // keep the estimate current (it includes the host's compile and instantiate):
         // up halfway (one slow compile should not stop it for good), down slowly
         let took = (m.now_us() - t) * 1000;
@@ -1093,14 +1114,10 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
     cache_resolved(m, addr, i);
     // for the next session's profile: the whole batch (what this function calls came
     // with it)
-    for a in std::mem::take(&mut m.engine().last_batch) {
-        if !m.engine_ref().profile_known.contains(&a) {
-            if let Some(h) = code_hash(m, a) {
-                let e = m.engine();
-                e.profile_known.insert(a);
-                let frame = e.frames_seen as u32;
-                e.demand.push((a, h, frame));
-            }
+    let e = m.engine();
+    for (a, h) in std::mem::take(&mut e.last_batch) {
+        if h != 0 && e.profile_known.insert(a) {
+            e.demand.push((a, h, e.frames_seen as u32));
         }
     }
     Ok(i)
@@ -1112,11 +1129,12 @@ const PROFILE_BURST_US: u64 = 2_000_000;
 /// translated while the game waits (`translate_idle` takes them before anything else).
 const PROFILE_BURST_FRAMES: u32 = 300;
 
-/// Before any guest code runs, the profile entries whose code already is what the
-/// profile saw are translated, in the order they were needed: nothing has run that
-/// could have changed it, so code a packer has yet to unpack cannot match and waits,
-/// with the rest, for the burst after the first frame. Startup then translates in
-/// full batches instead of a call at a time.
+/// Before any guest code runs, the profile entries needed before the first frame are
+/// translated, in the order they were needed, when everything they were translated
+/// from (their instructions, inlined callees' too) is what the profile saw: code a
+/// packer has yet to unpack, or startup code will patch, differs now and waits for
+/// the burst after the first frame. Startup then translates in full batches instead
+/// of a call at a time.
 fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
     if m.engine_ref().profile.is_empty() {
         return;
@@ -1130,58 +1148,60 @@ fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
     for (a, h, frame) in entries {
         let e = m.engine_ref();
         let mapped = e.mods.iter().any(|md| a >= md.base && a < md.base + md.size);
-        if frame == 0 && mapped && code_hash(&*m, a) == Some(h) {
-            now.push(a);
+        if frame == 0 && mapped {
+            now.push((a, h));
         } else {
             later.push((a, h, frame));
         }
     }
+    // (those whose code differs now, and any the time runs out for, wait for later)
     let mut done = 0;
     for chunk in now.chunks(16) {
-        if m.now_us() - t > budget_us {
-            break;
+        let batch: Vec<(u32, u32)> = chunk.iter().copied().filter(|(a, _)| !m.engine_ref().funcs.contains_key(a)).collect();
+        if batch.is_empty() {
+            continue;
         }
-        let batch: Vec<u32> = chunk.iter().copied().filter(|a| !m.engine_ref().funcs.contains_key(a)).collect();
-        if !batch.is_empty() {
-            let _ = translate_batch(m, &batch, batch.len());
-            done += batch.len();
+        if m.now_us() - t > budget_us {
+            later.extend(batch.iter().map(|&(a, h)| (a, h, 0)));
+            continue;
+        }
+        let addrs: Vec<u32> = batch.iter().map(|&(a, _)| a).collect();
+        match translate_batch_checked(m, &addrs, addrs.len(), &batch) {
+            Ok((_, changed)) => {
+                done += addrs.len() - changed.len();
+                later.extend(batch.iter().filter(|(a, _)| changed.contains(a)).map(|&(a, h)| (a, h, 0)));
+            }
+            Err(_) => later.extend(batch.iter().map(|&(a, h)| (a, h, 0))),
         }
     }
-    later.reverse();
+    // back to a stack in order of need
+    later.sort_by_key(|e| std::cmp::Reverse(e.2));
     m.engine().profile = later;
     let ms = (m.now_us() - t) / 1000;
     let left = m.engine_ref().profile.len();
     m.print(&format!("translation profile: {done} functions translated before the start in {ms} ms ({left} left for after the first frame)"));
 }
 
-/// Up to `max` profile entries needed by frame `frames` whose code is what the
-/// profile saw (others are dropped), taken off the profile.
-fn profile_batch<M: Machine>(m: &mut M, max: usize, frames: u32, skipped: &mut [usize; 3]) -> Vec<u32> {
-    let mut out = Vec::new();
+/// Up to `max` profile entries needed by frame `frames` that are mapped and not
+/// translated yet (others are dropped), taken off the profile; their code is checked
+/// as they are translated (`translate_batch_checked`).
+fn profile_batch<M: Machine>(m: &mut M, max: usize, frames: u32, skipped: &mut [usize; 3]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
     while out.len() < max {
         if m.engine_ref().profile.last().is_none_or(|e| e.2 > frames) {
             break;
         }
         let Some((a, h, _)) = m.engine().profile.pop() else { break };
         let e = m.engine_ref();
-        if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || out.contains(&a) {
+        if e.funcs.contains_key(&a) || e.bad_functions.contains(&a) || out.iter().any(|&(x, _)| x == a) {
             skipped[0] += 1;
         } else if !e.mods.iter().any(|md| a >= md.base && a < md.base + md.size) {
             skipped[1] += 1;
-        } else if code_hash(&*m, a) != Some(h) {
-            skipped[2] += 1;
         } else {
-            out.push(a);
+            out.push((a, h));
         }
     }
     out
-}
-
-/// FNV-1a of the 32 bytes at `addr`: what a profile entry expects to find there.
-pub fn code_hash<M: Machine>(m: &M, addr: u32) -> Option<u32> {
-    let mut b = [0u8; 32];
-    m.read(addr, &mut b).ok()?;
-    Some(b.iter().fold(0x811c_9dc5u32, |h, &x| (h ^ x as u32).wrapping_mul(0x0100_0193)))
 }
 
 /// Queues a profile entry: they go in last needed first (`profile` is a stack).
