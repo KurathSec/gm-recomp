@@ -191,9 +191,13 @@ struct State {
     soundfont: Option<Vec<u8>>,
     /// A recorded session's input: (frame, guest clock, event).
     replay: std::collections::VecDeque<(u64, u64, runtime::InputEvent)>,
+    /// When the key ring was last read (frame, guest clock), and whether the host
+    /// waited for real time since.
+    drained: (u64, u64),
+    waited: bool,
 }
 
-static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new() };
+static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -309,7 +313,17 @@ impl Machine for Web {
         log(s);
     }
     fn take_input(&mut self, frame: u64, clock_us: u64) -> Vec<runtime::InputEvent> {
-        let mut out = Web::take_input();
+        // The key ring is read through a call out to JS; games poll their messages
+        // hundreds of times a frame while they spin on the clock, between real-time
+        // waits. It is read after every wait (when keys come in), at a new frame, and
+        // every 100 µs of guest time otherwise.
+        let st = state();
+        if st.waited || frame != st.drained.0 || clock_us >= st.drained.1 + 100 {
+            st.drained = (frame, clock_us);
+            st.waited = false;
+            unsafe { input_drain() };
+        }
+        let mut out = std::mem::take(&mut state().input);
         // a replayed session: each event at the poll it was taken at
         let r = &mut state().replay;
         while let Some(&(f, t, _)) = r.front() {
@@ -330,6 +344,7 @@ impl Machine for Web {
             let deadline = self.now_us() + ((slack - 0.3) * 600.0).min(6000.0) as u64;
             runtime::engine::translate_idle_timed(self, deadline);
         }
+        state().waited = true;
         unsafe { gpu_pace(ms) }
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
@@ -339,13 +354,6 @@ impl Machine for Web {
             unsafe { soundfont_request() };
         }
         st.soundfont.take()
-    }
-}
-
-impl Web {
-    fn take_input() -> Vec<runtime::InputEvent> {
-        unsafe { input_drain() };
-        std::mem::take(&mut state().input)
     }
 }
 
