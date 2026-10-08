@@ -497,7 +497,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   if (profile) for (let i = profile.length - 3; i >= 0; i -= 3) x.profile_push(profile[i], profile[i + 1], profile[i + 2]);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   flushProfile();
-  if (gpu) print(`draw calls: ${(gpuMs / 1000).toFixed(2)}s in all, ${(gpuMs / Math.max(1, gpu.frames)).toFixed(2)} ms per frame`);
+  if (gpu) print(`draw calls: ${(gpuMs / 1000).toFixed(2)}s in all, ${(gpuMs / Math.max(1, gpu.frames)).toFixed(2)} ms per frame; ${(gpu.draws / Math.max(1, gpu.frames)).toFixed(1)} draws and ${(gpu.states / Math.max(1, gpu.frames)).toFixed(1)} state changes per frame`);
   if (slackStats.n) print(`slack: ${slackStats.n} asks, estimate ${(slackStats.est / slackStats.n).toFixed(2)} ms, frame left ${(slackStats.left / slackStats.n).toFixed(2)} ms`);
   print(`modules instantiated: ${modules} (${(moduleBytes / 1048576).toFixed(1)} MB; compile ${(compileMs / 1000).toFixed(2)}s, instantiate ${(instantiateMs / 1000).toFixed(2)}s)`);
   if (frameMs.length > 60) {

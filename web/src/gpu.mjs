@@ -252,6 +252,7 @@ export class D3DGL {
     this.targetH = 1;
     this.frames = 0;
     this.draws = 0;
+    this.states = 0; // batches started by a state change
   }
 
   makeTexture() {
@@ -390,6 +391,7 @@ export class D3DGL {
       for (let i = 0; i < KEY_WORDS.length; i++) k[i] = w[KEY_WORDS[i]];
       k.set(w.subarray(D.world, D.world + MATRIX_WORDS), KEY_WORDS.length);
       this.applyState(w, f, mode, rhw);
+      this.states++;
     }
     this.appendVertices(w, prim);
   }
