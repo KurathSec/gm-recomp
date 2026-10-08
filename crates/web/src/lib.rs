@@ -195,9 +195,10 @@ struct State {
     /// waited for real time since.
     drained: (u64, u64),
     waited: bool,
+    polls: u32,
 }
 
-static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false };
+static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0 };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -316,11 +317,14 @@ impl Machine for Web {
         // The key ring is read through a call out to JS; games poll their messages
         // hundreds of times a frame while they spin on the clock, between real-time
         // waits. It is read after every wait (when keys come in), at a new frame, and
-        // every 100 µs of guest time otherwise.
+        // every 100 µs of guest time or 64 polls otherwise (a loop of bare message
+        // polls moves no clock).
         let st = state();
-        if st.waited || frame != st.drained.0 || clock_us >= st.drained.1 + 100 {
+        st.polls += 1;
+        if st.waited || frame != st.drained.0 || clock_us >= st.drained.1 + 100 || st.polls >= 64 {
             st.drained = (frame, clock_us);
             st.waited = false;
+            st.polls = 0;
             unsafe { input_drain() };
         }
         let mut out = std::mem::take(&mut state().input);
