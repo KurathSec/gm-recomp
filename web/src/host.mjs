@@ -9,7 +9,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
 
 /**
  * @param {object} o
- * @param {BufferSource} o.runtimeBytes  web.wasm
+ * @param {BufferSource|WebAssembly.Module} o.runtimeBytes  web.wasm, or compiled
  * @param {Array<[string, Uint8Array, number?]>} o.files  game files: [path relative to the game dir ('\\' or '/'), bytes, mtime in ms]
  * @param {string} o.exe  entry executable
  * @param {number} [o.frames]  stop after this many Presents (0 = no limit)
@@ -433,7 +433,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
   };
 
-  ({ instance: rt } = await WebAssembly.instantiate(runtimeBytes, { host, gpu: gpuImports, audio: audioImports }));
+  const engineImports = { host, gpu: gpuImports, audio: audioImports };
+  rt = runtimeBytes instanceof WebAssembly.Module ? await WebAssembly.instantiate(runtimeBytes, engineImports) : (await WebAssembly.instantiate(runtimeBytes, engineImports)).instance;
   const x = rt.exports;
   table = x.__indirect_function_table;
 

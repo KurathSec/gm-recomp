@@ -1,5 +1,6 @@
 // The guest's main thread: fetches the runtime and the game files, then runs the game.
 // Messages to the page: {type: 'log', line} and {type: 'done', status}.
+import { GL_OPTIONS } from './gpu.mjs';
 import { runGame } from './host.mjs';
 import { KEYS } from './keys.mjs';
 import { applySaves, loadGame, loadProfile, loadSaves, openSaves, storeProfile, storeSaves } from './saves.mjs';
@@ -26,12 +27,23 @@ self.onmessage = async ({ data }) => {
   if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
+    // The runtime compiles while the game downloads.
+    const runtime = fetch('/runtime/web.wasm').then((r) => {
+      if (!r.ok) throw new Error(`runtime: HTTP ${r.status}`);
+      return r.headers.get('content-type')?.startsWith('application/wasm') ? WebAssembly.compileStreaming(r) : r.arrayBuffer().then((b) => WebAssembly.compile(b));
+    });
+    runtime.catch(() => {}); // (awaited below)
+    // Creating the WebGL context blocks this thread (seconds in a browser that has not
+    // used WebGL yet): it is done while the downloads are under way.
+    const warmGl = () => canvas?.getContext('webgl2', GL_OPTIONS);
     let manifest;
     let downloaded;
     const t0 = performance.now();
     if (local) {
       // imported in this browser (import.mjs)
-      const g = await loadGame(await openSaves(), game);
+      const pending = openSaves().then((db) => loadGame(db, game));
+      warmGl();
+      const g = await pending;
       if (!g) throw new Error(`no imported game ${game}`);
       manifest = g.manifest;
       downloaded = g.files.map(([path, data]) => [path, data, 0]);
@@ -39,7 +51,7 @@ self.onmessage = async ({ data }) => {
     } else {
       const base = `/games/${encodeURIComponent(game)}/`;
       manifest = await (await fetch(`${base}manifest.json`)).json();
-      downloaded = await Promise.all(
+      const pending = Promise.all(
         manifest.files.map(async (f) => {
           const r = await fetch(`${base}files/${f.path.split('/').map(encodeURIComponent).join('/')}`);
           if (!r.ok) throw new Error(`${f.path}: HTTP ${r.status}`);
@@ -47,6 +59,8 @@ self.onmessage = async ({ data }) => {
           return [f.path, new Uint8Array(await r.arrayBuffer()), mtime];
         }),
       );
+      warmGl();
+      downloaded = await pending;
       post(`downloaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     }
     let db = null;
@@ -144,7 +158,7 @@ self.onmessage = async ({ data }) => {
     const onSave = (changes) => {
       if (db) saving = saving.then(() => storeSaves(db, game, changes)).catch((e) => post(`saving failed: ${e}`));
     };
-    const runtimeBytes = await (await fetch('/runtime/web.wasm')).arrayBuffer();
+    const runtimeBytes = await runtime;
     const want = new Set(capture);
     // Scripted input for tests: [frame, code, down] applied after that frame.
     const onFrame = async (frame, gpu) => {

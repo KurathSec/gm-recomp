@@ -194,6 +194,9 @@ function toRGBA(fmt, src, w, h, pitch) {
   return out;
 }
 
+/** The canvas's WebGL2 context attributes (a page may create the context early with them). */
+export const GL_OPTIONS = { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, desynchronized: true, preserveDrawingBuffer: false };
+
 export class D3DGL {
   /**
    * @param {OffscreenCanvas|HTMLCanvasElement} canvas
@@ -206,7 +209,7 @@ export class D3DGL {
     this.canvas = canvas;
     this.guestBuffer = guestBuffer;
     this.rtBuffer = rtBuffer;
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, desynchronized: true, preserveDrawingBuffer: false });
+    const gl = canvas.getContext('webgl2', GL_OPTIONS);
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
     const p = gl.createProgram();
