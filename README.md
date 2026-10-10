@@ -26,8 +26,9 @@ from GameMaker itself, so games behave as they do on Windows, x87 rounding inclu
 # import games (folders, .zip, .rar, .exe) into web/public/games/<slug>/
 cargo run --release -p importer -- import path/to/game.zip --out web/public/games
 
-# build the browser runtime
-rustup run nightly cargo build --release --target wasm32-unknown-unknown -p web --target-dir target/wasm
+# build the browser runtime (without DWARF: 3.4 MB instead of 21; the name section,
+# which profiles and stack traces use, stays)
+CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target wasm32-unknown-unknown -p web --target-dir target/wasm
 
 # serve it (cross-origin isolation headers included) and open http://localhost:8766/
 node web/dev/server.mjs
