@@ -425,6 +425,9 @@ impl Process {
         vm.alloc(STUB_BASE, 0x0010_0000, true, PAGE_READWRITE, false, "hle stubs");
         vm.alloc(crate::hle::DATA_EXPORTS, crate::hle::DATA_EXPORTS_SIZE, true, PAGE_READWRITE, false, "exported variables");
         vm.alloc(RET_TO_HOST, 0x1000, true, PAGE_READWRITE, false, "host return");
+        // (The debugging counters after it, abi::COUNTERS, are left out: reserving them
+        // moves later top-down allocations and so every state hash. With GMR_COUNT an
+        // allocation landing there gets them as its initial contents.)
         vm.alloc(recomp::abi::RESOLVE_CACHE, recomp::abi::RESOLVE_CACHE_SIZE, true, PAGE_READWRITE, false, "resolve cache");
         // The page below each TEB holds the thread's x87 state (fpu::block).
         vm.alloc(TEB_BASE - 0x1000, 0x1000, true, PAGE_READWRITE, false, "thread state");
