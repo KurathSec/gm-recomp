@@ -728,6 +728,20 @@ pub extern "C" fn profile_push(addr: u32, hash: u32, frame: u32) {
     engine::profile_push(&mut Web, addr, hash, frame);
 }
 
+/// Registers the loaded modules (discovery) and returns how many there are, for
+/// `module_at` (profiles shared between games with the same runner).
+#[unsafe(no_mangle)]
+pub extern "C" fn module_count() -> u32 {
+    engine::sync_modules(&mut Web);
+    state().engine.as_ref().map_or(0, |e| e.mods.len() as u32)
+}
+
+/// Module `i`: its base (`which` 0), size (1) or code id (2, `ModInfo::code_id`).
+#[unsafe(no_mangle)]
+pub extern "C" fn module_at(i: u32, which: u32) -> u32 {
+    state().engine.as_ref().and_then(|e| e.mods.get(i as usize)).map_or(0, |md| [md.base, md.size, md.code_id][which.min(2) as usize])
+}
+
 /// How many functions this session has translated when they ran (`Engine::demand`).
 #[unsafe(no_mangle)]
 pub extern "C" fn demand_len() -> u32 {

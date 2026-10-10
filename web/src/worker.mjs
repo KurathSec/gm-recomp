@@ -83,13 +83,62 @@ self.onmessage = async ({ data }) => {
       }
     }
     let profileSaving = Promise.resolve();
-    const onProfile = (entries) => {
+    // Modules' own profiles (key `module:<code id>:<base>`): games built with the same
+    // runner (and the D3DX DLL GMS games ship) run the same code, so a game's first
+    // session starts from what other games needed of it.
+    const moduleKey = (m) => `module:${m.id.toString(16)}:${m.base.toString(16)}`;
+    const moduleProfiles = new Map(); // key -> {data, seen: Set of addresses}
+    const moduleProfile = async (m) => {
+      const key = moduleKey(m);
+      if (!moduleProfiles.has(key)) {
+        const data = (await loadProfile(profileDb, key).catch(() => null)) ?? new Uint32Array(0);
+        const seen = new Set();
+        for (let i = 0; i < data.length; i += 3) seen.add(data[i]);
+        moduleProfiles.set(key, { data, seen });
+      }
+      return moduleProfiles.get(key);
+    };
+    const sharedProfile = async (modules) => {
+      if (!profileDb) return null;
+      const all = [];
+      for (const m of modules) {
+        const { data } = await moduleProfile(m);
+        for (let i = 0; i < data.length; i += 3) all.push([data[i], data[i + 1], data[i + 2]]);
+      }
+      if (!all.length) return null;
+      // (in order of need across the modules)
+      all.sort((a, b) => a[2] - b[2]);
+      post(`translation profile shared with other games: ${all.length} functions`);
+      return Uint32Array.from(all.flat());
+    };
+    const onProfile = (entries, modules) => {
       if (!profileDb) return;
       const merged = new Uint32Array((profile?.length ?? 0) + entries.length);
       if (profile) merged.set(profile);
       merged.set(entries, profile?.length ?? 0);
       profile = merged;
-      profileSaving = profileSaving.then(() => storeProfile(profileDb, game, merged)).catch((e) => post(`storing the translation profile failed: ${e}`));
+      profileSaving = profileSaving
+        .then(async () => {
+          await storeProfile(profileDb, game, merged);
+          for (const m of modules ?? []) {
+            const mp = await moduleProfile(m);
+            const add = [];
+            for (let i = 0; i < entries.length; i += 3) {
+              const a = entries[i];
+              if (a >= m.base && a < m.base + m.size && !mp.seen.has(a)) {
+                mp.seen.add(a);
+                add.push(entries[i], entries[i + 1], entries[i + 2]);
+              }
+            }
+            if (!add.length) continue;
+            const data = new Uint32Array(mp.data.length + add.length);
+            data.set(mp.data);
+            data.set(add, mp.data.length);
+            mp.data = data;
+            await storeProfile(profileDb, moduleKey(m), data);
+          }
+        })
+        .catch((e) => post(`storing the translation profile failed: ${e}`));
     };
     let saving = Promise.resolve();
     const onSave = (changes) => {
@@ -126,7 +175,7 @@ self.onmessage = async ({ data }) => {
       : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log
     const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile });
+    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile });
     await saving;
     await profileSaving;
     self.postMessage({ type: 'done', status });

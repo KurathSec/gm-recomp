@@ -44,6 +44,10 @@ pub struct ModInfo {
     pub sorted: Vec<u32>,
     /// As discovery returns them (only looked up).
     pub jump_tables: std::collections::HashMap<u32, Vec<u32>>,
+    /// FNV-1a of the executable sections' bytes: the same for every game built with
+    /// the same runner (a GM8 game's data follows the sections), so translation
+    /// profiles can be shared between them.
+    pub code_id: u32,
 }
 
 pub use crate::fasthash::AddrHash;
@@ -705,8 +709,15 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
         let t = m.now_us();
         let mut functions = HashSet::default();
         let mut jump_tables = HashMap::default();
+        let mut code_id = 0x811c_9dc5u32;
         match pe::Pe::parse(&file) {
             Ok(pe) => {
+                for sec in pe.sections.iter().filter(|s| s.is_executable()) {
+                    let (a, n) = (sec.raw_offset as usize, sec.raw_size as usize);
+                    for &b in file.get(a..a.saturating_add(n).min(file.len())).unwrap_or(&[]) {
+                        code_id = (code_id ^ b as u32).wrapping_mul(0x0100_0193);
+                    }
+                }
                 let d = x86::discover(&pe);
                 for f in &d.function_list {
                     functions.insert(base + f.rva);
@@ -724,7 +735,7 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
         }
         let mut sorted: Vec<u32> = functions.iter().copied().collect();
         sorted.sort_unstable();
-        m.engine().mods.push(ModInfo { name, base, size, functions, sorted, jump_tables });
+        m.engine().mods.push(ModInfo { name, base, size, functions, sorted, jump_tables, code_id });
     }
 }
 

@@ -35,10 +35,14 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {Uint32Array} [o.profile]  [address, code hash, frame first needed] of functions earlier
  *   sessions needed, in the order they did: translated before the start, after the first frame or
  *   while the game waits
- * @param {(entries: Uint32Array) => void} [o.onProfile]  functions this session needed that the
- *   profile lacked (every few seconds and at the end), as the same triples, to add to it
+ * @param {(entries: Uint32Array, modules: {base: number, size: number, id: number}[]) => void} [o.onProfile]
+ *   functions this session needed that the profile lacked (every few seconds and at the end), as
+ *   the same triples, to add to it, with the modules loaded at the start (to file them by module)
+ * @param {(modules: {base: number, size: number, id: number}[]) => Promise<Uint32Array|null>} [o.sharedProfile]
+ *   without `profile`: what other games with the same modules needed (a runner's code is the same
+ *   in every game built with it)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -139,6 +143,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   };
   // functions this session needed that the profile lacked, handed out from `sent` on
   let sent = 0;
+  // the modules loaded at the start, by code (see sharedProfile)
+  const startModules = [];
   const flushProfile = () => {
     if (!onProfile) return;
     const n = rt.exports.demand_len();
@@ -146,7 +152,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     const entries = new Uint32Array(3 * (n - sent));
     for (let i = sent; i < n; i++) for (let k = 0; k < 3; k++) entries[3 * (i - sent) + k] = rt.exports.demand_at(i, k);
     sent = n;
-    onProfile(entries);
+    onProfile(entries, startModules);
   };
   const started = performance.now();
   const show = (clockMs, x, y, w, h, dw, dh, busy) => {
@@ -494,6 +500,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   if (monitor) x.set_monitor(1);
   // [kind, frame, clock, a, b, c]: a recorded session's input
   for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);
+  for (let i = 0, n = x.module_count(); i < n; i++) startModules.push({ base: x.module_at(i, 0), size: x.module_at(i, 1), id: x.module_at(i, 2) >>> 0 });
+  if (!profile && sharedProfile) profile = await sharedProfile(startModules);
   if (profile) for (let i = profile.length - 3; i >= 0; i -= 3) x.profile_push(profile[i], profile[i + 1], profile[i + 2]);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   flushProfile();
