@@ -5,7 +5,9 @@
 //        saves and input; `node --cpu-prof` then profiles it)
 //        [--profile from:to [--profile-out file.cpuprofile]] (a CPU profile of these frames only)
 //        [--translation-profile file] (read, then extended with what this run needed)
-import { readFile, readdir, stat, writeFile } from 'node:fs/promises';
+//        [--module-profiles dir] (what this run needed, per module: dir/module-<code id>-<base>.bin,
+//        for web/tools/module-profiles.mjs)
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { writeFileSync } from 'node:fs';
 import inspector from 'node:inspector';
@@ -86,14 +88,27 @@ if (tpFile) {
     tp = new Uint32Array(b.buffer, b.byteOffset, b.byteLength >> 2);
   } catch {}
 }
-const onProfile = (entries) => {
+const modDir = opt('--module-profiles', null);
+const needed = [];
+let modules = [];
+const onProfile = (entries, mods) => {
   const merged = new Uint32Array((tp?.length ?? 0) + entries.length);
   if (tp) merged.set(tp);
   merged.set(entries, tp?.length ?? 0);
   tp = merged;
+  needed.push(...entries);
+  modules = mods;
 };
-const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory), replay: replay.input, profile: tp, onProfile: tpFile ? onProfile : undefined });
+const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, trace, epoch, onFrame, onReady: (i) => (input = i), onExit: (s) => (guest = s.guestMemory), replay: replay.input, profile: tp, onProfile: tpFile || modDir ? onProfile : undefined });
 if (tpFile && tp) await writeFile(tpFile, new Uint8Array(tp.buffer, tp.byteOffset, tp.byteLength));
+if (modDir) {
+  await mkdir(modDir, { recursive: true });
+  for (const m of modules) {
+    const own = [];
+    for (let i = 0; i < needed.length; i += 3) if (needed[i] >= m.base && needed[i] - m.base < m.size) own.push(needed[i], needed[i + 1], needed[i + 2]);
+    if (own.length) await writeFile(join(modDir, `module-${m.id.toString(16)}-${m.base.toString(16)}.bin`), new Uint8Array(Uint32Array.from(own).buffer));
+  }
+}
 if (dumpMem) await writeFile(dumpMem, new Uint8Array(guest.buffer));
 console.log(`status ${status}, ${((performance.now() - t) / 1000).toFixed(1)}s total`);
 process.exit(status);

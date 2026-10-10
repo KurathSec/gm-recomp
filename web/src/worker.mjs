@@ -99,13 +99,19 @@ self.onmessage = async ({ data }) => {
     let profileSaving = Promise.resolve();
     // Modules' own profiles (key `module:<code id>:<base>`): games built with the same
     // runner (and the D3DX DLL GMS games ship) run the same code, so a game's first
-    // session starts from what other games needed of it.
+    // session starts from what other games needed of it; before any has, from the
+    // site's (web/tools/module-profiles.mjs).
     const moduleKey = (m) => `module:${m.id.toString(16)}:${m.base.toString(16)}`;
     const moduleProfiles = new Map(); // key -> {data, seen: Set of addresses}
+    const siteProfile = (m) =>
+      fetch(`/profiles/module-${m.id.toString(16)}-${m.base.toString(16)}.bin`)
+        .then((r) => (r.ok ? r.arrayBuffer() : null))
+        .then((b) => (b && b.byteLength % 12 === 0 ? new Uint32Array(b) : null))
+        .catch(() => null);
     const moduleProfile = async (m) => {
       const key = moduleKey(m);
       if (!moduleProfiles.has(key)) {
-        const data = (await loadProfile(profileDb, key).catch(() => null)) ?? new Uint32Array(0);
+        const data = (await loadProfile(profileDb, key).catch(() => null)) ?? (await siteProfile(m)) ?? new Uint32Array(0);
         const seen = new Set();
         for (let i = 0; i < data.length; i += 3) seen.add(data[i]);
         moduleProfiles.set(key, { data, seen });

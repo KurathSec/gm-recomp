@@ -39,6 +39,8 @@ const mounts = [
   // DLLs it may add (tools/system32.sh)
   ['/import/', join(repoRoot, 'target/wasm-import/wasm32-unknown-unknown/release')],
   ['/system32/', join(webRoot, 'public/system32')],
+  // what each runner's code needs first (tools/module-profiles.mjs)
+  ['/profiles/', join(webRoot, 'public/profiles')],
   ['/', webRoot],
 ];
 
