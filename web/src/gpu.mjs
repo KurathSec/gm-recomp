@@ -68,6 +68,7 @@ const FS = `#version 300 es
 precision highp float;
 in vec4 v_diffuse; in vec4 v_specular; in vec2 v_uv0; in vec2 v_uv1; in float v_fogz;
 uniform sampler2D u_tex0; uniform sampler2D u_tex1;
+uniform ivec2 u_swz; // per stage: 1 the texture holds B, G, R, A (as uploaded), 2 B, G, R, X
 uniform ivec4 u_stage0; uniform ivec4 u_stage1; // colorop, colorarg1, colorarg2, alphaop
 uniform ivec4 u_alpha0; uniform ivec4 u_alpha1; // alphaarg1, alphaarg2, has texture, -
 uniform vec4 u_tfactor;
@@ -112,15 +113,16 @@ vec4 stage(ivec4 s, ivec4 sa, vec4 cur, vec4 tex) {
   float al = s.w == 1 ? cur.a : combineA(s.w, a1.a, a2.a, v_diffuse, tex, cur, u_tfactor);
   return vec4(rgb, al);
 }
+vec4 swz(vec4 t, int s) { return s == 0 ? t : vec4(t.bgr, s == 2 ? 1.0 : t.a); }
 bool cmp(int f, float a, float r) {
   if (f == 1) return false; if (f == 2) return a < r; if (f == 3) return a == r; if (f == 4) return a <= r;
   if (f == 5) return a > r; if (f == 6) return a != r; if (f == 7) return a >= r; return true;
 }
 void main() {
-  vec4 t0 = u_alpha0.z == 1 ? texture(u_tex0, v_uv0) : vec4(1.0);
+  vec4 t0 = u_alpha0.z == 1 ? swz(texture(u_tex0, v_uv0), u_swz.x) : vec4(1.0);
   vec4 cur = stage(u_stage0, u_alpha0, v_diffuse, t0);
   if (u_stage1.x != 1) {
-    vec4 t1 = u_alpha1.z == 1 ? texture(u_tex1, v_uv1) : vec4(1.0);
+    vec4 t1 = u_alpha1.z == 1 ? swz(texture(u_tex1, v_uv1), u_swz.y) : vec4(1.0);
     cur = stage(u_stage1, u_alpha1, cur, t1);
   }
   if (u_fog != 0) {
@@ -155,6 +157,19 @@ function mul(a, b) {
 /** Converts D3D texel data to RGBA8. */
 function toRGBA(fmt, src, w, h, pitch) {
   const out = new Uint8Array(w * h * 4);
+  // A8R8G8B8 and X8R8G8B8, nearly every texture: a pixel per word, B and R swapped
+  if ((fmt === 21 || fmt === 22) && src.byteOffset % 4 === 0 && pitch % 4 === 0) {
+    const s32 = new Uint32Array(src.buffer, src.byteOffset, (pitch >> 2) * h);
+    const o32 = new Uint32Array(out.buffer);
+    const opaque = fmt === 22 ? 0xff000000 : 0;
+    for (let y = 0, d = 0; y < h; y++) {
+      for (let s = y * (pitch >> 2), end = s + w; s < end; s++, d++) {
+        const v = s32[s];
+        o32[d] = (v & 0xff00ff00) | ((v >>> 16) & 0xff) | ((v & 0xff) << 16) | opaque;
+      }
+    }
+    return out;
+  }
   for (let y = 0; y < h; y++) {
     let s = y * pitch;
     let d = y * w * 4;
@@ -221,7 +236,7 @@ export class D3DGL {
     this.prog = p;
     gl.useProgram(p);
     this.u = {};
-    for (const n of ['u_rhw', 'u_wvp', 'u_target', 'u_vp', 'u_tex0', 'u_tex1', 'u_stage0', 'u_stage1', 'u_alpha0', 'u_alpha1', 'u_tfactor', 'u_atest', 'u_aref', 'u_fog', 'u_fogcolor', 'u_fogparams'])
+    for (const n of ['u_rhw', 'u_wvp', 'u_target', 'u_vp', 'u_tex0', 'u_tex1', 'u_swz', 'u_stage0', 'u_stage1', 'u_alpha0', 'u_alpha1', 'u_tfactor', 'u_atest', 'u_aref', 'u_fog', 'u_fogcolor', 'u_fogparams'])
       this.u[n] = gl.getUniformLocation(p, n);
     gl.uniform1i(this.u.u_tex0, 0);
     gl.uniform1i(this.u.u_tex1, 1);
@@ -301,9 +316,12 @@ export class D3DGL {
     const tex = this.makeTexture();
     // Undefined contents read as transparent black until uploaded or rendered.
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    const t = { tex, w, h, levels, fmt, uploaded: 1, params: '', fbo: null, depth: null };
+    // swz: how the texture holds its texels, decided by the first upload (-1 before):
+    // 0 R, G, B, A; 1 or 2 as the guest has them (see textureUpload)
+    const t = { tex, w, h, levels, fmt, uploaded: 1, params: '', fbo: null, depth: null, swz: rt ? 0 : -1, src: null };
     if (rt) Object.assign(t, this.framebuffer(w, h, tex));
     this.textures.set(id, t);
+    this.keyValid = false;
   }
 
   textureUpload(id, level, w, h, fmt, pitch, bits) {
@@ -312,11 +330,46 @@ export class D3DGL {
     this.flush();
     const gl = this.gl;
     const src = new Uint8Array(this.guestBuffer(), bits, pitch * h);
+    // A8R8G8B8 and X8R8G8B8 go up as they are in guest memory (B, G, R, A bytes), and
+    // the fixed-function shader swaps R and B (u_swz): converting a 2048x2048 page
+    // here took 20 ms, a dropped frame where a room first shows it. Other readers of
+    // the texture get it converted first (normalize).
+    const raw = (fmt === 21 || fmt === 22) && pitch % 4 === 0 && t.swz !== 0;
+    if (t.swz > 0 && !raw) this.normalize(t);
     gl.bindTexture(gl.TEXTURE_2D, t.tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, toRGBA(fmt, src, w, h, pitch));
+    if (raw) {
+      const swz = fmt === 22 ? 2 : 1;
+      if (t.swz !== swz) this.keyValid = false;
+      t.swz = swz;
+      (t.src ??= [])[level] = { w, h, fmt, pitch, bits };
+      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, pitch >> 2);
+      gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, src);
+      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    } else {
+      if (t.swz !== 0) this.keyValid = false;
+      t.swz = 0;
+      gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, toRGBA(fmt, src, w, h, pitch));
+    }
     if (level + 1 > t.uploaded && level === t.uploaded) t.uploaded = level + 1;
     t.params = '';
+  }
+
+  /** Texture `t` converted to R, G, B, A from the guest memory its levels came from (still
+   * theirs: uploads happen when a draw uses levels the guest changed), for readers other
+   * than the fixed-function shader. */
+  normalize(t) {
+    if (!(t.swz > 0)) return;
+    this.flush();
+    const gl = this.gl;
+    t.swz = 0;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    for (const [level, s] of (t.src ?? []).entries()) {
+      if (s) gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA8, s.w, s.h, 0, gl.RGBA, gl.UNSIGNED_BYTE, toRGBA(s.fmt, new Uint8Array(this.guestBuffer(), s.bits, s.pitch * s.h), s.w, s.h, s.pitch));
+    }
+    t.src = null;
+    this.keyValid = false;
   }
 
   textureDelete(id) {
@@ -413,6 +466,7 @@ export class D3DGL {
       const m = mul(mul(f.subarray(D.world, D.world + 16), f.subarray(D.view, D.view + 16)), f.subarray(D.proj, D.proj + 16));
       gl.uniformMatrix4fv(this.u.u_wvp, false, m);
     }
+    const swz = [0, 0];
     for (let s = 0; s < 2; s++) {
       const base = s ? D.tss1 : D.tss0;
       const ts = (i) => w[base + i];
@@ -421,11 +475,13 @@ export class D3DGL {
       gl.activeTexture(gl.TEXTURE0 + s);
       gl.bindTexture(gl.TEXTURE_2D, t ? t.tex : this.white);
       if (t) this.samplerParams(t, ts(TSS.ADDRESSU), ts(TSS.ADDRESSV), ts(TSS.MAGFILTER), ts(TSS.MINFILTER), ts(TSS.MIPFILTER));
+      swz[s] = t ? Math.max(0, t.swz) : 0;
       // A stage without a texture reads TEXTURE as opaque white.
       gl.uniform4i(s ? this.u.u_stage1 : this.u.u_stage0, ts(TSS.COLOROP), ts(TSS.COLORARG1), ts(TSS.COLORARG2), ts(TSS.ALPHAOP));
       gl.uniform4i(s ? this.u.u_alpha1 : this.u.u_alpha0, ts(TSS.ALPHAARG1), ts(TSS.ALPHAARG2), t ? 1 : 0, 0);
     }
     gl.activeTexture(gl.TEXTURE0);
+    gl.uniform2i(this.u.u_swz, swz[0], swz[1]);
     const tf = rs(RS.TEXTUREFACTOR);
     gl.uniform4f(this.u.u_tfactor, ((tf >>> 16) & 255) / 255, ((tf >>> 8) & 255) / 255, (tf & 255) / 255, ((tf >>> 24) & 255) / 255);
     gl.uniform1i(this.u.u_atest, rs(RS.ALPHATESTENABLE) ? rs(RS.ALPHAFUNC) : 8);
@@ -599,6 +655,7 @@ export class D3DGL {
     if (!id) return this.back?.fbo;
     const t = this.textures.get(id);
     if (!t) return null;
+    this.normalize(t);
     if (!t.fbo) Object.assign(t, this.framebuffer(t.w, t.h, t.tex));
     return t.fbo;
   }
@@ -762,7 +819,12 @@ export class D3DGL {
     const rs = (i) => w[D9.rs + i];
     gl.uniform1i(p.atest, rs(RS.ALPHATESTENABLE) ? rs(RS.ALPHAFUNC) : 8);
     gl.uniform1f(p.aref, rs(RS.ALPHAREF) & 255);
-    // Textures with their sampler states
+    // Textures with their sampler states (in R, G, B, A for the game's shaders)
+    for (const s of p.samplers) {
+      const id = w[D9.textures + 3 * s];
+      const t = id ? this.textures.get(id) : null;
+      if (t) this.normalize(t);
+    }
     for (const s of p.samplers) {
       const id = w[D9.textures + 3 * s];
       const t = id ? this.textures.get(id) : null;
