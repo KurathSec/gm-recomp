@@ -105,7 +105,8 @@ self.onmessage = async ({ data }) => {
     const moduleProfiles = new Map(); // key -> {data, seen: Set of addresses}
     const siteProfile = (m) =>
       fetch(`/profiles/module-${m.id.toString(16)}-${m.base.toString(16)}.bin`)
-        .then((r) => (r.ok ? r.arrayBuffer() : null))
+        // (a host may answer a missing file with a page)
+        .then((r) => (r.ok && !r.headers.get('content-type')?.includes('html') ? r.arrayBuffer() : null))
         .then((b) => (b && b.byteLength % 12 === 0 ? new Uint32Array(b) : null))
         .catch(() => null);
     const moduleProfile = async (m) => {
