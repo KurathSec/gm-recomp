@@ -40,6 +40,10 @@ pub struct Options {
     pub no_inline: bool,
 }
 
+/// A function body larger than this is emitted again without inline x87 (the limit
+/// browsers enforce is 7,654,321 bytes).
+const MAX_FUNCTION_BYTES: usize = 7_000_000;
+
 pub struct Translator<'m> {
     mem: &'m dyn GuestMem,
     opts: Options,
@@ -201,13 +205,23 @@ impl<'m> Translator<'m> {
         let mut code = CodeSection::new();
         let mut out_funcs = Vec::new();
         for (&entry, cfg) in &self.cfgs {
-            let mut fe = lift::FuncEmit::new(cfg, &func_index);
-            fe.probe = self.opts.probes.contains(&entry);
-            fe.x87_inline = !self.opts.no_x87_inline;
-            fe.resolve_cache = self.opts.resolve_cache;
-            fe.count = self.opts.count;
-            fe.count_blocks = self.opts.count_blocks;
-            fe.emit();
+            let emit = |x87_inline: bool| {
+                let mut fe = lift::FuncEmit::new(cfg, &func_index);
+                fe.probe = self.opts.probes.contains(&entry);
+                fe.x87_inline = x87_inline;
+                fe.resolve_cache = self.opts.resolve_cache;
+                fe.count = self.opts.count;
+                fe.count_blocks = self.opts.count_blocks;
+                fe.emit();
+                fe
+            };
+            let mut fe = emit(!self.opts.no_x87_inline);
+            // Browsers reject function bodies over 7,654,321 bytes; x87 through rt.fpu
+            // takes about half the space of the inline paths (d3dx9_43 has a 40,000
+            // instruction function of x87 code: 7.8 MB, 3.6 MB this way).
+            if fe.f.byte_len() > MAX_FUNCTION_BYTES && fe.x87_inline {
+                fe = emit(false);
+            }
             self.unimplemented.extend(fe.unimplemented.drain(..));
             functions.function(types::FUNC);
             let name = abi::export_name(entry);
