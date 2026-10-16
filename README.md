@@ -53,7 +53,15 @@ web/tools/system32.sh
 
 The browser also remembers which code each game needed and translates it right
 after the first frame of the next session (`?noprofile` turns that off), so later
-sessions do not stall the first time they reach a room or effect.
+sessions do not stall the first time they reach a room or effect. A game's first
+session starts from what other games built with the same runner needed, or from the
+site's profiles in `web/public/profiles` until there are any. To remake those:
+
+```sh
+# per run (any games, recorded sessions with --replay), then merged
+node web/tools/run-node.mjs web/public/games/<slug> --frames 1000 --module-profiles runs/<slug>
+node web/tools/module-profiles.mjs web/public/profiles runs/*/
+```
 
 ## How it works
 

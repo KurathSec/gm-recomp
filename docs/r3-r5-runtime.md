@@ -322,6 +322,35 @@ Vandal's seventh floor):
   dispatches per frame, `run-node.mjs --profile from:to` (a CPU profile of a frame
   range), `run-browser.sh` with `FFPREFS`, `web/memtest/callbench.html` (call
   costs by kind).
+- Profiles across games: each module's code is identified by a hash of its
+  executable sections (`ModInfo::code_id`), and what a session needed is also filed
+  per module (IndexedDB `module:<code id>:<base>`). A game without its own profile
+  starts from what other games needed of the same modules (every game built with a
+  runner version runs the same runner code, and GMS games ship the same D3DX DLL);
+  before any has, from the site's (`web/public/profiles/module-<code id>-<base>.bin`,
+  made by `run-node.mjs --module-profiles <dir>` per run and merged by
+  `tools/module-profiles.mjs`: a function goes before the start only if every run
+  that needed it did so before its first frame). The ones committed come from 1000
+  frames of every corpus game and the recorded sessions of Vandal, 3055 and NANG.
+  uhuhu's first session: frames over 15 ms after the first, 5 -> 0.
+- 32-bit textures (A8R8G8B8, X8R8G8B8) go to `texImage2D` straight from guest
+  memory, B, G, R, A as the guest has them (both browsers take views of shared
+  memory), and the fixed-function shader swaps them back (`u_swz`); translated
+  shaders, render targets, blits and readbacks first get the texture converted from
+  the guest memory its levels came from (`D3DGL.normalize`). The JS conversion had
+  been a per-pixel switch: ~20 ms for a 2048x2048 page in the frame a room first
+  drew from it. 3055's room loads (frames 76 and 104): 26-29 -> 14-16 ms of guest
+  time in Firefox. Captures are pixel-identical.
+- A function whose body would pass the browsers' limit (7 654 321 bytes) is emitted
+  again without inline x87 (`recomp::MAX_FUNCTION_BYTES`): a 40 000-instruction x87
+  function in d3dx9_43.dll came to 7.8 MB and Chrome refused its module when ahead
+  translation reached it; through `rt.fpu` it is 3.6 MB.
+- The worker fetches and compiles the runtime while the game downloads (it had
+  waited for the downloads), and creates the WebGL context meanwhile: the first
+  WebGL context in a browser session took 2.6 s in headless Firefox (30 ms after).
+- Looked at and left: room changes in GMS show one frame for 40 ms because the
+  runner itself skips the Present of the frame it changes rooms in (native does the
+  same); NANG's ~1 s fourth frame is its own resource loading (guest code, zlib).
 
 ## Importing in the browser
 
@@ -343,11 +372,14 @@ the same state hashes. NSIS installers still need the native importer (7z).
 - Shaded draws are verified with the test program above, not yet in a game scene.
 - CPUID does not report MMX (MMX is lifted, for code that uses it without asking);
   code with an SSE or scalar fallback takes that.
-- GMS 1.4 runs at 49.7-49.9 fps instead of 50: it measures each frame from a
-  timestamp taken after the frame's own clock reads, and every
-  QueryPerformanceCounter advances the virtual clock 1-4 µs (so spin-waits end), so
-  20.03 ms per frame in menus, ~20.13 ms in play. Sub-microsecond steps for reads
-  outside a spin would fix it; it changes every GMS game's state hashes.
+- GMS 1.4 frames last ~20.03 ms instead of 20 (49.93 fps): its limiter
+  (`0x4d54f0` in the 1.4.9999 runner) sleeps `1/room_speed - (now - frame_start)`
+  from a second clock read of its own and takes `frame_start` after the sleep, and
+  every QueryPerformanceCounter advances the virtual clock 1-4 µs (so spin-waits
+  end): ~20 µs of profiler reads between the two reads, 3 µs of spin overshoot and
+  8 µs before `frame_start`. Mean intervals of ~20.13 ms in play also count the
+  runner's own 40 ms frames at room changes. Sub-microsecond steps for reads
+  outside a spin would remove the 30 µs; it changes every GMS game's state hashes.
 - x87 deviations in rare edges: fsqrt of extended-precision denormals, fidivr with
   precision control 01 (see `r1-cpu.md`).
 - No networking: ws2_32 reports the network as not ready, wininet fails to open; Steam is not loaded.
