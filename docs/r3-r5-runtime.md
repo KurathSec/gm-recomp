@@ -363,7 +363,12 @@ Vandal's seventh floor):
   file at load: `ModInfo::cost_bytes`) as 12 bytes, since x87 code compiles to far
   more wasm per byte (one overrunning batch was 31-70 % x87 against ~2 % usually):
   summed lateness 37/42/24 ms with the site profile, 39/51 without (from 29/59/65
-  and 36/62). Overruns remain now and then in the frame after a room change.
+  and 36/62). Overruns remain now and then in the frame after a room change: in
+  Vandal's replay frame 80 spends ~30 ms in ahead translation over several waits
+  with no batch much over 7 ms and no real wait left (accumulation across the
+  frame's `pace` calls, not one batch; raising the slack threshold from 0.8 to 4 ms
+  did not change it). Next to look at: how the slack is computed in the frame after
+  the runner's 40 ms room-change frame.
 - A function whose body would pass the browsers' limit (7 654 321 bytes) is emitted
   again without inline x87 (`recomp::MAX_FUNCTION_BYTES`): a 40 000-instruction x87
   function in d3dx9_43.dll came to 7.8 MB and Chrome refused its module when ahead
