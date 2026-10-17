@@ -358,9 +358,12 @@ Vandal's seventh floor):
   slack instead of 60 %) took that to 26 ms (Firefox) and 31 ms (Chrome) with the
   site profile, but ahead translation then almost stops (batches below 4 functions
   wait for a longer wait: 500 functions instead of 7 000-9 000 in Vandal), and
-  without a profile room loads hitch again (56 vs 49 ms): left at 6 ms. A better
-  estimate of a batch's cost (x87-heavy code compiles to far more wasm per byte) is
-  the open item.
+  without a profile room loads hitch again (56 vs 49 ms): left at 6 ms. Instead the
+  estimate counts each x87 opcode byte (D8-DF, counted per function from the module
+  file at load: `ModInfo::cost_bytes`) as 12 bytes, since x87 code compiles to far
+  more wasm per byte (one overrunning batch was 31-70 % x87 against ~2 % usually):
+  summed lateness 37/42/24 ms with the site profile, 39/51 without (from 29/59/65
+  and 36/62). Overruns remain now and then in the frame after a room change.
 - A function whose body would pass the browsers' limit (7 654 321 bytes) is emitted
   again without inline x87 (`recomp::MAX_FUNCTION_BYTES`): a 40 000-instruction x87
   function in d3dx9_43.dll came to 7.8 MB and Chrome refused its module when ahead

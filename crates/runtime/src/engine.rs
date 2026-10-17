@@ -48,6 +48,24 @@ pub struct ModInfo {
     /// the same runner (a GM8 game's data follows the sections), so translation
     /// profiles can be shared between them.
     pub code_id: u32,
+    /// Per function in `sorted`: bytes that open an x87 instruction (D8-DF) up to the
+    /// next function, for ahead translation's cost estimate (`cost_bytes`).
+    pub x87: Vec<u32>,
+}
+
+/// An x87 instruction translates to several times the wasm (and compile time) of an
+/// integer one: ahead translation counts each x87 opcode byte as this many bytes.
+const X87_COST_BYTES: u32 = 12;
+
+impl ModInfo {
+    /// What translating the function at `a` is estimated to cost, in bytes of plain code:
+    /// its length up to the next function (at most 64 KB) and its x87 code again.
+    pub fn cost_bytes(&self, a: u32) -> u32 {
+        let k = self.sorted.partition_point(|&f| f <= a);
+        let len = self.sorted.get(k).copied().unwrap_or(self.base + self.size).saturating_sub(a).clamp(1, 0x10000);
+        let x87 = if k > 0 && self.sorted[k - 1] == a { self.x87.get(k - 1).copied().unwrap_or(0) } else { 0 };
+        len + X87_COST_BYTES * x87
+    }
 }
 
 pub use crate::fasthash::AddrHash;
@@ -743,7 +761,18 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
         }
         let mut sorted: Vec<u32> = functions.iter().copied().collect();
         sorted.sort_unstable();
-        m.engine().mods.push(ModInfo { name, base, size, functions, sorted, jump_tables, code_id });
+        let x87 = match pe::Pe::parse(&file) {
+            Ok(pe) => (0..sorted.len())
+                .map(|k| {
+                    let end = sorted.get(k + 1).copied().unwrap_or(base + size).min(sorted[k].saturating_add(0x10000));
+                    let off = pe.rva_to_offset(sorted[k] - base).unwrap_or(usize::MAX);
+                    let bytes = file.get(off..off.saturating_add(end.saturating_sub(sorted[k]) as usize).min(file.len())).unwrap_or(&[]);
+                    bytes.iter().filter(|&&b| (0xD8..=0xDF).contains(&b)).count() as u32
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        m.engine().mods.push(ModInfo { name, base, size, functions, sorted, jump_tables, code_id, x87 });
     }
 }
 
@@ -906,12 +935,11 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
 /// sees no difference. Returns how many were translated.
 pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
     if m.engine_ref().idle_queue.is_none() {
-        // (address, bytes up to the next function or the module's end)
+        // (address, estimated cost in bytes: `ModInfo::cost_bytes`)
         let mut q: Vec<(u32, u32)> = Vec::new();
         for md in &m.engine_ref().mods {
-            for (k, &a) in md.sorted.iter().enumerate() {
-                let end = md.sorted.get(k + 1).copied().unwrap_or(md.base + md.size);
-                q.push((a, end.saturating_sub(a).clamp(1, 0x10000)));
+            for &a in &md.sorted {
+                q.push((a, md.cost_bytes(a)));
             }
         }
         q.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -976,8 +1004,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
                     e.profile.pop();
                     continue;
                 }
-                let k = md.sorted.partition_point(|&f| f <= a);
-                let size = md.sorted.get(k).copied().unwrap_or(md.base + md.size).saturating_sub(a).clamp(1, 0x10000);
+                let size = md.cost_bytes(a);
                 if size as u64 * per > budget_ns.max(4_000_000) {
                     e.profile.pop(); // too large to translate ahead
                     continue;
@@ -995,8 +1022,7 @@ pub fn translate_idle<M: Machine>(m: &mut M, deadline_us: u64) -> usize {
                     continue;
                 }
                 let Some(md) = e.mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
-                let k = md.sorted.partition_point(|&f| f <= a);
-                let size = md.sorted.get(k).copied().unwrap_or(md.base + md.size).saturating_sub(a).clamp(1, 0x10000);
+                let size = md.cost_bytes(a);
                 if (bytes + size as u64) * per > budget_ns || b.len() >= 16 {
                     e.idle_next.push(a);
                     break;
