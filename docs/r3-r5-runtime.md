@@ -353,7 +353,14 @@ Vandal's seventh floor):
   2-3.5 ms of guest time and on time (they were 14-16 ms and 12-28 ms late). Summed
   lateness over 3055's replay, three first sessions each: 29/59/65 ms with, 46/67/58
   without; what is left is ahead translation overrunning its estimate 3-5x now and
-  then (likely contention with the GPU process here; to watch on real GPUs).
+  then (likely contention with the GPU process here; to watch on real GPUs), mostly
+  in the frame after a room change. Waits of 4 ms at most instead of 6 (half the
+  slack instead of 60 %) took that to 26 ms (Firefox) and 31 ms (Chrome) with the
+  site profile, but ahead translation then almost stops (batches below 4 functions
+  wait for a longer wait: 500 functions instead of 7 000-9 000 in Vandal), and
+  without a profile room loads hitch again (56 vs 49 ms): left at 6 ms. A better
+  estimate of a batch's cost (x87-heavy code compiles to far more wasm per byte) is
+  the open item.
 - A function whose body would pass the browsers' limit (7 654 321 bytes) is emitted
   again without inline x87 (`recomp::MAX_FUNCTION_BYTES`): a 40 000-instruction x87
   function in d3dx9_43.dll came to 7.8 MB and Chrome refused its module when ahead
