@@ -303,7 +303,10 @@ Vandal's seventh floor):
   for a ~75 ms burst at frame 10. Entries needed before the first frame whose code
   already matches before any guest code runs (code a packer has yet to unpack, or
   startup code will patch, cannot match) are translated then, in full batches (`engine::profile_prefetch`): 3055's
-  first frame 4.5 -> 1.9 s in Firefox. `?noprofile` turns it off.
+  first frame 4.5 -> 1.9 s in Firefox. `?noprofile` turns it off. Since 05:30 the
+  prefetch takes everything the burst would (the first 300 frames' needs) that
+  already matches: the first frame comes 0.1-0.3 s later, behind a blank window,
+  and the intro no longer stops (3055: a 130 ms frame at frame 5 before).
 - Ahead translation fits a batch's cost as fixed + per byte (`fit_idle_cost`); the
   per-byte rate alone had folded in each module's fixed compile cost and overstated
   small batches threefold, so waits rarely fit a module. 3055 first session: ahead

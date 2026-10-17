@@ -1152,15 +1152,16 @@ fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
     }
     sync_modules(m);
     let t = m.now_us();
-    // (the profile is a stack, first needed last); what was needed before the first
-    // frame, and matches
+    // (the profile is a stack, first needed last); what the burst after the first frame
+    // would take, and matches: translated here it holds up a blank window instead of
+    // the game's first frames (a ~130 ms stop in 3055's intro)
     let entries: Vec<(u32, u32, u32)> = m.engine().profile.drain(..).rev().collect();
     let (mut now, mut later) = (Vec::new(), Vec::new());
     for (a, h, frame) in entries {
         let e = m.engine_ref();
         let mapped = e.mods.iter().any(|md| a >= md.base && a < md.base + md.size);
-        if frame == 0 && mapped {
-            now.push((a, h));
+        if frame <= PROFILE_BURST_FRAMES && mapped {
+            now.push((a, h, frame));
         } else {
             later.push((a, h, frame));
         }
@@ -1168,21 +1169,22 @@ fn profile_prefetch<M: Machine>(m: &mut M, budget_us: u64) {
     // (those whose code differs now, and any the time runs out for, wait for later)
     let mut done = 0;
     for chunk in now.chunks(16) {
-        let batch: Vec<(u32, u32)> = chunk.iter().copied().filter(|(a, _)| !m.engine_ref().funcs.contains_key(a)).collect();
+        let batch: Vec<(u32, u32, u32)> = chunk.iter().copied().filter(|(a, _, _)| !m.engine_ref().funcs.contains_key(a)).collect();
         if batch.is_empty() {
             continue;
         }
         if m.now_us() - t > budget_us {
-            later.extend(batch.iter().map(|&(a, h)| (a, h, 0)));
+            later.extend(batch);
             continue;
         }
-        let addrs: Vec<u32> = batch.iter().map(|&(a, _)| a).collect();
-        match translate_batch_checked(m, &addrs, addrs.len(), &batch) {
+        let addrs: Vec<u32> = batch.iter().map(|&(a, _, _)| a).collect();
+        let expect: Vec<(u32, u32)> = batch.iter().map(|&(a, h, _)| (a, h)).collect();
+        match translate_batch_checked(m, &addrs, addrs.len(), &expect) {
             Ok((_, changed)) => {
                 done += addrs.len() - changed.len();
-                later.extend(batch.iter().filter(|(a, _)| changed.contains(a)).map(|&(a, h)| (a, h, 0)));
+                later.extend(batch.iter().filter(|(a, _, _)| changed.contains(a)));
             }
-            Err(_) => later.extend(batch.iter().map(|&(a, h)| (a, h, 0))),
+            Err(_) => later.extend(batch),
         }
     }
     // back to a stack in order of need
