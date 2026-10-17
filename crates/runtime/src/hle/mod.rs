@@ -103,6 +103,11 @@ pub trait Host: Guest {
     /// The main thread's clock moved on to `clock_us`: a host that plays in real time
     /// holds it there until real time catches up.
     fn pace(&mut self, _clock_us: u64) {}
+    /// How long (ms) a host that plays in real time has before the guest's clock is
+    /// due at `clock_us` (0: none, or not playing in real time).
+    fn slack_ms(&mut self, _clock_us: u64) -> f64 {
+        0.0
+    }
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far, `clock_us` the guest's clock (a replay delivers each
     /// event at the poll it was taken at).
@@ -192,6 +197,18 @@ impl Ctx<'_> {
             // The sound mixed so far goes out now, not only at the next Present: the
             // host's buffer can stay small and a sound starts sooner after its frame.
             dsound::flush_audio(self);
+            // A texture the guest finished writing goes to the GPU here if this wait
+            // leaves time for it, instead of in the frame that first draws it (GMS
+            // decodes every texture page at the start; a room's first draw from a
+            // 2048x2048 page used to upload it then).
+            if !self.p.pending_uploads.is_empty() && self.host.slack_ms(self.p.clock_us) > UPLOAD_SLACK_MS {
+                let (tex, version) = self.p.pending_uploads.remove(0);
+                if version == 8 {
+                    d3d8::upload_pending(self, tex);
+                } else {
+                    d3d9::upload_pending(self, tex);
+                }
+            }
             self.host.pace(self.p.clock_us);
         }
         dsound::tick(self);
@@ -215,6 +232,10 @@ impl Ctx<'_> {
         self.p.registry.entries.get(self.id.0 as usize).map(|e| e.nargs).unwrap_or(0)
     }
 }
+
+/// The time a wait must leave (ms) for a texture upload in it (a 2048x2048 page takes
+/// several ms in a browser).
+const UPLOAD_SLACK_MS: f64 = 12.0;
 
 pub type ApiFn = fn(&mut Ctx) -> ApiResult;
 

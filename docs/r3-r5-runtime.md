@@ -344,6 +344,16 @@ Vandal's seventh floor):
   been a per-pixel switch: ~20 ms for a 2048x2048 page in the frame a room first
   drew from it. 3055's room loads (frames 76 and 104): 26-29 -> 14-16 ms of guest
   time in Firefox. Captures are pixel-identical.
+- Textures the guest finished writing (`mark_dirty`: Unlock, copies) wait in
+  `Process::pending_uploads`, and one goes to the GPU at each step of the clock that
+  leaves more than 12 ms before the frame is due (`Host::slack_ms`); a draw still
+  uploads whatever is left. GMS decodes every texture page at the start, so the pages
+  now go up during the intro (~9.5 ms each in headless Firefox's software GL) instead
+  of in the frame a room first draws from them: 3055's room loads (frames 76 and 104)
+  2-3.5 ms of guest time and on time (they were 14-16 ms and 12-28 ms late). Summed
+  lateness over 3055's replay, three first sessions each: 29/59/65 ms with, 46/67/58
+  without; what is left is ahead translation overrunning its estimate 3-5x now and
+  then (likely contention with the GPU process here; to watch on real GPUs).
 - A function whose body would pass the browsers' limit (7 654 321 bytes) is emitted
   again without inline x87 (`recomp::MAX_FUNCTION_BYTES`): a 40 000-instruction x87
   function in d3dx9_43.dll came to 7.8 MB and Chrome refused its module when ahead

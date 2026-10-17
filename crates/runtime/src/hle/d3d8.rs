@@ -226,6 +226,7 @@ fn release_obj(c: &mut Ctx, t: u32) -> u32 {
         None => 0,
     };
     if n == 0 {
+        c.p.pending_uploads.retain(|&(x, _)| x != t);
         if let Some(o) = c.p.d3d_objects.remove(&t) {
             if o.data.get("gpu").copied().unwrap_or(0) != 0 {
                 c.p.gpu.texture_delete(t);
@@ -769,6 +770,7 @@ fn sync_texture(c: &mut Ctx, tex: u32) {
         return;
     }
     set_field(c, tex, "dirty", 0);
+    c.p.pending_uploads.retain(|&(t, _)| t != tex);
     let (w, h, fmt) = (field(c, tex, "w"), field(c, tex, "h"), field(c, tex, "fmt"));
     for level in 0..16 {
         if dirty & (1 << level) == 0 {
@@ -786,6 +788,17 @@ fn sync_texture(c: &mut Ctx, tex: u32) {
 fn mark_dirty(c: &mut Ctx, tex: u32, level: u32) {
     let d = field(c, tex, "dirty") | (1 << level.min(15));
     set_field(c, tex, "dirty", d);
+    if !c.p.pending_uploads.contains(&(tex, 8)) {
+        c.p.pending_uploads.push((tex, 8));
+    }
+}
+
+/// Uploads what the guest changed of texture `tex`, if it is still a GPU texture
+/// (`Process::pending_uploads`).
+pub(crate) fn upload_pending(c: &mut Ctx, tex: u32) {
+    if c.p.d3d_objects.contains_key(&tex) && field(c, tex, "gpu") != 0 {
+        sync_texture(c, tex);
+    }
 }
 
 /// Builds the host's draw record from the device state.

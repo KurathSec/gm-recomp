@@ -258,6 +258,10 @@ pub trait Machine: Guest {
     }
     /// See `Host::pace`.
     fn pace(&mut self, _clock_us: u64) {}
+    /// See `Host::slack_ms`.
+    fn slack_ms(&mut self, _clock_us: u64) -> f64 {
+        0.0
+    }
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -416,6 +420,10 @@ impl<M: Machine> Host for M {
 
     fn pace(&mut self, clock_us: u64) {
         Machine::pace(self, clock_us)
+    }
+
+    fn slack_ms(&mut self, clock_us: u64) -> f64 {
+        Machine::slack_ms(self, clock_us)
     }
 
     fn set_fpu_state(&mut self, f: &fpu::Fpu) {

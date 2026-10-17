@@ -354,6 +354,9 @@ impl Machine for Web {
         }
         out
     }
+    fn slack_ms(&mut self, clock_us: u64) -> f64 {
+        unsafe { gpu_slack(clock_us as f64 / 1000.0) }
+    }
     fn pace(&mut self, clock_us: u64) {
         let ms = clock_us as f64 / 1000.0;
         // Time to wait anyway (often a millisecond at a time: game threads sleep in

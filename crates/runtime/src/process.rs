@@ -388,6 +388,9 @@ pub struct Process {
     pub numpad_shift: u8,
     /// The millisecond of the clock the host was last asked to pace to.
     pub paced_ms: u64,
+    /// Textures the guest finished writing that no draw has uploaded yet, with the
+    /// Direct3D version (8, 9) that owns them: uploaded while the game waits.
+    pub pending_uploads: Vec<(u32, u8)>,
     /// The MIDI SoundFont, once the host supplied it (or failed to).
     pub soundfont: Option<std::sync::Arc<rustysynth::SoundFont>>,
     pub soundfont_failed: bool,
@@ -519,6 +522,7 @@ impl Process {
             numpad_sent: [0; 11],
             numpad_shift: 0,
             paced_ms: 0,
+            pending_uploads: Vec::new(),
             timers_due: Vec::new(),
             pads: Default::default(),
             soundfont: None,
