@@ -38,6 +38,20 @@ export const MODS = [
     files: ['sprPlayerIdle.png', 'sprPlayerRunning.png', 'sprPlayerJump.png', 'sprPlayerFall.png', 'sprPlayerSliding.png', 'sprBow.png'],
   },
   {
+    id: 'DbgHelper',
+    name: 'DbgHelper',
+    about: 'Fixes GameMaker lag issues: gm8x_fix 0.5.9’s patches to the GameMaker 8 runner.',
+    applies: gm8,
+    options: [
+      { key: 'InputLagPatch', label: 'Input lag patch', type: 'bool', default: true },
+      { key: 'JoystickPatch', label: 'Joystick patch', type: 'bool', default: true },
+      { key: 'SchedulerPatch', label: 'Scheduler patch', type: 'bool', default: true },
+      { key: 'MemoryPatch', label: 'Memory patch', type: 'bool', default: true },
+      { key: 'DirectPlayPatch', label: 'DirectPlay patch', type: 'bool', default: true },
+    ],
+    files: [],
+  },
+  {
     id: 'DotKid',
     name: 'DotKid',
     about: 'The player is drawn as its collision box (a dot), with an optional outline circle.',

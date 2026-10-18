@@ -6,6 +6,8 @@
 
 pub mod debug;
 pub mod gm8;
+pub mod gm8x_fix;
+mod gm8x_fix_data;
 pub mod image;
 pub mod mods;
 
@@ -101,6 +103,8 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
     let mut log = Vec::new();
     // GameMaker 8's game data, parsed once for all the mods and written back at the end
     let mut gm8: Option<gm8::Gm8> = None;
+    // changes to the exe itself, after the game data is written (ModLoader's ModExecutable)
+    let mut exe_mods: Vec<(String, &Value)> = Vec::new();
     for m in mods {
         let id = m["id"].as_str().unwrap_or("");
         let config = &m["config"];
@@ -126,6 +130,10 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
                 "AllowFullscreen" => mods::allow_fullscreen_gm8(g)?,
                 "CrimsonKid" => mods::crimson_kid_gm8(g, config, assets)?,
                 "DotKid" => mods::dot_kid_gm8(g, config, assets)?,
+                "DbgHelper" => {
+                    exe_mods.push((id.to_owned(), config));
+                    Vec::new()
+                }
                 _ => return Err(format!("{id} does not work with GameMaker 8 games yet")),
             }
         } else {
@@ -133,9 +141,15 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
         };
         log.extend(lines.into_iter().map(|l| format!("{id}: {l}")));
     }
+    let entry = game.entry.clone();
     if let Some(g) = gm8 {
-        let entry = game.entry.clone();
         game.put(&entry, g.write());
+    }
+    for (id, config) in exe_mods {
+        let exe = game.file_mut(&entry).ok_or("the game's exe is missing")?;
+        let flag = |k: &str| config[k].as_bool().unwrap_or(true);
+        let o = gm8x_fix::Options { input_lag: flag("InputLagPatch"), joystick: flag("JoystickPatch"), scheduler: flag("SchedulerPatch"), memory: flag("MemoryPatch"), direct_play: flag("DirectPlayPatch") };
+        log.extend(gm8x_fix::apply(exe, &o)?.into_iter().map(|l| format!("{id}: {l}")));
     }
     Ok(log)
 }
