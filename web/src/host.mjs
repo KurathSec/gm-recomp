@@ -259,7 +259,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       // sleeps a millisecond at a time): until the next frame is due, less what the
       // guest needs for it and a margin; the waits after it then end at once.
       let shownClock = 0;
+      // The frame period: the shortest of the last 8 clock steps, so a one-off long
+      // frame (GMS skips a Present when it changes rooms: a 40 ms step) does not make
+      // the next frame look 40 ms away and ahead translation run into it.
       let frameStep = 20;
+      const steps = [];
       if (ahead)
         gpuImports.gpu_slack = (clockMs) => {
           const now = performance.now();
@@ -286,7 +290,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       let wakeUp = null;
       channel.port1.onmessage = () => wakeUp?.();
       gpuImports.gpu_present = new WebAssembly.Suspending((clockMs, x, y, w, h, dw, dh) => {
-        if (clockMs > shownClock) frameStep = Math.min(100, clockMs - shownClock);
+        if (clockMs > shownClock) {
+          steps.push(Math.min(100, clockMs - shownClock));
+          if (steps.length > 8) steps.shift();
+          frameStep = Math.min(...steps);
+        }
         shownClock = clockMs;
         const frame = show(clockMs, x, y, w, h, dw, dh, guestTime());
         const r = onFrame ? onFrame(frame, gpu) : undefined;
