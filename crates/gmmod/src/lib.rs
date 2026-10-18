@@ -5,6 +5,9 @@
 //! mods' own files, then takes back the files that changed or were added.
 
 pub mod debug;
+pub mod gm8;
+pub mod image;
+pub mod mods;
 
 use serde_json::{Value, json};
 
@@ -95,16 +98,44 @@ impl Assets {
 /// Applies the mods `mods` ([{id, config}], in order) to `game`; returns a log line per
 /// change (or skip), or the first error.
 pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<String>, String> {
-    let _ = assets;
     let mut log = Vec::new();
+    // GameMaker 8's game data, parsed once for all the mods and written back at the end
+    let mut gm8: Option<gm8::Gm8> = None;
     for m in mods {
         let id = m["id"].as_str().unwrap_or("");
         let config = &m["config"];
-        let lines = match id {
-            "debug" => debug_mod(game, config)?,
-            _ => return Err(format!("unknown mod {id}")),
+        let lines = if id == "debug" {
+            debug_mod(game, config)?
+        } else if game.engine.is_gm8() {
+            if gm8.is_none() {
+                let exe = game.files.get(game.index(&game.entry).ok_or("the game's exe is missing")?).unwrap();
+                gm8 = Some(gm8::Gm8::parse(&exe.1)?);
+            }
+            let g = gm8.as_mut().unwrap();
+            match id {
+                // (parsed and written back unchanged: a test)
+                "_roundtrip" => Vec::new(),
+                // (the assets' names: a test)
+                "_list" => {
+                    let names = |l: &gm8::List| -> Result<String, String> {
+                        Ok(l.names()?.iter().flatten().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>().join(" "))
+                    };
+                    vec![format!("sprites: {}", names(&g.sprites)?), format!("objects: {}", names(&g.objects)?), format!("scripts: {}", names(&g.scripts)?)]
+                }
+                "GodMode" => mods::godmode_gm8(g)?,
+                "AllowFullscreen" => mods::allow_fullscreen_gm8(g)?,
+                "CrimsonKid" => mods::crimson_kid_gm8(g, config, assets)?,
+                "DotKid" => mods::dot_kid_gm8(g, config, assets)?,
+                _ => return Err(format!("{id} does not work with GameMaker 8 games yet")),
+            }
+        } else {
+            return Err(format!("{id} does not work with this game's engine yet"));
         };
         log.extend(lines.into_iter().map(|l| format!("{id}: {l}")));
+    }
+    if let Some(g) = gm8 {
+        let entry = game.entry.clone();
+        game.put(&entry, g.write());
     }
     Ok(log)
 }

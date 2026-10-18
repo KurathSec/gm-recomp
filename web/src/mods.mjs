@@ -4,8 +4,8 @@
 // allows (`applies`, from the manifest's engine) and keeps each game's choices.
 
 // Fangame.ModLoader edits GameMaker 8 games and GameMaker: Studio games that keep their
-// bytecode (not YYC).
-const modLoaderGame = (e) => e?.kind === 'gm80' || e?.kind === 'gm81' || (e?.kind === 'gms' && !e.yyc);
+// bytecode (not YYC); these mods do GameMaker 8 so far.
+const gm8 = (e) => e?.kind === 'gm80' || e?.kind === 'gm81';
 
 /**
  * id: the mod (crates/gmmod `apply`); options: {key, label, type 'bool' | 'number' | 'text',
@@ -18,6 +18,39 @@ export const MODS = [
     about: "Turns on the game's debug switch (debugMode and the like), as patcher.rs does.",
     applies: (e) => e?.kind === 'gms',
     options: [{ key: 'noDeath', label: 'Also debugNoDeath (the player cannot die)', type: 'bool', default: false, applies: (e) => !e.yyc }],
+    files: [],
+  },
+  // Fangame.ModLoader's mods, in its order (they apply in this order)
+  {
+    id: 'AllowFullscreen',
+    name: 'AllowFullscreen',
+    about: 'F4 switches the game to full screen (a GameMaker 8 setting).',
+    applies: gm8,
+    options: [],
+    files: [],
+  },
+  {
+    id: 'CrimsonKid',
+    name: 'CrimsonKid',
+    about: 'The Crimson Kid skin: new player and bow sprites, the bow drawn behind the player.',
+    applies: gm8,
+    options: [{ key: 'BowImageSpeed', label: 'Bow animation speed', type: 'number', default: 0.2 }],
+    files: ['sprPlayerIdle.png', 'sprPlayerRunning.png', 'sprPlayerJump.png', 'sprPlayerFall.png', 'sprPlayerSliding.png', 'sprBow.png'],
+  },
+  {
+    id: 'DotKid',
+    name: 'DotKid',
+    about: 'The player is drawn as its collision box (a dot), with an optional outline circle.',
+    applies: gm8,
+    options: [{ key: 'ShowOutline', label: 'Outline circle', type: 'bool', default: true }],
+    files: ['sprDotkidMask.png', 'sprEmpty32x32.png', 'sprDotkidCircle.png'],
+  },
+  {
+    id: 'GodMode',
+    name: 'GodMode',
+    about: 'The player cannot die (the kill script returns at once).',
+    applies: gm8,
+    options: [],
     files: [],
   },
 ];
