@@ -51,6 +51,18 @@ CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target 
 web/tools/system32.sh
 ```
 
+Each game's card (and the bar while it plays) has a **Mods** button: changes made to
+the game's files before it starts, only those its engine allows. *Debug mode* turns on
+the game's debug switch (GameMaker: Studio, VM or YYC; patcher.rs's patch). The mods'
+code is `crates/gmmod`; their own files come from a Fangame.ModLoader folder:
+
+```sh
+# the mods for the page (served at /gmmod/)
+CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target wasm32-unknown-unknown -p gmmod --target-dir target/wasm-mods
+# their files (served at /mods/)
+web/tools/mods.sh path/to/Fangame.ModLoader
+```
+
 The browser also remembers which code each game needed and translates it right
 after the first frame of the next session (`?noprofile` turns that off), so later
 sessions do not stall the first time they reach a room or effect. A game's first

@@ -2,6 +2,7 @@
 // Messages to the page: {type: 'log', line} and {type: 'done', status}.
 import { GL_OPTIONS } from './gpu.mjs';
 import { runGame } from './host.mjs';
+import { applyMods, selectedMods } from './mods.mjs';
 import { KEYS } from './keys.mjs';
 import { applySaves, loadGame, loadProfile, loadSaves, openSaves, storeProfile, storeSaves } from './saves.mjs';
 
@@ -23,7 +24,7 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false } = data;
+  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false, modChoices = {} } = data;
   if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
@@ -62,6 +63,13 @@ self.onmessage = async ({ data }) => {
       warmGl();
       downloaded = await pending;
       post(`downloaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    }
+    // The mods chosen for the game change its files before the saves go on top.
+    const mods = selectedMods(modChoices, manifest.engine);
+    if (mods.length) {
+      const t = performance.now();
+      downloaded = await applyMods(downloaded, manifest, mods, post);
+      post(`mods ${mods.map((m) => m.id).join(', ')} applied in ${((performance.now() - t) / 1000).toFixed(1)}s`);
     }
     let db = null;
     let files = downloaded;

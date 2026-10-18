@@ -38,6 +38,9 @@ const mounts = [
   // the browser importer (crates/webimport, built without debug info) and the system
   // DLLs it may add (tools/system32.sh)
   ['/import/', join(repoRoot, 'target/wasm-import/wasm32-unknown-unknown/release')],
+  // the mods (crates/gmmod, built without debug info) and their files (tools/mods.sh)
+  ['/gmmod/', join(repoRoot, 'target/wasm-mods/wasm32-unknown-unknown/release')],
+  ['/mods/', join(webRoot, 'public/mods')],
   ['/system32/', join(webRoot, 'public/system32')],
   // what each runner's code needs first (tools/module-profiles.mjs)
   ['/profiles/', join(webRoot, 'public/profiles')],

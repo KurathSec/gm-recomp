@@ -6,3 +6,5 @@
 /out
 /web/soundfont.sf2
 /web/public/system32
+# mods' files come from a Fangame.ModLoader folder (web/tools/mods.sh)
+/web/public/mods

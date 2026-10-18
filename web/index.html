@@ -78,6 +78,24 @@
         background: rgba(10, 10, 12, 0.8); color: #cfe9cf; font: 12px/1.45 ui-monospace, monospace; white-space: pre;
       }
       body.fullscreen #bar { display: none; }
+
+      /* mods */
+      #mods { max-width: min(560px, calc(100vw - 32px)); padding: 0; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+      #mods::backdrop { background: rgba(0, 0, 0, 0.55); }
+      #mods form { display: flex; flex-direction: column; gap: 14px; padding: 18px; margin: 0; }
+      #mods h2 { margin: 0; font-size: 17px; }
+      #mods .none { color: var(--muted); margin: 0; }
+      #mods fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+      #mods fieldset.off .opts { opacity: 0.5; }
+      #mods legend { padding: 0 4px; }
+      #mods legend label { font-weight: 600; display: flex; gap: 8px; align-items: center; cursor: pointer; }
+      #mods .about { color: var(--muted); font-size: 13px; margin: 0; }
+      #mods .opts { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+      #mods .opts label { display: flex; gap: 8px; align-items: center; }
+      #mods .opts input[type=text], #mods .opts input[type=number] { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; min-width: 0; flex: 1; }
+      #mods .buttons { display: flex; gap: 8px; justify-content: flex-end; }
+      #mods .buttons .primary { border-color: var(--accent); color: var(--accent); }
+      .badge.mods { color: var(--accent); border-color: currentColor; }
     </style>
   </head>
   <body>
@@ -101,6 +119,7 @@
         <button id="export">Export saves</button>
         <label class="button" title="Load saves exported earlier (restarts the game)">Import saves<input id="import" type="file" accept=".json,application/json" hidden /></label>
         <button id="wipe">Delete saves</button>
+        <button id="modsbtn" title="Change the game before it starts (restarts it)" hidden>Mods</button>
         <button id="statsbtn" title="Frame rate, frame time and input latency">Stats</button>
         <button id="logbtn">Log</button>
         <button id="fs">Fullscreen</button>
@@ -114,9 +133,115 @@
       </div>
     </div>
 
+    <dialog id="mods"><form method="dialog"></form></dialog>
+
     <script type="module">
       import { deleteGame, deleteSaves, exportSaves, listGames, loadGame, loadSaves, openSaves, parseSaves, storeGame, storeSaves } from './src/saves.mjs';
       import { KEYS } from './src/keys.mjs';
+      import { loadChoices, modsFor, saveChoices, selectedMods } from './src/mods.mjs';
+
+      /** The mods dialog for a game; `saved()` runs after its choices were stored. */
+      function openMods(slug, title, engine, saved) {
+        const dlg = document.getElementById('mods');
+        const form = dlg.querySelector('form');
+        form.replaceChildren();
+        const h = document.createElement('h2');
+        h.textContent = `Mods · ${title}`;
+        form.append(h);
+        const choices = loadChoices(slug);
+        const mods = modsFor(engine);
+        if (!mods.length) {
+          const p = document.createElement('p');
+          p.className = 'none';
+          p.textContent = 'No mods work with this game’s engine.';
+          form.append(p);
+        }
+        const inputs = [];
+        for (const m of mods) {
+          const c = choices[m.id] ?? {};
+          const fs = document.createElement('fieldset');
+          const legend = document.createElement('legend');
+          const label = document.createElement('label');
+          const on = document.createElement('input');
+          on.type = 'checkbox';
+          on.checked = !!c.on;
+          label.append(on, m.name);
+          legend.append(label);
+          const about = document.createElement('p');
+          about.className = 'about';
+          about.textContent = m.about;
+          const opts = document.createElement('div');
+          opts.className = 'opts';
+          const fields = [];
+          for (const o of m.options) {
+            if (o.applies && !o.applies(engine)) continue;
+            const row = document.createElement('label');
+            const input = document.createElement('input');
+            const value = c.config?.[o.key] ?? o.default;
+            if (o.type === 'bool') {
+              input.type = 'checkbox';
+              input.checked = !!value;
+              row.append(input, o.label);
+            } else {
+              input.type = o.type === 'number' ? 'number' : 'text';
+              if (o.type === 'number') input.step = 'any';
+              input.value = String(value);
+              row.append(o.label, input);
+            }
+            fields.push([o, input]);
+            opts.append(row);
+          }
+          const sync = () => fs.classList.toggle('off', !on.checked);
+          on.addEventListener('change', sync);
+          sync();
+          fs.append(legend, about);
+          if (fields.length) fs.append(opts);
+          form.append(fs);
+          inputs.push([m, on, fields]);
+        }
+        const buttons = document.createElement('div');
+        buttons.className = 'buttons';
+        const cancel = document.createElement('button');
+        cancel.value = 'cancel';
+        cancel.textContent = 'Cancel';
+        const save = document.createElement('button');
+        save.value = 'save';
+        save.className = 'primary';
+        save.textContent = 'Save';
+        buttons.append(cancel, save);
+        form.append(buttons);
+        dlg.onclose = () => {
+          if (dlg.returnValue !== 'save') return;
+          const next = { ...choices };
+          for (const [m, on, fields] of inputs) {
+            const config = { ...(choices[m.id]?.config ?? {}) };
+            for (const [o, input] of fields) config[o.key] = o.type === 'bool' ? input.checked : o.type === 'number' ? Number(input.value) : input.value;
+            next[m.id] = { on: on.checked, config };
+          }
+          saveChoices(slug, next);
+          saved?.();
+        };
+        dlg.returnValue = '';
+        dlg.showModal();
+      }
+
+      /** A "Mods" button and badge for a library card (none when no mod fits the engine). */
+      function modsControls(meta, slug, title, engine) {
+        if (!modsFor(engine).length) return;
+        const badge = document.createElement('span');
+        badge.className = 'badge mods';
+        badge.textContent = 'mods on';
+        const refresh = () => (badge.hidden = selectedMods(loadChoices(slug), engine).length === 0);
+        const btn = document.createElement('button');
+        btn.textContent = 'Mods';
+        btn.title = 'Choose mods for this game';
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          openMods(slug, title, engine, refresh);
+        });
+        refresh();
+        meta.append(btn, badge);
+      }
 
       // ?game=<slug> plays a game; test options: &frames=N &epoch=S &report=1 &capture=30,60
       // &stats (overlay) &pacing=clock|jit|asap (other frame pacing; the default follows the
@@ -126,6 +251,7 @@
       // took it, stats, slow frames) in target/monitor/, for `harness run --replay`
       // &replay=<session>: plays a recorded session again (its date, saves and input)
       // &noprofile: no translation profile (functions earlier sessions needed, translated ahead)
+      // &nomods: without the mods chosen for the game (src/mods.mjs); &mods=a,b: with exactly these
       // ?zip=<url>: imports the game in that archive (zip, 7z or RAR) into this browser and plays it;
       // &local plays a game imported in this browser
       const q = new URLSearchParams(location.search);
@@ -208,6 +334,7 @@
           };
           badge(engineLabel(g.engine));
           if (!ok) badge('not playable yet');
+          else modsControls(meta, g.slug, g.title || g.slug, g.engine);
           a.append(title, meta);
           li.append(a);
           list.append(li);
@@ -252,6 +379,7 @@
               li.remove();
             });
             meta.append(del);
+            modsControls(meta, m.slug, m.title || m.slug, m.engine);
             a.append(t, meta);
             li.append(a);
             localList.append(li);
@@ -310,6 +438,9 @@
             title = m.title || game;
             document.getElementById('name').textContent = title;
             document.title = `${title} · gmrecomp`;
+            const modsBtn = document.getElementById('modsbtn');
+            modsBtn.hidden = !runnable(m.engine) || !modsFor(m.engine).length;
+            modsBtn.onclick = () => openMods(game, title, m.engine, () => location.reload());
           })
           .catch(() => {});
 
@@ -459,6 +590,12 @@
           send('/done', `worker error: ${e.message}`);
         };
         statusEl.textContent = 'Downloading…';
+        // &mods=a,b: exactly these mods this time (with their stored settings)
+        let modChoices = q.has('nomods') ? {} : loadChoices(game);
+        if (q.has('mods')) {
+          const on = q.get('mods').split(',').filter(Boolean);
+          modChoices = Object.fromEntries(on.map((id) => [id, { on: true, config: modChoices[id]?.config ?? {} }]));
+        }
         const offscreen = screen.transferControlToOffscreen();
         const pacing = ['asap', 'jit', 'clock'].includes(q.get('pacing')) ? q.get('pacing') : 'sync';
         const ahead = !q.has('noahead');
@@ -497,7 +634,7 @@
           ringWhen[i] = when ?? performance.timeOrigin + performance.now();
           Atomics.store(ringIdx, 0, (wr + 1) | 0);
         };
-        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing, useProfile: !q.has('noprofile'), local }, [offscreen]);
+        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing, useProfile: !q.has('noprofile'), local, modChoices }, [offscreen]);
 
         // Input goes to the worker as it happens; the runtime applies it at the guest's
         // next message poll.
