@@ -130,6 +130,16 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
                 "AllowFullscreen" => mods::allow_fullscreen_gm8(g)?,
                 "CrimsonKid" => mods::crimson_kid_gm8(g, config, assets)?,
                 "DotKid" => mods::dot_kid_gm8(g, config, assets)?,
+                "PlayOnline" => {
+                    let i = game.index(&game.entry).ok_or("the game's exe is missing")?;
+                    let (lines, files) = mods::play_online_gm8(g, config, assets, &game.files[i].1, &game.entry)?;
+                    // (its files go next to the exe)
+                    let dir = game.entry.rfind(['/', '\\']).map_or(String::new(), |k| game.entry[..=k].to_owned());
+                    for (name, data) in files {
+                        game.put(&format!("{dir}{name}"), data);
+                    }
+                    lines
+                }
                 "DbgHelper" => {
                     exe_mods.push((id.to_owned(), config));
                     Vec::new()
