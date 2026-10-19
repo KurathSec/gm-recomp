@@ -318,6 +318,8 @@ pub struct Process {
     pub clock_us: u64,
     /// Consecutive clock reads without other API work (see `Ctx::poll_clock`).
     pub idle_streak: u32,
+    /// Winsock sockets and the names behind their stand-in addresses
+    pub sockets: crate::hle::winsock::Sockets,
     pub exit_code: Option<u32>,
     pub tls_used: Vec<bool>,
     pub atoms: HashMap<String, u16>,
@@ -474,6 +476,7 @@ impl Process {
             ],
             clock_us: 0,
             idle_streak: 0,
+            sockets: Default::default(),
             exit_code: None,
             tls_used: vec![false; 1088],
             atoms: HashMap::default(),

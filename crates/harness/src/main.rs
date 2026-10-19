@@ -5,6 +5,7 @@ mod ssegen;
 mod x87gen;
 mod native;
 mod proto;
+mod net;
 mod run;
 mod wasm;
 

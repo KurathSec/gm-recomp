@@ -280,6 +280,26 @@ pub trait Machine: Guest {
     fn slack_ms(&mut self, _clock_us: u64) -> f64 {
         0.0
     }
+    /// See `Host::net_enabled`, `Host::net_open` and the rest.
+    fn net_enabled(&mut self) -> bool {
+        false
+    }
+    fn net_open(&mut self, _id: u32, _udp: bool, _host: &str, _port: u16) -> bool {
+        false
+    }
+    fn net_send(&mut self, _id: u32, _data: &[u8]) -> bool {
+        false
+    }
+    fn net_recv(&mut self, _id: u32, _buf: &mut [u8]) -> Option<usize> {
+        Some(0)
+    }
+    fn net_available(&mut self, _id: u32) -> u32 {
+        0
+    }
+    fn net_state(&mut self, _id: u32) -> crate::hle::winsock::NetState {
+        crate::hle::winsock::NetState::Failed
+    }
+    fn net_close(&mut self, _id: u32) {}
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -442,6 +462,28 @@ impl<M: Machine> Host for M {
 
     fn slack_ms(&mut self, clock_us: u64) -> f64 {
         Machine::slack_ms(self, clock_us)
+    }
+
+    fn net_enabled(&mut self) -> bool {
+        Machine::net_enabled(self)
+    }
+    fn net_open(&mut self, id: u32, udp: bool, host: &str, port: u16) -> bool {
+        Machine::net_open(self, id, udp, host, port)
+    }
+    fn net_send(&mut self, id: u32, data: &[u8]) -> bool {
+        Machine::net_send(self, id, data)
+    }
+    fn net_recv(&mut self, id: u32, buf: &mut [u8]) -> Option<usize> {
+        Machine::net_recv(self, id, buf)
+    }
+    fn net_available(&mut self, id: u32) -> u32 {
+        Machine::net_available(self, id)
+    }
+    fn net_state(&mut self, id: u32) -> crate::hle::winsock::NetState {
+        Machine::net_state(self, id)
+    }
+    fn net_close(&mut self, id: u32) {
+        Machine::net_close(self, id)
     }
 
     fn set_fpu_state(&mut self, f: &fpu::Fpu) {

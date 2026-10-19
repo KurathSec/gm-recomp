@@ -38,11 +38,13 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  * @param {(entries: Uint32Array, modules: {base: number, size: number, id: number}[]) => void} [o.onProfile]
  *   functions this session needed that the profile lacked (every few seconds and at the end), as
  *   the same triples, to add to it, with the modules loaded at the start (to file them by module)
+ * @param {string} [o.relayUrl]  a WebSocket relay (tools/relay.mjs) for the guest's network
+ *   connections; without one, sockets fail to connect
  * @param {(modules: {base: number, size: number, id: number}[]) => Promise<Uint32Array|null>} [o.sharedProfile]
  *   without `profile`: what other games with the same modules needed (a runner's code is the same
  *   in every game built with it)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -441,7 +443,86 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
   };
 
-  const engineImports = { host, gpu: gpuImports, audio: audioImports };
+  // Guest sockets (hle/winsock.rs): each connection a WebSocket to the relay
+  // (tools/relay.mjs), which makes the TCP connection or sends the UDP datagrams;
+  // nothing connects without `relayUrl`.
+  const conns = new Map(); // id -> {ws, udp, state (0 connecting, 1 open, 2 closed, 3 failed), chunks, pending}
+  const netImports = {
+    net_enabled: () => (relayUrl ? 1 : 0),
+    net_open(id, udp, hostPtr, hostLen, port) {
+      if (!relayUrl) return 0;
+      const url = new URL(relayUrl, location.href);
+      url.searchParams.set('proto', udp ? 'udp' : 'tcp');
+      url.searchParams.set('host', dec.decode(mem().subarray(hostPtr, hostPtr + hostLen)));
+      url.searchParams.set('port', String(port));
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        print(`relay ${url}: ${e.message}`);
+        return 0;
+      }
+      ws.binaryType = 'arraybuffer';
+      const c = { ws, udp: !!udp, state: 0, chunks: [], pending: [] };
+      ws.onopen = () => {
+        c.state = 1;
+        for (const d of c.pending) ws.send(d);
+        c.pending = [];
+      };
+      ws.onmessage = (e) => c.chunks.push(new Uint8Array(e.data));
+      ws.onclose = () => (c.state = c.state === 0 ? 3 : 2);
+      ws.onerror = () => c.state === 0 && (c.state = 3);
+      conns.set(id, c);
+      return 1;
+    },
+    net_send(id, ptr, len) {
+      const c = conns.get(id);
+      if (!c || c.state >= 2) return 0;
+      const d = mem().slice(ptr, ptr + len);
+      if (c.state === 0) c.pending.push(d);
+      else c.ws.send(d);
+      return 1;
+    },
+    net_recv(id, ptr, len) {
+      const c = conns.get(id);
+      if (!c) return 0;
+      if (!c.chunks.length) return c.state >= 2 && !c.udp ? 0 : -1;
+      if (c.udp) {
+        const d = c.chunks.shift();
+        const n = Math.min(len, d.length);
+        mem().set(d.subarray(0, n), ptr);
+        return n;
+      }
+      let n = 0;
+      while (n < len && c.chunks.length) {
+        const d = c.chunks[0];
+        const take = Math.min(len - n, d.length);
+        mem().set(d.subarray(0, take), ptr + n);
+        n += take;
+        if (take === d.length) c.chunks.shift();
+        else c.chunks[0] = d.subarray(take);
+      }
+      return n;
+    },
+    net_available(id) {
+      const c = conns.get(id);
+      if (!c || !c.chunks.length) return 0;
+      return c.udp ? Math.max(1, c.chunks[0].length) : c.chunks.reduce((a, d) => a + d.length, 0);
+    },
+    net_state(id) {
+      return conns.get(id)?.state ?? 3;
+    },
+    net_close(id) {
+      const c = conns.get(id);
+      if (!c) return;
+      try {
+        c.ws.close();
+      } catch {}
+      conns.delete(id);
+    },
+  };
+
+  const engineImports = { host, gpu: gpuImports, audio: audioImports, net: netImports };
   rt = runtimeBytes instanceof WebAssembly.Module ? await WebAssembly.instantiate(runtimeBytes, engineImports) : (await WebAssembly.instantiate(runtimeBytes, engineImports)).instance;
   const x = rt.exports;
   table = x.__indirect_function_table;

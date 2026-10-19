@@ -22,6 +22,7 @@ pub mod nls;
 pub mod pads;
 pub mod profile;
 pub mod user32;
+pub mod winsock;
 
 use crate::mem::Guest;
 use crate::process::Process;
@@ -108,6 +109,34 @@ pub trait Host: Guest {
     fn slack_ms(&mut self, _clock_us: u64) -> f64 {
         0.0
     }
+    /// Whether the host can make network connections (the page: a relay is set); without,
+    /// WSAStartup fails as it always did.
+    fn net_enabled(&mut self) -> bool {
+        false
+    }
+    /// A network connection for a guest socket (`winsock`): connection `id`, a TCP stream
+    /// or UDP datagrams to `host`:`port`. False when the host has no network (the page:
+    /// no relay set).
+    fn net_open(&mut self, _id: u32, _udp: bool, _host: &str, _port: u16) -> bool {
+        false
+    }
+    /// Sends (queued until the connection is open); false once it has ended.
+    fn net_send(&mut self, _id: u32, _data: &[u8]) -> bool {
+        false
+    }
+    /// Reads what arrived: TCP up to `buf.len()` bytes, UDP one datagram (cut to fit).
+    /// Some(0) at the end of a TCP stream; None when nothing is there yet.
+    fn net_recv(&mut self, _id: u32, _buf: &mut [u8]) -> Option<usize> {
+        Some(0)
+    }
+    /// Bytes waiting (UDP: the next datagram's size).
+    fn net_available(&mut self, _id: u32) -> u32 {
+        0
+    }
+    fn net_state(&mut self, _id: u32) -> winsock::NetState {
+        winsock::NetState::Failed
+    }
+    fn net_close(&mut self, _id: u32) {}
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far, `clock_us` the guest's clock (a replay delivers each
     /// event at the poll it was taken at).
@@ -277,6 +306,10 @@ pub struct Registry {
     pub data_addr: HashMap<(String, String), u32>,
     pub data_next: u32,
     pub data_pending: Vec<(u32, Vec<u8>)>,
+    /// Implementations an API gets only when a module imports it (`add_on_demand`): APIs
+    /// added after the rest, so the ids (stub addresses, and with them the state games
+    /// see) of everything that games do import stay where they were.
+    pub on_demand: HashMap<(String, String), ApiFn>,
 }
 
 /// Exported variables live here, after the stubs.
@@ -290,6 +323,7 @@ impl Registry {
         user32::register(&mut r);
         gdi32::register(&mut r);
         misc::register(&mut r);
+        winsock::register(&mut r);
         d3d8::register(&mut r);
         d3d9::register(&mut r);
         com::register(&mut r);
@@ -323,6 +357,8 @@ impl Registry {
         pads::register(&mut r);
         dinput::register(&mut r);
         profile::register(&mut r);
+        // APIs added since, made when imported (`on_demand`)
+        msvcrt::register_late(&mut r);
         r
     }
 
@@ -402,9 +438,15 @@ impl Registry {
             return id;
         }
         let id = ApiId(self.entries.len() as u32);
-        self.entries.push(ApiEntry { dll, name: name.to_string(), func: None, nargs: 0, pop: None });
+        let func = self.on_demand.get(&key).copied();
+        self.entries.push(ApiEntry { dll, name: name.to_string(), func, nargs: 0, pop: None });
         self.by_name.insert(key, id);
         id
+    }
+
+    /// `f` implements `dll!name` once a module imports it (see `on_demand`).
+    pub fn add_on_demand(&mut self, dll: &str, name: &str, f: ApiFn) {
+        self.on_demand.insert((dll.to_lowercase(), name.to_string()), f);
     }
 
     pub fn lookup(&self, dll: &str, name: &str) -> Option<ApiId> {

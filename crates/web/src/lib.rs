@@ -45,6 +45,23 @@ unsafe extern "C" {
     fn gpu_slack(clock_ms: f64) -> f64;
 }
 
+/// Guest sockets' connections (hle/winsock.rs), relayed by the page over WebSockets.
+#[link(wasm_import_module = "net")]
+unsafe extern "C" {
+    /// 1 when the page has a relay for connections.
+    fn net_enabled() -> u32;
+    /// 1 when the page can make the connection (a relay is set).
+    fn net_open(id: u32, udp: u32, host: *const u8, host_len: usize, port: u32) -> u32;
+    /// 0 once the connection has ended.
+    fn net_send(id: u32, data: *const u8, len: usize) -> u32;
+    /// Bytes read (0: the end of a TCP stream), or -1 when nothing has arrived.
+    fn net_recv(id: u32, buf: *mut u8, len: usize) -> i32;
+    fn net_available(id: u32) -> u32;
+    /// 0 connecting, 1 open, 2 closed, 3 failed
+    fn net_state(id: u32) -> u32;
+    fn net_close(id: u32);
+}
+
 #[link(wasm_import_module = "audio")]
 unsafe extern "C" {
     /// Interleaved stereo f32 frames at `rate`.
@@ -369,6 +386,34 @@ impl Machine for Web {
         }
         state().waited = true;
         unsafe { gpu_pace(ms) }
+    }
+    fn net_enabled(&mut self) -> bool {
+        unsafe { net_enabled() != 0 }
+    }
+    fn net_open(&mut self, id: u32, udp: bool, host: &str, port: u16) -> bool {
+        unsafe { net_open(id, udp as u32, host.as_ptr(), host.len(), port as u32) != 0 }
+    }
+    fn net_send(&mut self, id: u32, data: &[u8]) -> bool {
+        unsafe { net_send(id, data.as_ptr(), data.len()) != 0 }
+    }
+    fn net_recv(&mut self, id: u32, buf: &mut [u8]) -> Option<usize> {
+        let n = unsafe { net_recv(id, buf.as_mut_ptr(), buf.len()) };
+        (n >= 0).then_some(n as usize)
+    }
+    fn net_available(&mut self, id: u32) -> u32 {
+        unsafe { net_available(id) }
+    }
+    fn net_state(&mut self, id: u32) -> runtime::hle::winsock::NetState {
+        use runtime::hle::winsock::NetState;
+        match unsafe { net_state(id) } {
+            0 => NetState::Connecting,
+            1 => NetState::Open,
+            2 => NetState::Closed,
+            _ => NetState::Failed,
+        }
+    }
+    fn net_close(&mut self, id: u32) {
+        unsafe { net_close(id) }
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         let st = state();

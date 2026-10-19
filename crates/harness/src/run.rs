@@ -124,6 +124,8 @@ struct Hd {
     /// (frame, host µs, dispatches, x87 via rt.fpu, translated, translate µs, other
     /// threads µs) at the start of the frame being measured.
     frame_mark: (u64, u64, u64, u64, usize, u64, u64),
+    /// The guest's network connections (GMR_NET).
+    net: crate::net::Net,
 }
 
 /// Store and Caller both give direct access to their data.
@@ -208,6 +210,27 @@ impl<C: Cx> Machine for Wt<'_, C> {
         hd.soundfont_given = true;
         let path = std::env::var("GMR_SOUNDFONT").unwrap_or_else(|_| "/usr/share/soundfonts/default.sf2".into());
         std::fs::read(path).ok()
+    }
+    fn net_enabled(&mut self) -> bool {
+        std::env::var_os("GMR_NET").is_some()
+    }
+    fn net_open(&mut self, id: u32, udp: bool, host: &str, port: u16) -> bool {
+        self.cx.hd().net.open(id, udp, host, port)
+    }
+    fn net_send(&mut self, id: u32, data: &[u8]) -> bool {
+        self.cx.hd().net.send(id, data)
+    }
+    fn net_recv(&mut self, id: u32, buf: &mut [u8]) -> Option<usize> {
+        self.cx.hd().net.recv(id, buf)
+    }
+    fn net_available(&mut self, id: u32) -> u32 {
+        self.cx.hd().net.available(id)
+    }
+    fn net_state(&mut self, id: u32) -> runtime::hle::winsock::NetState {
+        self.cx.hd().net.state(id)
+    }
+    fn net_close(&mut self, id: u32) {
+        self.cx.hd().net.close(id)
     }
     fn xmm(&mut self, i: u32) -> u128 {
         self.cpu.globals[G::Xmm0 as usize + i as usize].get(&mut *self.cx).v128().map(|v| v.as_u128()).unwrap_or(0)
@@ -417,7 +440,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0) });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0), net: Default::default() });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;

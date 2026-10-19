@@ -1805,3 +1805,39 @@ pub fn register_more(r: &mut Registry) {
         Ok(Ret::resume())
     });
 }
+
+/// C runtime functions added later than the rest: made only when a module imports them
+/// (`Registry::on_demand`), so the stub addresses of everything else stay put.
+pub fn register_late(r: &mut Registry) {
+    let m = "msvcrt.dll";
+    r.add_on_demand(m, "_memicmp", |c| {
+        let n = c.arg(2) as usize;
+        let mut a = vec![0u8; n];
+        let mut b = vec![0u8; n];
+        let _ = c.host.read(c.arg(0), &mut a);
+        let _ = c.host.read(c.arg(1), &mut b);
+        let o = a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+        ok(o as i32 as u32)
+    });
+    r.add_on_demand(m, "fputs", |c| {
+        let (p, f) = (c.arg(0), c.arg(1));
+        let text = c.host.read_cstr(p).unwrap_or_default();
+        match file_handle(c, f) {
+            Some(h) => {
+                super::kernel32::write_file(c, h, &text);
+            }
+            None => {
+                // stdout/stderr: logged a line at a time
+                for &ch in &text {
+                    if ch == b'\n' {
+                        let line = String::from_utf8_lossy(&std::mem::take(&mut c.p.crt_line)).into_owned();
+                        c.p.log(format!("stdout: {line}"));
+                    } else {
+                        c.p.crt_line.push(ch);
+                    }
+                }
+            }
+        }
+        ok(0)
+    });
+}

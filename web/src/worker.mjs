@@ -204,7 +204,9 @@ self.onmessage = async ({ data }) => {
       : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log
     const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
-    const status = await runGame({ runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile });
+    // the guest's network connections go through PlayOnline's relay, when it is on
+    const relayUrl = mods.find((m) => m.id === 'PlayOnline')?.config.RelayUrl || undefined;
+    const status = await runGame({ relayUrl, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile });
     await saving;
     await profileSaving;
     self.postMessage({ type: 'done', status });

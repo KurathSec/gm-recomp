@@ -63,6 +63,13 @@ CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target 
 web/tools/mods.sh path/to/Fangame.ModLoader
 ```
 
+A game's network connections (Winsock) go through a WebSocket relay you run, since
+a browser cannot open TCP or UDP itself; PlayOnline's settings name it (`ws://…`):
+
+```sh
+node web/tools/relay.mjs --port 8790 --allow iwannastartaparty.com
+```
+
 The browser also remembers which code each game needed and translates it right
 after the first frame of the next session (`?noprofile` turns that off), so later
 sessions do not stall the first time they reach a room or effect. A game's first
