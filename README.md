@@ -53,8 +53,13 @@ web/tools/system32.sh
 
 Each game's card (and the bar while it plays) has a **Mods** button: changes made to
 the game's files before it starts, only those its engine allows. *Debug mode* turns on
-the game's debug switch (GameMaker: Studio, VM or YYC; patcher.rs's patch). The mods'
-code is `crates/gmmod`; their own files come from a Fangame.ModLoader folder:
+the game's debug switch (GameMaker: Studio, VM or YYC; patcher.rs's patch).
+Fangame.ModLoader's mods are reimplemented for GameMaker 8 and GameMaker: Studio 1.4 VM
+games (not YYC, not GameMaker Studio 2 yet): GodMode, CrimsonKid, DotKid, DbgHelper
+(gm8x_fix's patches; the sleep margin for GameMaker: Studio), AllowFullscreen and
+PlayOnline (GameMaker 8 only). A GameMaker: Studio data.win is changed in place where
+sizes allow and grows at its end otherwise (`crates/gmmod/src/gms.rs` says how). The
+mods' code is `crates/gmmod`; their own files come from a Fangame.ModLoader folder:
 
 ```sh
 # the mods for the page (served at /gmmod/)

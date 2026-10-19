@@ -8,6 +8,9 @@ pub mod debug;
 pub mod gm8;
 pub mod gm8x_fix;
 mod gm8x_fix_data;
+pub mod gms;
+mod gms_asm;
+mod gms_builtins;
 pub mod image;
 pub mod mods;
 
@@ -103,13 +106,15 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
     let mut log = Vec::new();
     // GameMaker 8's game data, parsed once for all the mods and written back at the end
     let mut gm8: Option<gm8::Gm8> = None;
+    // GameMaker: Studio's (data.win), likewise
+    let mut gms: Option<gms::Gms> = None;
     // changes to the exe itself, after the game data is written (ModLoader's ModExecutable)
     let mut exe_mods: Vec<(String, &Value)> = Vec::new();
     for m in mods {
         let id = m["id"].as_str().unwrap_or("");
         let config = &m["config"];
         let lines = if id == "debug" {
-            debug_mod(game, config)?
+            debug_mod(game, gms.as_mut(), config)?
         } else if game.engine.is_gm8() {
             if gm8.is_none() {
                 let exe = game.files.get(game.index(&game.entry).ok_or("the game's exe is missing")?).unwrap();
@@ -146,6 +151,27 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
                 }
                 _ => return Err(format!("{id} does not work with GameMaker 8 games yet")),
             }
+        } else if game.engine.is_gms() {
+            if game.engine.yyc {
+                return Err(format!("{id} does not work with YYC games (their code is compiled into the exe)"));
+            }
+            if gms.is_none() {
+                let path = game.engine.data_file.clone();
+                if path.is_empty() || path.starts_with("embedded@") {
+                    return Err("the game's data is inside its exe, which these mods cannot change yet".into());
+                }
+                let data = std::mem::take(game.file_mut(&path).ok_or_else(|| format!("{path} is missing"))?);
+                gms = Some(gms::Gms::parse(data)?);
+            }
+            let g = gms.as_mut().unwrap();
+            match id {
+                "_roundtrip" => Vec::new(),
+                "GodMode" => mods::godmode_gms(g)?,
+                "CrimsonKid" => mods::crimson_kid_gms(g, config, assets)?,
+                "DotKid" => mods::dot_kid_gms(g, config, assets)?,
+                "DbgHelper" => mods::dbg_helper_gms(g, config)?,
+                _ => return Err(format!("{id} does not work with GameMaker: Studio games yet")),
+            }
         } else {
             return Err(format!("{id} does not work with this game's engine yet"));
         };
@@ -154,6 +180,10 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
     let entry = game.entry.clone();
     if let Some(g) = gm8 {
         game.put(&entry, g.write());
+    }
+    if let Some(g) = gms {
+        let path = game.engine.data_file.clone();
+        game.put(&path, g.write()?);
     }
     for (id, config) in exe_mods {
         let exe = game.file_mut(&entry).ok_or("the game's exe is missing")?;
@@ -164,7 +194,7 @@ pub fn apply(game: &mut Game, mods: &[Value], assets: &Assets) -> Result<Vec<Str
     Ok(log)
 }
 
-fn debug_mod(game: &mut Game, config: &Value) -> Result<Vec<String>, String> {
+fn debug_mod(game: &mut Game, gms: Option<&mut gms::Gms>, config: &Value) -> Result<Vec<String>, String> {
     let e = game.engine.clone();
     if !e.is_gms() {
         return Err("the debug switch is for GameMaker: Studio games".into());
@@ -177,6 +207,10 @@ fn debug_mod(game: &mut Game, config: &Value) -> Result<Vec<String>, String> {
     let mut names = debug::VM_NAMES.to_vec();
     if config["noDeath"].as_bool().unwrap_or(false) {
         names.push(debug::VM_NO_DEATH);
+    }
+    if let Some(g) = gms {
+        // (the data file is being changed by the other mods)
+        return debug::patch_vm(g.form_mut(), &names);
     }
     if let Some(off) = e.data_file.strip_prefix("embedded@") {
         // the data file inside the exe

@@ -4,8 +4,11 @@
 // allows (`applies`, from the manifest's engine) and keeps each game's choices.
 
 // Fangame.ModLoader edits GameMaker 8 games and GameMaker: Studio games that keep their
-// bytecode (not YYC); these mods do GameMaker 8 so far.
+// bytecode (not YYC); these mods do GameMaker 8 and GameMaker: Studio 1.4 (crates/gmmod
+// gms.rs; not GameMaker Studio 2 yet).
 const gm8 = (e) => e?.kind === 'gm80' || e?.kind === 'gm81';
+const gmsVm = (e) => e?.kind === 'gms' && !e.yyc && (e.version?.[0] ?? 1) < 2;
+const modLoader = (e) => gm8(e) || gmsVm(e);
 
 /**
  * id: the mod (crates/gmmod `apply`); options: {key, label, type 'bool' | 'number' | 'text',
@@ -33,21 +36,23 @@ export const MODS = [
     id: 'CrimsonKid',
     name: 'CrimsonKid',
     about: 'The Crimson Kid skin: new player and bow sprites, the bow drawn behind the player.',
-    applies: gm8,
+    applies: modLoader,
     options: [{ key: 'BowImageSpeed', label: 'Bow animation speed', type: 'number', default: 0.2 }],
     files: ['sprPlayerIdle.png', 'sprPlayerRunning.png', 'sprPlayerJump.png', 'sprPlayerFall.png', 'sprPlayerSliding.png', 'sprBow.png'],
   },
   {
     id: 'DbgHelper',
     name: 'DbgHelper',
-    about: 'Fixes GameMaker lag issues: gm8x_fix 0.5.9’s patches to the GameMaker 8 runner.',
-    applies: gm8,
+    about: 'Fixes GameMaker lag issues: gm8x_fix 0.5.9’s patches to the GameMaker 8 runner; for GameMaker: Studio, the runner’s sleep margin (its DBGHELP.dll only sets Windows’ timer resolution, which the browser’s clock does not need).',
+    applies: modLoader,
     options: [
-      { key: 'InputLagPatch', label: 'Input lag patch', type: 'bool', default: true },
-      { key: 'JoystickPatch', label: 'Joystick patch', type: 'bool', default: true },
-      { key: 'SchedulerPatch', label: 'Scheduler patch', type: 'bool', default: true },
-      { key: 'MemoryPatch', label: 'Memory patch', type: 'bool', default: true },
-      { key: 'DirectPlayPatch', label: 'DirectPlay patch', type: 'bool', default: true },
+      { key: 'InputLagPatch', label: 'Input lag patch', type: 'bool', default: true, applies: gm8 },
+      { key: 'JoystickPatch', label: 'Joystick patch', type: 'bool', default: true, applies: gm8 },
+      { key: 'SchedulerPatch', label: 'Scheduler patch', type: 'bool', default: true, applies: gm8 },
+      { key: 'MemoryPatch', label: 'Memory patch', type: 'bool', default: true, applies: gm8 },
+      { key: 'DirectPlayPatch', label: 'DirectPlay patch', type: 'bool', default: true, applies: gm8 },
+      { key: 'SetSleepMargin', label: 'Set the sleep margin', type: 'bool', default: true, applies: gmsVm },
+      { key: 'SleepMargin', label: 'Sleep margin (ms)', type: 'number', default: 1, applies: gmsVm },
     ],
     files: [],
   },
@@ -55,7 +60,7 @@ export const MODS = [
     id: 'DotKid',
     name: 'DotKid',
     about: 'The player is drawn as its collision box (a dot), with an optional outline circle.',
-    applies: gm8,
+    applies: modLoader,
     options: [{ key: 'ShowOutline', label: 'Outline circle', type: 'bool', default: true }],
     files: ['sprDotkidMask.png', 'sprEmpty32x32.png', 'sprDotkidCircle.png'],
   },
@@ -79,7 +84,7 @@ export const MODS = [
     id: 'GodMode',
     name: 'GodMode',
     about: 'The player cannot die (the kill script returns at once).',
-    applies: gm8,
+    applies: modLoader,
     options: [],
     files: [],
   },

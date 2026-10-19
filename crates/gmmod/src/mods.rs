@@ -3,10 +3,31 @@
 
 use crate::Assets;
 use crate::gm8::{Entry, Gm8, Image, Object, Script, Sprite, event};
+use crate::gms::Gms;
 use crate::image;
 use serde_json::Value;
 
 type Result<T> = std::result::Result<T, String>;
+
+/// GodMode's scripts that kill the player.
+const KILL_SCRIPTS: &[&str] = &["scrKillPlayer", "killPlayer", "player_kill", "kill_player"];
+/// CrimsonKid's sprites: (name, image, frames).
+const CRIMSON_SPRITES: &[(&str, &str, u32)] = &[
+    ("sprPlayerIdle", "sprPlayerIdle.png", 4),
+    ("sprPlayerRunning", "sprPlayerRunning.png", 4),
+    ("sprPlayerJump", "sprPlayerJump.png", 2),
+    ("sprPlayerFall", "sprPlayerFall.png", 2),
+    ("sprPlayerSliding", "sprPlayerSliding.png", 2),
+    ("sprBow", "sprBow.png", 4),
+];
+const PLAYER: &[&str] = &["player", "objPlayer"];
+const BOW: &[&str] = &["bow", "objBow"];
+/// DotKid's: the player's masks (the dot), its sprites (blank), the objects that draw it.
+const DOT_MASKS: &[&str] = &["maskPlayer", "maskPlayer2", "sprPlayerMask", "sprPlayerMaskFlip"];
+const DOT_BLANK: &[&str] = &["sprPlayerIdle", "sprPlayerRunning", "sprPlayerJump", "sprPlayerFall", "sprBow", "sprPlayerSliding"];
+const DOT_PLAYERS: &[&str] = &["player", "objPlayer", "Player"];
+const DOT_DRAW: &str = "draw_sprite_ext(mask_index, image_index, x, y, image_xscale, image_yscale, image_angle, image_blend, image_alpha);";
+const DOT_DRAW_OUTLINE: &str = "draw_sprite_ext(sprDotkidModCircle, image_index, x, y, image_xscale, image_yscale, image_angle, image_blend, image_alpha);";
 
 fn png(assets: &Assets, module: &str, name: &str, n: u32) -> Result<Vec<Image>> {
     let bytes = assets.get(module, name).ok_or_else(|| format!("{name} is missing from the mod's files"))?;
@@ -56,8 +77,7 @@ fn gm8_object(g: &Gm8, i: usize) -> Result<Object> {
 
 /// GodMode: the scripts that kill the player return at once.
 pub fn godmode_gm8(g: &mut Gm8) -> Result<Vec<String>> {
-    let names = ["scrKillPlayer", "killPlayer", "player_kill", "kill_player"];
-    let n = gm8_scripts(g, &names, |s| {
+    let n = gm8_scripts(g, KILL_SCRIPTS, |s| {
         let mut src = b"exit;\n".to_vec();
         src.extend_from_slice(&s.source);
         s.source = src;
@@ -81,22 +101,15 @@ pub fn allow_fullscreen_gm8(g: &mut Gm8) -> Result<Vec<String>> {
 pub fn crimson_kid_gm8(g: &mut Gm8, config: &Value, assets: &Assets) -> Result<Vec<String>> {
     let speed = config["BowImageSpeed"].as_f64().unwrap_or(0.2);
     let mut log = Vec::new();
-    for (name, file, n) in [
-        ("sprPlayerIdle", "sprPlayerIdle.png", 4),
-        ("sprPlayerRunning", "sprPlayerRunning.png", 4),
-        ("sprPlayerJump", "sprPlayerJump.png", 2),
-        ("sprPlayerFall", "sprPlayerFall.png", 2),
-        ("sprPlayerSliding", "sprPlayerSliding.png", 2),
-        ("sprBow", "sprBow.png", 4),
-    ] {
+    for &(name, file, n) in CRIMSON_SPRITES {
         let frames = png(assets, "CrimsonKid", file, n)?;
         let origin = (name == "sprBow").then_some((22, 23));
         for s in gm8_sprites(g, &[name], &frames, origin)? {
             log.push(format!("sprite {s} replaced"));
         }
     }
-    let player = gm8_last_object(g, &["player", "objPlayer"])?;
-    if let Some(b) = gm8_last_object(g, &["bow", "objBow"])? {
+    let player = gm8_last_object(g, PLAYER)?;
+    if let Some(b) = gm8_last_object(g, BOW)? {
         let mut bow = gm8_object(g, b)?;
         if let Some(p) = player {
             bow.depth = gm8_object(g, p)?.depth + 1;
@@ -114,16 +127,16 @@ pub fn dot_kid_gm8(g: &mut Gm8, config: &Value, assets: &Assets) -> Result<Vec<S
     let outline = config["ShowOutline"].as_bool().unwrap_or(true);
     let mut log = Vec::new();
     let mask = png(assets, "DotKid", "sprDotkidMask.png", 1)?;
-    for s in gm8_sprites(g, &["maskPlayer", "maskPlayer2", "sprPlayerMask", "sprPlayerMaskFlip"], &mask, Some((16, 16)))? {
+    for s in gm8_sprites(g, DOT_MASKS, &mask, Some((16, 16)))? {
         log.push(format!("mask {s} is the dot"));
     }
     let empty = png(assets, "DotKid", "sprEmpty32x32.png", 1)?;
-    for s in gm8_sprites(g, &["sprPlayerIdle", "sprPlayerRunning", "sprPlayerJump", "sprPlayerFall", "sprBow", "sprPlayerSliding"], &empty, Some((16, 16)))? {
+    for s in gm8_sprites(g, DOT_BLANK, &empty, Some((16, 16)))? {
         log.push(format!("sprite {s} blank"));
     }
-    let mut code = b"draw_sprite_ext(mask_index, image_index, x, y, image_xscale, image_yscale, image_angle, image_blend, image_alpha);".to_vec();
+    let mut code = DOT_DRAW.as_bytes().to_vec();
     if outline {
-        code.extend_from_slice(b"draw_sprite_ext(sprDotkidModCircle, image_index, x, y, image_xscale, image_yscale, image_angle, image_blend, image_alpha);");
+        code.extend_from_slice(DOT_DRAW_OUTLINE.as_bytes());
         let mut circle = Sprite::new("sprDotkidModCircle");
         circle.set_frames(&png(assets, "DotKid", "sprDotkidCircle.png", 1)?);
         circle.origin = (65, 64);
@@ -132,11 +145,96 @@ pub fn dot_kid_gm8(g: &mut Gm8, config: &Value, assets: &Assets) -> Result<Vec<S
     }
     let names = g.objects.names()?;
     for (i, n) in names.iter().enumerate() {
-        if n.as_deref().is_some_and(|n| [&b"player"[..], b"objPlayer", b"Player"].contains(&n)) {
+        if n.as_deref().is_some_and(|n| DOT_PLAYERS.iter().any(|p| p.as_bytes() == n)) {
             let mut o = gm8_object(g, i)?;
             o.add_code(event::DRAW, 0, &code);
             g.objects.entries[i] = Entry::Content(o.content());
             log.push(format!("object {} draws the dot", String::from_utf8_lossy(n.as_deref().unwrap())));
+        }
+    }
+    Ok(log)
+}
+
+// ---- GameMaker: Studio (bytecode, not YYC) ---------------------------------------------
+
+/// GodMode: the scripts that kill the player return at once.
+pub fn godmode_gms(g: &mut Gms) -> Result<Vec<String>> {
+    let mut n = 0;
+    for name in KILL_SCRIPTS {
+        if let Some(code) = g.script_code(name)? {
+            g.end_at_once(code)?;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Err("no script that kills the player (scrKillPlayer, killPlayer, player_kill, kill_player)".into());
+    }
+    Ok(vec![format!("{n} kill script(s) made to return at once")])
+}
+
+/// CrimsonKid, as for GameMaker 8.
+pub fn crimson_kid_gms(g: &mut Gms, config: &Value, assets: &Assets) -> Result<Vec<String>> {
+    let speed = config["BowImageSpeed"].as_f64().unwrap_or(0.2);
+    let mut log = Vec::new();
+    for &(name, file, n) in CRIMSON_SPRITES {
+        let frames = png(assets, "CrimsonKid", file, n)?;
+        let origin = (name == "sprBow").then_some((22, 23));
+        if g.replace_sprite(name, &frames, origin)? > 0 {
+            log.push(format!("sprite {name} replaced"));
+        }
+    }
+    let player = g.object(PLAYER)?;
+    if let Some(bow) = g.object(BOW)? {
+        if let Some(p) = player {
+            let depth = g.depth(p)? + 1;
+            g.set_depth(bow, depth);
+        }
+        g.add_event_code(bow, event::CREATE, 0, &format!("image_speed = {speed};"), "CrimsonKid")?;
+        log.push(format!("bow: behind the player, image_speed {speed}"));
+    }
+    Ok(log)
+}
+
+/// DotKid, as for GameMaker 8.
+pub fn dot_kid_gms(g: &mut Gms, config: &Value, assets: &Assets) -> Result<Vec<String>> {
+    let outline = config["ShowOutline"].as_bool().unwrap_or(true);
+    let mut log = Vec::new();
+    let mask = png(assets, "DotKid", "sprDotkidMask.png", 1)?;
+    for name in DOT_MASKS {
+        if g.replace_sprite(name, &mask, Some((16, 16)))? > 0 {
+            log.push(format!("mask {name} is the dot"));
+        }
+    }
+    let empty = png(assets, "DotKid", "sprEmpty32x32.png", 1)?;
+    for name in DOT_BLANK {
+        if g.replace_sprite(name, &empty, Some((16, 16)))? > 0 {
+            log.push(format!("sprite {name} blank"));
+        }
+    }
+    let mut code = DOT_DRAW.to_owned();
+    if outline {
+        g.add_sprite("sprDotkidModCircle", &png(assets, "DotKid", "sprDotkidCircle.png", 1)?, (65, 64))?;
+        code.push_str(DOT_DRAW_OUTLINE);
+        log.push("sprite sprDotkidModCircle added".into());
+    }
+    for (obj, name) in g.objects(DOT_PLAYERS)? {
+        g.add_event_code(obj, event::DRAW, 0, &code, "DotKid")?;
+        log.push(format!("object {name} draws the dot"));
+    }
+    Ok(log)
+}
+
+/// DbgHelper's GameMaker: Studio part: the runner's sleep margin (how long before a frame
+/// is due it stops sleeping and waits busily). Its DBGHELP.dll, which only sets Windows'
+/// timer resolution to 1 ms, has nothing to do here: the clock is the runtime's own.
+pub fn dbg_helper_gms(g: &mut Gms, config: &Value) -> Result<Vec<String>> {
+    let mut log = Vec::new();
+    if config["SetSleepMargin"].as_bool().unwrap_or(true) {
+        let margin = config["SleepMargin"].as_f64().map_or(1, |v| v.round() as i64);
+        if g.set_constant("@@SleepMargin", &margin.to_string())? {
+            log.push(format!("sleep margin {margin} ms"));
+        } else {
+            log.push("the game sets no sleep margin, left alone".into());
         }
     }
     Ok(log)

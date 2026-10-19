@@ -35,3 +35,15 @@ pub fn frames(strip: &Image, n: u32) -> Vec<Image> {
         })
         .collect()
 }
+
+/// `img` as a PNG (8-bit RGBA).
+pub fn encode_png(img: &Image) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, img.w, img.h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().map_err(|e| format!("png: {e}"))?;
+    w.write_image_data(&img.rgba).map_err(|e| format!("png: {e}"))?;
+    w.finish().map_err(|e| format!("png: {e}"))?;
+    Ok(out)
+}
