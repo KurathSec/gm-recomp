@@ -1564,10 +1564,11 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
     if let Ok(pe) = pe::Pe::parse(&bytes) {
         for d in pe.imports().unwrap_or_default() {
             let stem = dll_stem(crate::api_set(&d.dll).unwrap_or(&d.dll));
-            if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.module_by_name(&d.dll).is_some() {
+            let file = format!("{stem}.dll");
+            // (loaded already, also under the name an API set stands for)
+            if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.module_by_name(&d.dll).is_some() || c.p.module_by_name(&file).is_some() {
                 continue;
             }
-            let file = format!("{stem}.dll");
             let in_dll_dir = c.p.dll_dir.as_ref().is_some_and(|d| c.p.fs.is_file(&c.p.vpath(&format!("{}\\{file}", d.trim_end_matches('\\')))));
             if c.p.fs.is_file(&c.p.vpath(&file)) || in_dll_dir || c.p.fs.is_file(&format!("{SYSTEM_DIR}\\{file}")) {
                 load_library(c, &file)?;
