@@ -126,6 +126,23 @@ pub fn register(r: &mut Registry) {
         let n = copy_wstr_out(c, c.arg(1), c.arg(2), &path);
         ok(3, n)
     });
+    // GetModuleFileNameEx(hProcess, hModule, lpFilename, nSize): this process's only
+    for (dll, name) in [(k, "K32GetModuleFileNameExW"), ("psapi.dll", "GetModuleFileNameExW")] {
+        r.add_on_demand(dll, name, |c| {
+            let base = c.arg(1);
+            let path = module_path(c, base);
+            let n = copy_wstr_out(c, c.arg(2), c.arg(3), &path);
+            ok(4, n)
+        });
+    }
+    for (dll, name) in [(k, "K32GetModuleFileNameExA"), ("psapi.dll", "GetModuleFileNameExA")] {
+        r.add_on_demand(dll, name, |c| {
+            let base = c.arg(1);
+            let path = module_path(c, base);
+            let n = copy_str_out(c, c.arg(2), c.arg(3), path.as_bytes());
+            ok(4, n)
+        });
+    }
     r.add(k, "LoadLibraryA", |c| {
         let name = c.str_arg(0);
         let h = load_library(c, &name)?;

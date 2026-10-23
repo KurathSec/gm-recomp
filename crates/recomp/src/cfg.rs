@@ -437,8 +437,35 @@ fn zero_filled(mem: &dyn GuestMem, va: u32) -> bool {
 /// The call target pops its return address right away (and is not the `call $+5`
 /// get-PC idiom, whose continuation is real code).
 fn pops_return_address(mem: &dyn GuestMem, target: u32, next: u32) -> bool {
-    let mut b = [0u8; 1];
-    target != next && mem.read(target, &mut b) && (0x58..=0x5F).contains(&b[0])
+    let mut b = [0u8; 16];
+    if target == next || !mem.read(target, &mut b) || !(0x58..=0x5F).contains(&b[0]) {
+        return false;
+    }
+    // Unless the address goes back onto the stack a little after (`pop eax; pop ecx;
+    // xchg [esp], eax; jmp eax`: MSVC's thunk that calls its second argument returns
+    // to the caller): then the call returns, and what follows it is code.
+    let popped = Register::EAX as u32 + (b[0] - 0x58) as u32;
+    let mut d = iced_x86::Decoder::with_ip(32, &b, target as u64, iced_x86::DecoderOptions::NONE);
+    let _ = d.decode();
+    for _ in 0..3 {
+        let i = d.decode();
+        if i.is_invalid() {
+            break;
+        }
+        let back = match i.mnemonic() {
+            Mnemonic::Push => i.op0_kind() == OpKind::Register && i.op0_register() as u32 == popped,
+            Mnemonic::Xchg => {
+                let reg = |n: u32| i.op_kind(n) == OpKind::Register && i.op_register(n) as u32 == popped;
+                let stack = |n: u32| i.op_kind(n) == OpKind::Memory && i.memory_base() == Register::ESP;
+                (reg(0) && stack(1)) || (stack(0) && reg(1))
+            }
+            _ => false,
+        };
+        if back {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether an instruction's memory operand is just `[disp32]` with a jump-table shape.

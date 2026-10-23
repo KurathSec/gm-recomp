@@ -247,7 +247,8 @@ impl Vm {
             self.find_free(size, top_down, 0)?
         } else {
             let b = base & !(GRANULARITY - 1);
-            if self.overlaps(b, size) {
+            // (a 64-bit DLL's preferred base above 4 GB can land past the guest's memory)
+            if self.overlaps(b, size) || b < self.min_addr || b as u64 + size as u64 > self.max_addr as u64 {
                 return None;
             }
             b
