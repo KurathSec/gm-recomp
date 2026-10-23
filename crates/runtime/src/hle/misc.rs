@@ -514,6 +514,19 @@ fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
 
 /// APIs only newer runners import (GameMaker Studio 2's 64-bit ones), on demand.
 fn register_newer(r: &mut Registry) {
+    // ETW and process settings newer runtimes set up: accepted
+    // (EventSetInformation's RegHandle is 64-bit: two slots)
+    r.add_on_demand("advapi32.dll", "EventSetInformation", |_c| ok(5, 0));
+    r.add_on_demand("kernel32.dll", "SetProcessInformation", |_c| ok(4, 1));
+    // avrt: a thread's multimedia scheduling class (GameMaker Studio 2's audio thread)
+    for name in ["AvSetMmThreadCharacteristicsA", "AvSetMmThreadCharacteristicsW"] {
+        r.add_on_demand("avrt.dll", name, |c| {
+            let _ = c.host.write_u32(c.arg(1), 0);
+            ok(2, 0xA0A0_0001)
+        });
+    }
+    r.add_on_demand("avrt.dll", "AvRevertMmThreadCharacteristics", |_c| ok(1, 1));
+    r.add_on_demand("avrt.dll", "AvSetMmThreadPriority", |_c| ok(2, 1));
     // RegGetValue(key, subkey, value, flags, pdwType, pvData, pcbData)
     r.add_on_demand("advapi32.dll", "RegGetValueA", |c| {
         let (sub, name) = (c.str_arg(1), c.str_arg(2));

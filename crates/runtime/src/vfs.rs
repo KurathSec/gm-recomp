@@ -322,6 +322,13 @@ impl MemFs {
         self.nodes.insert(path.to_lowercase(), Node { name, is_dir: false, data, mtime });
     }
 
+    /// A folder (and its parents) the game comes with.
+    pub fn insert_dir(&mut self, path: &str) {
+        let path = path.trim_end_matches('\\');
+        self.ensure_parents(path);
+        self.mkdir(path);
+    }
+
     fn ensure_parents(&mut self, path: &str) {
         let mut acc = String::new();
         let comps: Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();

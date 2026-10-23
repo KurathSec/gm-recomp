@@ -278,11 +278,12 @@
       const q = new URLSearchParams(location.search);
       const game = q.get('game');
 
-      const runnable = (e) => e && (e.kind === 'gm80' || e.kind === 'gm81' || e.kind === 'gms');
+      const runnable = (e) => e && (e.kind === 'gm80' || e.kind === 'gm81' || e.kind === 'gm8' || e.kind === 'gms');
       function engineLabel(e) {
         if (!e) return 'unknown engine';
         if (e.kind === 'gm80') return 'GameMaker 8.0';
         if (e.kind === 'gm81') return 'GameMaker 8.1';
+        if (e.kind === 'gm8') return 'GameMaker 8';
         if (e.kind === 'gms') {
           const build = e.version && e.version[3] && e.version[3] !== 9999 ? `.${e.version[3]}` : '';
           return `GameMaker: Studio 1.4${build}${e.yyc ? ' · YYC' : ''}`;

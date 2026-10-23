@@ -65,6 +65,8 @@ self.onmessage = async ({ data }) => {
       downloaded = await pending;
       post(`downloaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     }
+    // the folders the game comes with empty (a save folder), as paths ending in '/'
+    for (const d of manifest.dirs ?? []) downloaded.push([`${d}/`, new Uint8Array(0), 0]);
     // The mods chosen for the game change its files before the saves go on top.
     const mods = selectedMods(modChoices, manifest.engine);
     for (const id of Object.keys(modChoices)) {

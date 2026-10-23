@@ -10,6 +10,9 @@ use std::path::Path;
 pub enum Engine {
     Gm80,
     Gm81,
+    /// Another GameMaker 8 runner build (or a packed one): it runs, but its game data is
+    /// not where `gm80_header`/`GM81_SIGNATURE` know it, so mods cannot read it.
+    Gm8,
     Gms {
         bytecode: u8,
         version: [u32; 4],
@@ -63,11 +66,37 @@ pub fn detect(exe: &[u8], game_dir: &Path) -> Engine {
         }
         from = pos + 4;
     }
+    if gm8_runner(exe) {
+        return Engine::Gm8;
+    }
     Engine::Unknown
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// A GameMaker 8 runner of any build: its main form's resource (Delphi keeps a form under
+/// its class name, which a packer such as UPX leaves readable), in the PE image rather than
+/// the game data after it.
+pub fn gm8_runner(exe: &[u8]) -> bool {
+    const NAME: &[u8] = b"T\0R\0U\0N\0N\0E\0R\0F\0O\0R\0M\0";
+    let image = &exe[..pe_image_end(exe).min(exe.len())];
+    image.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// Where a PE file's sections end (the overlay, such as GameMaker 8's game data, follows).
+pub fn pe_image_end(exe: &[u8]) -> usize {
+    let Some(pe) = u32_at(exe, 0x3c).map(|p| p as usize) else { return exe.len() };
+    let (Some(n), Some(opt)) = (exe.get(pe + 6..pe + 8), exe.get(pe + 20..pe + 22)) else { return exe.len() };
+    let (n, opt) = (u16::from_le_bytes([n[0], n[1]]) as usize, u16::from_le_bytes([opt[0], opt[1]]) as usize);
+    (0..n)
+        .filter_map(|i| {
+            let s = pe + 24 + opt + i * 40;
+            Some(u32_at(exe, s + 20)? as usize + u32_at(exe, s + 16)? as usize)
+        })
+        .max()
+        .unwrap_or(exe.len())
 }
 
 /// A PE32+ (64-bit) image: optional header magic 0x20b.

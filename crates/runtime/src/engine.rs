@@ -292,6 +292,10 @@ pub trait Machine: Guest {
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         None
     }
+    /// See `Host::system_dll`.
+    fn system_dll(&mut self, _name: &str) -> Option<Vec<u8>> {
+        None
+    }
     /// See `Host::pace`.
     fn pace(&mut self, _clock_us: u64) {}
     /// See `Host::slack_ms`.
@@ -564,6 +568,10 @@ impl<M: Machine> Host for M {
 
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         Machine::soundfont(self)
+    }
+
+    fn system_dll(&mut self, name: &str) -> Option<Vec<u8>> {
+        Machine::system_dll(self, name)
     }
 
     fn pace(&mut self, clock_us: u64) {

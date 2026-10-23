@@ -23,8 +23,9 @@ const GAME_KEYS = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|D
  * Callbacks: onLog(line), onSize(w, h) (the game's resolution), onStats(stats),
  * onCapture(frame, png), onMonitor(line), onSoundPending(waiting) (sound waits for a click
  * or key press), onSaved() (saves stored), onDone(status) (the game ended: 0, or why not),
- * onPrompt({title, text, def, kind}) (a dialog the game opened, kind 'message', 'text' or
- * 'question': resolve to the text, '' for OK or Yes, null to cancel or for No; the browser's
+ * onPrompt({title, text, def, kind}) (a dialog the game opened, kind 'message', 'text',
+ * 'question' or 'error' (GameMaker 8's runtime error: Ignore or Abort): resolve to the text,
+ * '' for OK, Yes or Ignore, null to cancel, for No or Abort; the browser's
  * alert/prompt/confirm without it).
  * @returns {{worker: Worker, setKeymap(map): void, soundStats(): Promise<string | null>, stop(): void}}
  */
@@ -78,12 +79,13 @@ export function playGame(o) {
   // A dialog the game opened (worker.mjs `prompt`): o.onPrompt answers (a string, or null
   // to cancel or for No), else the browser's own.
   const answerPrompt = async ({ title, text, def, kind: k, sab }) => {
-    const kind = k === 2 ? 'question' : k === 1 ? 'text' : 'message';
+    // ('error': GameMaker 8's error form; an answer ignores the error, null aborts the game)
+    const kind = k === 3 ? 'error' : k === 2 ? 'question' : k === 1 ? 'text' : 'message';
     const shown = title ? `${title}\n\n${text}` : text;
     let answer = null;
     try {
       if (o.onPrompt) answer = await o.onPrompt({ title, text, def: kind === 'text' ? def ?? '' : null, kind });
-      else if (kind === 'question') answer = window.confirm(shown) ? '' : null;
+      else if (kind === 'question' || kind === 'error') answer = window.confirm(shown) ? '' : null;
       else if (kind === 'text') answer = window.prompt(shown, def ?? '');
       else {
         window.alert(shown);

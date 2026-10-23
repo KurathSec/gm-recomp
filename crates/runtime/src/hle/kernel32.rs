@@ -1496,9 +1496,31 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
     if HLE_DLLS.contains(&stem.as_str()) || FALLBACK_DLLS.contains(&stem.as_str()) {
         return Ok(c.p.fake_module(&stem));
     }
+    // Then the player's own system DLLs (the importer could not know this one was needed).
+    if !with_ext.contains(['\\', '/']) {
+        if let Some(bytes) = host_system_dll(c, &base_name) {
+            return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true);
+        }
+    }
     c.p.log(format!("LoadLibrary({name:?}): not found"));
     c.set_last_error(ERROR_MOD_NOT_FOUND);
     Ok(0)
+}
+
+/// A system DLL from the host (`Host::system_dll`), asked for once per name.
+fn host_system_dll(c: &mut Ctx, file: &str) -> Option<Vec<u8>> {
+    let key = file.to_lowercase();
+    if c.p.system_dll_missing.contains(&key) {
+        return None;
+    }
+    let bytes = c.host.system_dll(&key);
+    match &bytes {
+        Some(b) => c.p.log(format!("{key}: the player's copy ({} KB)", b.len() / 1024)),
+        None => {
+            c.p.system_dll_missing.insert(key);
+        }
+    }
+    bytes
 }
 
 /// Maps a PE image, binds its imports, runs TLS callbacks and DllMain. Shared by
@@ -1522,6 +1544,10 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
             let in_dll_dir = c.p.dll_dir.as_ref().is_some_and(|d| c.p.fs.is_file(&c.p.vpath(&format!("{}\\{file}", d.trim_end_matches('\\')))));
             if c.p.fs.is_file(&c.p.vpath(&file)) || in_dll_dir || c.p.fs.is_file(&format!("{SYSTEM_DIR}\\{file}")) {
                 load_library(c, &file)?;
+            } else if !FALLBACK_DLLS.contains(&stem.as_str()) {
+                if let Some(bytes) = host_system_dll(c, &file) {
+                    load_image(c, &file, &format!("C:\\Windows\\system32\\{file}"), bytes, true)?;
+                }
             }
         }
     }

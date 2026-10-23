@@ -226,10 +226,9 @@ pub fn register(r: &mut Registry) {
     r.alias(u, "DispatchMessageW", u, "DispatchMessageA");
     r.add(u, "GetQueueStatus", |c| ok(1, if c.p.messages.is_empty() { 0 } else { 0x0001_0001 }));
     r.add(u, "GetInputState", |_c| ok(0, 0));
-    r.add(u, "MsgWaitForMultipleObjects", |c| {
-        pump_timers(c);
-        ok(5, if c.p.messages.is_empty() { c.advance_clock(1000); 0x102 } else { c.arg(0) })
-    });
+    // (implemented with MsgWaitForMultipleObjectsEx in register_more; registered here first,
+    // which keeps the API ids, and so the stub addresses, where they have been)
+    r.add(u, "MsgWaitForMultipleObjects", |_c| ok(5, 0x102));
     r.add(u, "WaitMessage", |c| {
         if answer_dialog(c) {
             return ok(0, 1);
@@ -1290,7 +1289,7 @@ fn show_window(c: &mut Ctx, hwnd: u32, show: bool) -> Result<bool, super::ApiErr
             c.p.shown.push(hwnd);
             // A dialog form shown again (GameMaker 8 keeps one for every get_string and
             // show_message) is a new dialog for `answer_dialog`.
-            if c.p.windows.get(&hwnd).is_some_and(|w| w.class == DIALOG_FORM) {
+            if c.p.windows.get(&hwnd).is_some_and(|w| w.class == DIALOG_FORM || w.class == ERROR_FORM) {
                 c.p.dialog = (0, 0, false);
                 c.p.dialog_text.remove(&hwnd);
             }
@@ -1576,7 +1575,7 @@ fn post_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) {
 }
 
 /// Queues WM_TIMER messages whose due time has passed.
-fn pump_timers(c: &mut Ctx) {
+pub fn pump_timers(c: &mut Ctx) {
     let now = c.p.clock_us;
     let mut due = Vec::new();
     for (&hwnd, w) in c.p.windows.iter_mut() {
@@ -2071,6 +2070,9 @@ fn draw_text(c: &mut Ctx, wide: bool, ex: bool) -> ApiResult {
 /// GameMaker 8's dialog form: show_message, show_question, get_string, get_integer (and
 /// Delphi's MessageDlg).
 const DIALOG_FORM: &str = "TMessageForm";
+/// GameMaker 8's runtime error form ("Error Messages": the message in a memo, Ignore and
+/// Abort buttons). Left unanswered, the game waits in it with nothing on screen.
+const ERROR_FORM: &str = "TErrorForm";
 
 /// GameMaker 8's dialogs are VCL forms the browser never shows: when the game waits in such a
 /// form's modal loop (WaitMessage), the player is asked instead (`Host::prompt`), the answer
@@ -2079,9 +2081,10 @@ const DIALOG_FORM: &str = "TMessageForm";
 /// or after a few waits without.
 fn answer_dialog(c: &mut Ctx) -> bool {
     use super::Ask;
-    let Some(form) = c.p.windows.iter().filter(|(_, w)| w.class == DIALOG_FORM && w.visible && w.enabled).map(|(&h, _)| h).max() else {
+    let Some(form) = c.p.windows.iter().filter(|(_, w)| (w.class == DIALOG_FORM || w.class == ERROR_FORM) && w.visible && w.enabled).map(|(&h, _)| h).max() else {
         return false;
     };
+    let error = c.p.windows[&form].class == ERROR_FORM;
     if c.p.dialog.0 != form {
         c.p.dialog = (form, 0, false);
     }
@@ -2094,22 +2097,37 @@ fn answer_dialog(c: &mut Ctx) -> bool {
         }
         return false;
     }
-    if !c.p.dialog_text.contains_key(&form) && waits < 20 {
+    // (the error form's message is in its memo, nothing painted to wait for)
+    if !error && !c.p.dialog_text.contains_key(&form) && waits < 20 {
         return false;
     }
     c.p.dialog = (form, 0, true);
     let mut edit = None;
+    let mut memo = String::new();
     let mut buttons: Vec<(u32, String)> = Vec::new();
     for k in c.p.windows[&form].children.clone() {
         let Some(w) = c.p.windows.get(&k) else { continue };
         if !w.visible {
             continue;
         }
-        if w.class.ends_with("Edit") {
+        if w.class.ends_with("Memo") {
+            memo = w.title.clone();
+        } else if w.class.ends_with("Edit") {
             edit = Some(k);
-        } else if w.class.ends_with("Button") {
+        } else if w.class.ends_with("Button") || w.class.ends_with("BitBtn") {
             buttons.push((k, w.title.replace('&', "")));
         }
+    }
+    if error {
+        let title = c.p.windows[&form].title.clone();
+        let text = memo.trim().replace("\r\n", "\n").trim_start_matches('_').trim().to_owned();
+        c.p.log(format!("dialog [{title}]: {text:?} (Error)"));
+        let answer = c.host.prompt(Ask::Error, &title, &text);
+        let want = if answer.is_some() { "Ignore" } else { "Abort" };
+        if let Some(&(b, _)) = buttons.iter().find(|(_, t)| t.eq_ignore_ascii_case(want)) {
+            post(c, form, WM_COMMAND, 0, b);
+        }
+        return true;
     }
     let title = c.p.windows[&form].title.clone();
     // The buttons' captions are painted on the form too (GameMaker 8's buttons are painted
@@ -2509,33 +2527,19 @@ pub fn register_more(r: &mut Registry) {
     r.add(u, "CloseGestureInfoHandle", |_c| ok(1, 0));
     r.add(u, "SetGestureConfig", |_c| ok(5, 0));
     r.add(u, "GetGestureConfig", |_c| ok(6, 0));
+    // (nCount, pHandles, dwMilliseconds, dwWakeMask, dwFlags: MWMO_WAITALL 1)
     r.add(u, "MsgWaitForMultipleObjectsEx", |c| {
-        let (count, ms) = (c.arg(0), c.arg(2));
-        if !c.p.messages.is_empty() {
-            return ok(5, count);
-        }
-        if ms != 0xFFFF_FFFF {
-            c.advance_clock(ms as u64 * 1000);
-            pump_timers(c);
-            return ok(5, if c.p.messages.is_empty() { 258 } else { count });
-        }
-        c.advance_clock(10_000);
-        pump_timers(c);
-        ok(5, count)
+        let (n, p, ms, mask, flags) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4));
+        let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + c.ptr_size() * i).unwrap_or(0)).collect();
+        let r = super::threads::msg_wait(c, handles, flags & 1 != 0, ms, mask);
+        ok(5, r)
     });
+    // (nCount, pHandles, fWaitAll, dwMilliseconds, dwWakeMask)
     r.add(u, "MsgWaitForMultipleObjects", |c| {
-        let (count, ms) = (c.arg(0), c.arg(3));
-        if !c.p.messages.is_empty() {
-            return ok(5, count);
-        }
-        if ms != 0xFFFF_FFFF {
-            c.advance_clock(ms as u64 * 1000);
-            pump_timers(c);
-            return ok(5, if c.p.messages.is_empty() { 258 } else { count });
-        }
-        c.advance_clock(10_000);
-        pump_timers(c);
-        ok(5, count)
+        let (n, p, all, ms, mask) = (c.arg(0), c.arg(1), c.arg(2) != 0, c.arg(3), c.arg(4));
+        let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + c.ptr_size() * i).unwrap_or(0)).collect();
+        let r = super::threads::msg_wait(c, handles, all, ms, mask);
+        ok(5, r)
     });
 }
 

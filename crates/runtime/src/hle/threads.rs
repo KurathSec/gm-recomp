@@ -237,6 +237,49 @@ fn wait(c: &mut Ctx, handles: Vec<u32>, all: bool, ms: u32) -> u32 {
     WAIT_TIMEOUT // replaced by the result when the thread wakes
 }
 
+/// MsgWaitForMultipleObjects(Ex): `handles` as `wait` (WAIT_OBJECT_0 + k), or a queued
+/// message of the kinds `mask` names (WAIT_OBJECT_0 + n). Sent messages are delivered as
+/// they are sent here, so a mask of QS_SENDMESSAGE alone (Delphi's TThread.WaitFor) waits
+/// for the objects only. The main thread lets the other threads run meanwhile; without
+/// handles, or when nothing can change, the clock moves on by the timeout (10 s for
+/// INFINITE, which then reports a message) and the timers are pumped.
+pub fn msg_wait(c: &mut Ctx, handles: Vec<u32>, all: bool, ms: u32, mask: u32) -> u32 {
+    const QS_SENDMESSAGE: u32 = 0x40;
+    let n = handles.len() as u32;
+    let posted = mask & !QS_SENDMESSAGE != 0;
+    let mut check = |p: &mut Process| -> Option<u32> {
+        if all {
+            if !handles.is_empty() && handles.iter().all(|&h| signaled(p, h, false)) {
+                for &h in &handles {
+                    signaled(p, h, true);
+                }
+                return Some(WAIT_OBJECT_0);
+            }
+        } else if let Some(k) = handles.iter().position(|&h| signaled(p, h, true)) {
+            return Some(WAIT_OBJECT_0 + k as u32);
+        }
+        (posted && !p.messages.is_empty()).then_some(WAIT_OBJECT_0 + n)
+    };
+    if let Some(r) = check(c.p) {
+        return r;
+    }
+    let until = c.p.clock_us + if ms == INFINITE { 10_000 } else { ms as u64 } * 1000;
+    if c.p.current == 0 && n > 0 && ms != 0 {
+        let r = main_wait(c, Some(until), &mut check);
+        if r != WAIT_TIMEOUT && r != WAIT_FAILED {
+            return r;
+        }
+    }
+    if until > c.p.clock_us {
+        c.advance_clock(until - c.p.clock_us);
+    }
+    super::user32::pump_timers(c);
+    if let Some(r) = check(c.p) {
+        return r;
+    }
+    if ms == INFINITE { WAIT_OBJECT_0 + n } else { WAIT_TIMEOUT }
+}
+
 // ---- critical sections --------------------------------------------------------------------
 // CRITICAL_SECTION: DebugInfo, LockCount, RecursionCount, OwningThread, LockSemaphore, SpinCount
 

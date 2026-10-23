@@ -373,10 +373,12 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // Key events the page writes to a shared ring as they happen (see index.html):
   // read at the guest's every message poll, also while the worker blocks in a wait.
   const keyRing = inputRing && { idx: new Int32Array(inputRing, 0, 2), ev: new Int32Array(inputRing, 8, 256 * 3), when: new Float64Array(inputRing, 8 + 256 * 12, 256) };
+  let systemDll = null;
   const host = {
     // A dialog for the player (hle Host::prompt: GameMaker 8's message, question and text
     // dialogs, I wanna play online's input_box): `prompt(title, text, default | null, kind)`
-    // (kind 0 a message, 1 text, 2 a yes/no question) answers synchronously (worker.mjs
+    // (kind 0 a message, 1 text, 2 a yes/no question, 3 a game error: an answer ignores it,
+    // null aborts the game) answers synchronously (worker.mjs
     // waits for the page), a string or null when cancelled. Without one it is cancelled.
     prompt(tPtr, tLen, xPtr, xLen, dPtr, dLen, kind, out, cap) {
       const str = (p, n) => dec.decode(mem().subarray(p, p + n));
@@ -388,6 +390,27 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       const bytes = new TextEncoder().encode(answer);
       mem().set(bytes.subarray(0, cap), out);
       return bytes.length;
+    },
+    // A system DLL the import did not supply (hle Host::system_dll: one a DLL the game
+    // writes at run time imports): the player's system32/ copy, fetched synchronously
+    // (a worker may), its length or -1; system_dll_copy then writes it.
+    system_dll_len(p, n) {
+      const name = dec.decode(mem().subarray(p, p + n));
+      try {
+        const x = new XMLHttpRequest();
+        x.open('GET', asset(`system32/${encodeURIComponent(name)}`), false);
+        x.responseType = 'arraybuffer';
+        x.send();
+        if (x.status !== 200) return -1;
+        systemDll = new Uint8Array(x.response);
+        return systemDll.length;
+      } catch {
+        return -1;
+      }
+    },
+    system_dll_copy(out) {
+      mem().set(systemDll, out);
+      systemDll = null;
     },
     input_drain() {
       if (!keyRing) return;

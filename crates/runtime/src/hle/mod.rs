@@ -14,6 +14,7 @@ pub mod dmusic;
 pub mod dsound;
 pub mod gpu;
 pub mod gdi32;
+pub mod gdiplus;
 pub mod httpdll;
 pub mod kernel32;
 pub mod threads;
@@ -101,6 +102,9 @@ pub enum Ask<'a> {
     Question,
     /// a line of text, with this default
     Text(&'a str),
+    /// a runtime error of the game's code (GameMaker 8's error form): Some to ignore it and
+    /// go on, None to abort the game
+    Error,
 }
 
 /// Services the host provides to APIs beyond raw memory: calling back into guest code.
@@ -131,6 +135,11 @@ pub trait Host: Guest {
     fn run_threads(&mut self, p: &mut Process);
     /// A General MIDI SoundFont, once available (the first call may start loading it).
     fn soundfont(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    /// A system DLL the import did not supply (one a DLL the game writes at run time
+    /// imports, such as an extension's ucrtbase.dll): the player's copy, if it has one.
+    fn system_dll(&mut self, _name: &str) -> Option<Vec<u8>> {
         None
     }
     /// The main thread's clock moved on to `clock_us`: a host that plays in real time
@@ -553,6 +562,7 @@ impl Registry {
         profile::register(&mut r);
         // APIs added since, made when imported (`on_demand`)
         msvcrt::register_late(&mut r);
+        gdiplus::register(&mut r);
         r
     }
 

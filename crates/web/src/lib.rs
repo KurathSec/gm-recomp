@@ -17,7 +17,7 @@ use runtime::{Guest, Process};
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
     /// Asks the player (hle `Host::prompt`): `kind` 0 a message, 1 a line of text (default
-    /// `def`), 2 a yes/no question. Writes the answer (UTF-8, cut to `cap`) at `out`;
+    /// `def`), 2 a yes/no question, 3 a game error (an answer ignores it, -1 aborts). Writes the answer (UTF-8, cut to `cap`) at `out`;
     /// returns its full length, or -1 when cancelled (or No). The game's thread waits for it.
     fn prompt(title: *const u8, title_len: usize, text: *const u8, text_len: usize, def: *const u8, def_len: usize, kind: u32, out: *mut u8, cap: usize) -> i32;
     /// Compiles and instantiates a translated module; writes the table index of each
@@ -25,6 +25,10 @@ unsafe extern "C" {
     fn instantiate(wasm: *const u8, len: usize, names: *const u8, names_len: usize, out: *mut u32) -> i32;
     fn print(ptr: *const u8, len: usize);
     fn now_us() -> f64;
+    /// A system DLL from the player's system32/ (hle `Host::system_dll`): its length, or
+    /// -1 when there is none; `system_dll_copy` then writes it at `out`.
+    fn system_dll_len(name: *const u8, name_len: usize) -> i32;
+    fn system_dll_copy(out: *mut u8);
 }
 
 #[link(wasm_import_module = "gpu")]
@@ -444,6 +448,7 @@ impl Machine for Web {
             Ask::Message => ("", 0),
             Ask::Text(d) => (d, 1),
             Ask::Question => ("", 2),
+            Ask::Error => ("", 3),
         };
         let mut out = vec![0u8; 4096];
         let n = unsafe { prompt(title.as_ptr(), title.len(), text.as_ptr(), text.len(), def.as_ptr(), def.len(), kind, out.as_mut_ptr(), out.len()) };
@@ -452,6 +457,15 @@ impl Machine for Web {
         }
         out.truncate((n as usize).min(out.len()));
         Some(String::from_utf8_lossy(&out).into_owned())
+    }
+    fn system_dll(&mut self, name: &str) -> Option<Vec<u8>> {
+        let n = unsafe { system_dll_len(name.as_ptr(), name.len()) };
+        if n < 0 {
+            return None;
+        }
+        let mut v = vec![0u8; n as usize];
+        unsafe { system_dll_copy(v.as_mut_ptr()) };
+        Some(v)
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         let st = state();
@@ -769,6 +783,11 @@ pub unsafe extern "C" fn fs_add(path: *const u8, path_len: usize, data: *const u
     let data = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
     let ms = mtime_ms.max(0.0) as u64;
     let filetime = if ms == 0 { 0 } else { (ms / 1000 + 11_644_473_600) * 10_000_000 + (ms % 1000) * 10_000 };
+    // (a path ending in '\\': a folder the game comes with, empty)
+    if path.ends_with('\\') {
+        state().fs.get_or_insert_with(MemFs::new).insert_dir(&path);
+        return;
+    }
     state().fs.get_or_insert_with(MemFs::new).insert_with_time(&path, data, filetime);
 }
 

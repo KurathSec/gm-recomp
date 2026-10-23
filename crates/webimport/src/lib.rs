@@ -20,6 +20,9 @@ pub struct Game {
     pub files: Vec<(String, Vec<u8>)>,
     /// The IExpress stub, the program it runs and its title.
     pub iexpress: Option<(String, String, String)>,
+    /// Folders the archive has with no files in them ('/' separated, parents first): games
+    /// write into a folder they ship empty (a save folder), as extracting leaves it.
+    pub dirs: Vec<String>,
 }
 
 fn u16le(d: &[u8], o: usize) -> Result<u16, String> {
@@ -201,7 +204,58 @@ pub fn read_rar(data: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String
     Ok(out)
 }
 
-/// Unpacks an archive (zip, 7z or RAR, by content: renamed ones are common; or a bare exe)
+/// An LHA/LZH archive's files and folders (through `delharc`), as `read_zip` gives them.
+/// Names are taken raw (Shift-JIS in Japanese archives), from the level 2 file name and
+/// directory headers when there are some.
+pub fn read_lzh(data: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String> {
+    use std::io::Read;
+    let mut reader = delharc::LhaDecodeReader::new(std::io::Cursor::new(data)).map_err(|e| format!("LZH: {e}"))?;
+    let mut out = Vec::new();
+    loop {
+        let h = reader.header();
+        let (mut dir, mut file) = (Vec::new(), None);
+        for extra in h.iter_extra() {
+            match extra {
+                [0x01, name @ ..] => file = Some(name.to_vec()),
+                [0x02, path @ ..] => dir = path.to_vec(),
+                _ => {}
+            }
+        }
+        // (level 0/1: the path is in the file name field, '\' or 0xff separated)
+        let mut raw = dir;
+        if !raw.is_empty() {
+            raw.push(b'/');
+        }
+        raw.extend(file.unwrap_or_else(|| h.filename.to_vec()));
+        let name: String = raw.split(|&b| b == 0xff || b == b'\\' || b == b'/').filter(|s| !s.is_empty()).map(|s| decode_name(s, false)).collect::<Vec<_>>().join("/");
+        let is_dir = h.is_directory();
+        if !name.is_empty() {
+            let parts = safe_parts(&name).filter(|p| !p.is_empty()).ok_or_else(|| format!("unsafe LZH entry name {name:?}"))?;
+            if is_dir {
+                out.push((parts, true, Vec::new()));
+            } else {
+                if !reader.is_decoder_supported() {
+                    return Err(format!("{name}: LZH method {} is not supported", String::from_utf8_lossy(&h.compression)));
+                }
+                let mut v = Vec::with_capacity(h.original_size as usize);
+                reader.read_to_end(&mut v).map_err(|e| format!("LZH {name}: {e}"))?;
+                reader.crc_check().map_err(|e| format!("LZH {name}: {e}"))?;
+                out.push((parts, false, v));
+            }
+        }
+        if !reader.next_file().map_err(|e| format!("LZH: {e}"))? {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// An LHA/LZH archive: a method id such as `-lh5-` after the header's first two bytes.
+fn is_lzh(data: &[u8]) -> bool {
+    data.len() > 21 && data[2] == b'-' && data[6] == b'-' && (data[3..5] == *b"lh" || data[3..5] == *b"lz" || data[3..5] == *b"pm")
+}
+
+/// Unpacks an archive (zip, 7z, RAR or LZH, by content: renamed ones are common; or a bare exe)
 /// into a game:
 /// files with a single shared top folder stripped (its name is the title then), an
 /// IExpress package unwrapped.
@@ -210,6 +264,8 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
         read_7z(archive)?
     } else if archive.starts_with(b"Rar!") {
         read_rar(archive)?
+    } else if is_lzh(archive) {
+        read_lzh(archive)?
     } else if archive.starts_with(b"MZ") {
         // a self-extracting zip, else a game released as its exe alone (GameMaker 8 keeps
         // the game data inside)
@@ -223,8 +279,12 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     let top = entries.first().map(|(p, _, _)| p[0].clone());
     let shared = top.filter(|t| entries.iter().all(|(p, is_dir, _)| &p[0] == t && (p.len() > 1 || *is_dir)));
     let mut files = Vec::new();
+    let mut dirs = Vec::new();
     for (parts, is_dir, data) in entries {
         let parts = if shared.is_some() { &parts[1..] } else { &parts[..] };
+        if is_dir && !parts.is_empty() {
+            dirs.push(parts.join("/"));
+        }
         if is_dir || parts.is_empty() {
             continue;
         }
@@ -235,11 +295,19 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     }
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
-    let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None };
+    let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs };
     // (the game's folder first: an IExpress package in a folder unwraps from there)
     game.reroot();
     game.iexpress = unwrap_iexpress(&mut game.files)?;
     game.files.sort_by(|a, b| a.0.cmp(&b.0));
+    // only the folders extracting would leave empty (the others come with their files)
+    let lower: Vec<String> = game.files.iter().map(|(p, _)| p.to_lowercase()).collect();
+    game.dirs.retain(|d| {
+        let d = format!("{}/", d.to_lowercase());
+        !lower.iter().any(|p| p.starts_with(&d))
+    });
+    game.dirs.sort();
+    game.dirs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     let (entry, _) = game.entry();
     if game.find(&entry).is_some_and(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")) {
         return Err(format!("{entry} is an NSIS installer, which cannot be imported in the browser yet"));
@@ -433,6 +501,8 @@ impl Game {
         let prefix = format!("{dir}/");
         let files = std::mem::take(&mut self.files);
         self.files = files.into_iter().filter_map(|(p, d)| p.strip_prefix(&prefix).map(|q| (q.to_owned(), d))).collect();
+        let dirs = std::mem::take(&mut self.dirs);
+        self.dirs = dirs.into_iter().filter_map(|p| p.strip_prefix(&prefix).filter(|q| !q.is_empty()).map(str::to_owned)).collect();
         if let Some(name) = dir.rsplit('/').next() {
             self.title = name.to_owned();
         }
@@ -492,6 +562,10 @@ impl Game {
             }
             from = pos + 4;
         }
+        // another GameMaker 8 runner build, or a packed one: it runs, without mods
+        if gm8_runner(exe) {
+            return json!({ "kind": "gm8" });
+        }
         json!({ "kind": "unknown" })
     }
 
@@ -549,12 +623,36 @@ impl Game {
             "entry_candidates": candidates,
             "iexpress": self.iexpress.as_ref().map(|(stub, run, title)| json!({ "stub": stub, "run_program": run, "title": title })),
             "files": self.files.iter().map(|(p, d)| json!({ "path": p, "size": d.len() })).collect::<Vec<_>>(),
+            "dirs": self.dirs,
         })
     }
 }
 
 fn u32_at(d: &[u8], off: usize) -> Option<u32> {
     d.get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// A GameMaker 8 runner of any build: its main form's resource (Delphi keeps a form under
+/// its class name, which a packer such as UPX leaves readable), in the PE image rather than
+/// the game data after it. As the native importer's `engine::gm8_runner`.
+fn gm8_runner(exe: &[u8]) -> bool {
+    const NAME: &[u8] = b"T\0R\0U\0N\0N\0E\0R\0F\0O\0R\0M\0";
+    let image = &exe[..pe_image_end(exe).min(exe.len())];
+    image.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// Where a PE file's sections end (the overlay, such as GameMaker 8's game data, follows).
+fn pe_image_end(exe: &[u8]) -> usize {
+    let Some(pe) = u32_at(exe, 0x3c).map(|p| p as usize) else { return exe.len() };
+    let (Some(n), Some(opt)) = (exe.get(pe + 6..pe + 8), exe.get(pe + 20..pe + 22)) else { return exe.len() };
+    let (n, opt) = (u16::from_le_bytes([n[0], n[1]]) as usize, u16::from_le_bytes([opt[0], opt[1]]) as usize);
+    (0..n)
+        .filter_map(|i| {
+            let s = pe + 24 + opt + i * 40;
+            Some(u32_at(exe, s + 20)? as usize + u32_at(exe, s + 16)? as usize)
+        })
+        .max()
+        .unwrap_or(exe.len())
 }
 
 /// A PE32+ (64-bit) image: optional header magic 0x20b.

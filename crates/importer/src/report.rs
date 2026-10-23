@@ -29,6 +29,7 @@ fn engine_label(e: &Value) -> String {
     match s(&e["kind"]) {
         "gm80" => "GM8.0".into(),
         "gm81" => "GM8.1".into(),
+        "gm8" => "GM8 (other build)".into(),
         "gms" => {
             let ver: Vec<String> = e["version"].as_array().map(|a| a.iter().map(|x| x.to_string()).collect()).unwrap_or_default();
             format!(

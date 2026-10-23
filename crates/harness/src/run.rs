@@ -206,6 +206,12 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn set_global64(&mut self, g: G, v: u64) {
         let _ = self.cpu.globals[g as usize].set(&mut *self.cx, Val::I64(v as i64));
     }
+    /// GMR_SYSTEM32's copy (the player bundle's system32/), as the page fetches it.
+    fn system_dll(&mut self, name: &str) -> Option<Vec<u8>> {
+        let dir = std::env::var("GMR_SYSTEM32").ok()?;
+        let found = std::fs::read_dir(&dir).ok()?.flatten().find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))?;
+        std::fs::read(found.path()).ok()
+    }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         // GMR_SOUNDFONT, else the system's General MIDI SoundFont; offered once
         let mut cx = self.cx.as_context_mut();
@@ -242,11 +248,11 @@ impl<C: Cx> Machine for Wt<'_, C> {
     /// prompt with that instead, and GMR_PROMPT=no answers a question No.
     fn prompt(&mut self, ask: runtime::hle::Ask, title: &str, text: &str) -> Option<String> {
         use runtime::hle::Ask;
-        eprintln!("prompt [{title}]: {text}");
+        eprintln!("prompt [{title}]: {}", text.replace('\n', " | "));
         let given = std::env::var("GMR_PROMPT").ok();
         match ask {
             Ask::Message => Some(String::new()),
-            Ask::Question => (given.as_deref() != Some("no")).then(String::new),
+            Ask::Question | Ask::Error => (given.as_deref() != Some("no")).then(String::new),
             Ask::Text(d) => Some(given.unwrap_or_else(|| d.to_owned())),
         }
     }
@@ -633,6 +639,22 @@ pub fn run(opts: RunOpts) -> Result<()> {
         if !missing.is_empty() {
             eprintln!("---- {} statically imported APIs without an implementation ----", missing.len());
             eprintln!("{}", missing.join(" "));
+        }
+        // the visible top-level windows (a modal form left open stops a game that waits in it)
+        let mut shown: Vec<String> = p
+            .windows
+            .iter()
+            .filter(|(_, w)| w.style & 0x4000_0000 == 0 && w.visible)
+            .map(|(h, w)| {
+                // (and its controls' texts: an error form's message is in its memo)
+                let texts: Vec<String> = w.children.iter().filter_map(|k| p.windows.get(k)).filter(|k| !k.title.is_empty()).map(|k| format!("{} {:?}", k.class, k.title.chars().take(400).collect::<String>())).collect();
+                let texts = if texts.is_empty() { String::new() } else { format!(" [{}]", texts.join(", ")) };
+                format!("{h:#x} {} {:?} {}x{}{}{texts}", w.class, w.title, w.w, w.h, if w.enabled { "" } else { " (disabled)" })
+            })
+            .collect();
+        shown.sort();
+        if !shown.is_empty() {
+            eprintln!("windows: {}", shown.join(" | "));
         }
         let presents: Vec<&String> = p.log.iter().filter(|l| l.starts_with("Present #")).collect();
         for l in presents.iter().rev().take(3).rev() {
