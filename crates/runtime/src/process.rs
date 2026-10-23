@@ -359,6 +359,9 @@ pub struct Process {
     pub messages: VecDeque<Msg>,
     pub focus: u32,
     pub active: u32,
+    /// Windows in the order they were last shown, for activation to go back to when the
+    /// one with the focus hides (a modal dialog closing).
+    pub shown: Vec<u32>,
     pub capture: u32,
     pub next_gdi: u32,
     pub stock_objects: HashMap<u32, u32>,
@@ -526,6 +529,7 @@ impl Process {
             next_hwnd: 0x0001_0010,
             messages: VecDeque::new(),
             focus: 0,
+            shown: Vec::new(),
             active: 0,
             capture: 0,
             next_gdi: 0x0100_0000,

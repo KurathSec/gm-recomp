@@ -273,6 +273,10 @@ pub fn register(r: &mut Registry) {
             if flags & 0x40 != 0 { win.visible = true; }
             if flags & 0x80 != 0 { win.visible = false; }
         }
+        // (SWP_HIDEWINDOW is how Delphi's forms hide, a modal dialog among them)
+        if flags & 0x80 != 0 {
+            focus_back(c, hwnd);
+        }
         if flags & 1 == 0 {
             let wh = (w.max(0) as u32 & 0xFFFF) | ((h.max(0) as u32) << 16);
             send_message(c, hwnd, WM_SIZE, 0, wh)?;
@@ -498,8 +502,12 @@ pub fn register(r: &mut Registry) {
     });
     r.add(u, "GetActiveWindow", |c| ok(0, c.p.active));
     r.add(u, "SetActiveWindow", |c| {
-        let old = c.p.active;
-        c.p.active = c.arg(0);
+        let (old, hwnd) = (c.p.active, c.arg(0));
+        c.p.active = hwnd;
+        // the keyboard goes with the activation (unless it is already in that window)
+        if hwnd != 0 && c.p.windows.contains_key(&hwnd) && !within(c, c.p.focus, hwnd) {
+            c.p.focus = hwnd;
+        }
         ok(1, old)
     });
     r.add(u, "GetForegroundWindow", |c| ok(0, c.p.active));
@@ -1274,7 +1282,18 @@ fn show_window(c: &mut Ctx, hwnd: u32, show: bool) -> Result<bool, super::ApiErr
     };
     if was != show {
         send_message(c, hwnd, WM_SHOWWINDOW, show as u32, 0)?;
+        c.p.shown.retain(|&h| h != hwnd);
+        if !show {
+            focus_back(c, hwnd);
+        }
         if show {
+            c.p.shown.push(hwnd);
+            // A dialog form shown again (GameMaker 8 keeps one for every get_string and
+            // show_message) is a new dialog for `answer_dialog`.
+            if c.p.windows.get(&hwnd).is_some_and(|w| w.class == DIALOG_FORM) {
+                c.p.dialog = (0, 0, false);
+                c.p.dialog_text.remove(&hwnd);
+            }
             let (w, h) = c.p.windows.get(&hwnd).map(|w| (w.w, w.h)).unwrap_or((0, 0));
             c.p.active = hwnd;
             c.p.focus = hwnd;
@@ -1287,6 +1306,34 @@ fn show_window(c: &mut Ctx, hwnd: u32, show: bool) -> Result<bool, super::ApiErr
         }
     }
     Ok(was)
+}
+
+/// `hwnd` hid: if the keyboard was in it (a dialog closing), the window shown before it
+/// gets it back, as Windows activates the next window.
+fn focus_back(c: &mut Ctx, hwnd: u32) {
+    c.p.shown.retain(|&h| h != hwnd);
+    if !(within(c, c.p.focus, hwnd) || c.p.active == hwnd) {
+        return;
+    }
+    let back = c.p.shown.iter().rev().copied().find(|&h| c.p.windows.get(&h).is_some_and(|w| w.visible && w.parent == 0));
+    if let Some(back) = back {
+        c.p.active = back;
+        c.p.focus = back;
+    }
+}
+
+/// Whether `hwnd` is `ancestor` or inside it.
+fn within(c: &Ctx, mut hwnd: u32, ancestor: u32) -> bool {
+    for _ in 0..64 {
+        if hwnd == 0 {
+            return false;
+        }
+        if hwnd == ancestor {
+            return true;
+        }
+        hwnd = c.p.windows.get(&hwnd).map_or(0, |w| w.parent);
+    }
+    false
 }
 
 fn invalidate(c: &mut Ctx, hwnd: u32) {
@@ -2098,9 +2145,10 @@ fn answer_dialog(c: &mut Ctx) -> bool {
         // No) to the focused control, as the player would press it
         None => {
             let to = edit.unwrap_or(form);
+            // (no WM_CHAR: the dialog's TranslateMessage makes it, and a second one is
+            // left to close the next dialog GameMaker opens on the same form)
             let (vk, scan) = if answer.is_some() { (0x0D, 0x1C) } else { (0x1B, 0x01) };
             post(c, to, WM_KEYDOWN, vk, 1 | scan << 16);
-            post(c, to, WM_CHAR, vk, 1 | scan << 16);
             post(c, to, WM_KEYUP, vk, 1 | scan << 16 | 0xC000_0000);
         }
     }
