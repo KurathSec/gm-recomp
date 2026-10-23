@@ -23,6 +23,11 @@ pub struct FuncInfo<'a> {
     /// address`, so RIP-relative operands and pushed return addresses are the real
     /// 64-bit values; blocks and functions are keyed by the low half (docs/x64.md).
     pub high: u32,
+    /// Code that may change after it is translated (a packer's or protector's, code
+    /// written at run time): its blocks check their first bytes (`abi::trap::STALE`).
+    pub volatile: &'a dyn Fn(u32) -> bool,
+    /// The batch being translated (1..2^23), for `abi::trap::STALE`.
+    pub tag: u32,
 }
 
 /// How code is decoded: 32-bit, or 64-bit with the upper half of its addresses.
@@ -131,6 +136,11 @@ pub struct Cfg {
     pub call_flags: HashMap<u32, u8>,
     /// Direct call and jump targets translated already -> their table index.
     pub known: HashMap<u32, u32>,
+    /// Volatile code (`FuncInfo::volatile`): the batch tag its checks report, else 0.
+    pub guard: u32,
+    /// Block key -> (address, length 1/2/4, bytes) of its first instruction as it was
+    /// decoded, for the block's check.
+    pub checks: HashMap<u32, (u32, u8, u32)>,
 }
 
 const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
@@ -183,6 +193,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
     let mut ret_targets = Vec::new();
     let mut call_flags = HashMap::default();
     let mut known = HashMap::default();
+    let mut checks = HashMap::default();
+    // (32-bit code only)
+    let guard = matches!(bits, Bits::B32) && info.tag != 0 && (info.volatile)(entry);
     let mut queue = VecDeque::from([entry]);
     let mut total = 0usize;
     let mut buf = vec![0u8; 16];
@@ -312,6 +325,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                             _ => Term::InlineRet { ret_to: next, ret_key: next },
                         };
                         blocks.insert(key(k), Block { start: key(k), instrs: b.instrs.clone(), term: t });
+                        if let Some(&c) = callee.checks.get(&k) {
+                            checks.insert(key(k), c);
+                        }
                     }
                     fop.extend(callee.fop.iter().map(|(&a, &b)| (a, b)));
                     call_flags.extend(callee.call_flags.iter().map(|(&a, &b)| (a, b)));
@@ -359,10 +375,23 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
             break;
         }
         let block = Block { start, instrs, term };
+        if guard && let Some(first) = block.instrs.first() {
+            // the bytes the block was decoded from, as far as its first instruction goes
+            let at = first.ip() as u32;
+            let len: u8 = match first.len() {
+                1 => 1,
+                2 | 3 => 2,
+                _ => 4,
+            };
+            let mut b = [0u8; 4];
+            if mem.read(at, &mut b[..len as usize]) {
+                checks.insert(start, (at, len, u32::from_le_bytes(b)));
+            }
+        }
         queue.extend(block.successors());
         blocks.insert(start, block);
     }
-    Ok(Cfg { entry, blocks, fop, ret_targets, call_flags, known })
+    Ok(Cfg { entry, blocks, fop, ret_targets, call_flags, known, guard: if guard { info.tag } else { 0 }, checks })
 }
 
 /// The flags the code at `entry` reads before writing them, following its first

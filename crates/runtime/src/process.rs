@@ -343,6 +343,9 @@ pub struct Process {
     /// SetDllDirectory's folder: LoadLibrary looks there after the game's folder
     /// (gm82core points it at the extensions' DLLs it extracted).
     pub dll_dir: Option<String>,
+    /// Ranges of the images the game made writable (VirtualProtect): their code may
+    /// change after it is translated (`recomp::cfg::FuncInfo::volatile`).
+    pub code_written: Vec<(u32, u32)>,
     /// System DLLs the host was asked for and does not have (lowercase).
     pub system_dll_missing: std::collections::HashSet<String>,
     /// Text drawn on GameMaker 8's dialog forms (hle::user32 `answer_dialog`), by window.
@@ -522,6 +525,7 @@ impl Process {
             gdiplus: Default::default(),
             dll_dir: None,
             system_dll_missing: Default::default(),
+            code_written: Vec::new(),
             dialog_text: Default::default(),
             dialog: (0, 0, false),
             exit_code: None,

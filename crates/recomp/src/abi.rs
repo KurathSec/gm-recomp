@@ -229,6 +229,11 @@ pub mod trap {
     pub const FPU_EXCEPTION: i32 = 8;
     /// Debugging: execution reached the entry of a probed function (`arg` = address).
     pub const PROBE: i32 = 9;
+    /// Code that could change (in a writable section, outside the images, or made
+    /// writable) changed since it was translated: `arg` is the block's address, the
+    /// kind's bits above the low byte the batch (`FuncInfo::tag`) it was translated in.
+    /// The code then jumps to `arg` through the dispatcher, which translates it anew.
+    pub const STALE: i32 = 10;
 }
 
 /// Type indices inside every generated module.

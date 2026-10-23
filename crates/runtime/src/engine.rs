@@ -42,6 +42,9 @@ pub struct ModInfo {
     pub functions: HashSet<u32>,
     /// The same, in address order.
     pub sorted: Vec<u32>,
+    /// Sections that are writable and executable (a packer's: UPX0/UPX1): their code
+    /// may change after it is translated (`FuncInfo::volatile`).
+    pub volatile: Vec<(u32, u32)>,
     /// As discovery returns them (only looked up).
     pub jump_tables: std::collections::HashMap<u32, Vec<u32>>,
     /// FNV-1a of the executable sections' bytes: the same for every game built with
@@ -169,6 +172,14 @@ pub struct Engine {
     pub idle_us: u64,
     /// Callees considered for inlining, kept from one translation to the next.
     pub inline_cache: Option<recomp::fasthash::HashMap<(u32, u8), Option<std::rc::Rc<recomp::cfg::Cfg>>>>,
+    /// The last batch tag given out (`FuncInfo::tag`), and for batches of volatile code
+    /// the functions they translated, so a stale check can drop them (`drop_stale`).
+    pub batch_tag: u32,
+    pub tag_entries: HashMap<u32, Vec<u32>>,
+    pub tag_of: HashMap<u32, u32>,
+    /// Stale checks that fired; `Process::code_written` ranges already handled.
+    pub stale_hits: u64,
+    pub code_written_seen: usize,
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
     /// a session can be replayed (`harness run --replay`).
     pub monitor: bool,
@@ -224,6 +235,11 @@ impl Engine {
             api_calls: 0,
             api_hist: None,
             inline_cache: None,
+            batch_tag: 0,
+            tag_entries: HashMap::default(),
+            tag_of: HashMap::default(),
+            stale_hits: 0,
+            code_written_seen: 0,
             monitor: false,
         }
     }
@@ -888,6 +904,10 @@ pub fn stack_pointer<M: Machine + ?Sized>(m: &mut M) -> u32 {
 
 pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
     let ip = m.global(Global::Eip);
+    if kind & 0xFF == trap::STALE {
+        drop_stale(m, (kind as u32) >> 8, arg);
+        return;
+    }
     match kind {
         trap::INT3 => m.print(&format!("int3 at {arg:#x} (ignored)")),
         trap::PROBE => {
@@ -906,7 +926,16 @@ pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
             ));
         }
         trap::DIVIDE_ERROR => request(m, Ctl::Fault { code: 0xC000_0094, ip: arg }),
-        trap::UD2 => request(m, Ctl::Fault { code: 0xC000_001D, ip: arg }),
+        trap::UD2 => {
+            // GMR_UD2_DEBUG: what memory holds there now (code changed since it was
+            // translated decodes differently)
+            if std::env::var_os("GMR_UD2_DEBUG").is_some() {
+                let bytes: Vec<String> = (0..16).map(|i| format!("{:02x}", m.read_u8(arg + i).unwrap_or(0))).collect();
+                let below = m.engine_ref().funcs.keys().filter(|&&a| a <= arg).max().copied().unwrap_or(0);
+                m.print(&format!("ud2 at {arg:#x}: memory now {} (nearest translated entry below {below:#x})", bytes.join(" ")));
+            }
+            request(m, Ctl::Fault { code: 0xC000_001D, ip: arg })
+        }
         trap::INT => stop(m, format!("int {arg:#x} at {ip:#x}")),
         trap::HLT => stop(m, format!("hlt at {arg:#x}")),
         trap::NO_TARGET => stop(m, format!("branch to an unresolvable target at {arg:#x}")),
@@ -1009,8 +1038,12 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
         let mut functions = HashSet::default();
         let mut jump_tables = HashMap::default();
         let mut code_id = 0x811c_9dc5u32;
+        let mut volatile = Vec::new();
         match pe::Pe::parse(&file) {
             Ok(pe) => {
+                for sec in pe.sections.iter().filter(|s| s.is_executable() && s.is_writable()) {
+                    volatile.push((base + sec.virtual_address, base + sec.virtual_address + sec.virtual_size.max(sec.raw_size)));
+                }
                 for sec in pe.sections.iter().filter(|s| s.is_executable()) {
                     let (a, n) = (sec.raw_offset as usize, sec.raw_size as usize);
                     for &b in file.get(a..a.saturating_add(n).min(file.len())).unwrap_or(&[]) {
@@ -1052,7 +1085,7 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
         };
         let e = m.engine();
         e.x64 |= x64;
-        e.mods.push(ModInfo { name, base, size, functions, sorted, jump_tables, code_id, x87, x64, base_high });
+        e.mods.push(ModInfo { name, base, size, functions, sorted, volatile, jump_tables, code_id, x87, x64, base_high });
     }
 }
 
@@ -1082,7 +1115,24 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
     let mods = std::mem::take(&mut m.engine().mods);
     let mut failed = Vec::new();
     let mut errors = Vec::new();
+    note_code_written(m);
     let cache = m.engine().inline_cache.take().unwrap_or_default();
+    let tag = {
+        let e = m.engine();
+        e.batch_tag = e.batch_tag % 0x7F_FFFF + 1;
+        e.batch_tag
+    };
+    // code that may change after it is translated: a writable code section, code the
+    // runtime allocated (outside the images), or a range the game made writable
+    let written: Vec<(u32, u32)> = m.engine_ref().p.as_ref().map(|p| p.code_written.clone()).unwrap_or_default();
+    let volatile = |a: u32| {
+        written.iter().any(|&(s, e)| a >= s && a < e)
+            || match mods.iter().find(|md| a >= md.base && a < md.base + md.size) {
+                Some(md) => md.volatile.iter().any(|&(s, e)| a >= s && a < e),
+                None => true,
+            }
+    };
+    let mut volatile_batch = false;
     let out = {
         let mem = CodeMem(&*m);
         let probes = m.engine_ref().probes.clone();
@@ -1102,7 +1152,8 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
             let is_fn = |a: u32| funcs.contains_key(&a) || md.map(|md| md.functions.contains(&a)).unwrap_or(false);
             // (code outside the images, which the runtime allocated, lies below 4 GB)
             let high = md.map_or(0, |md| md.base_high);
-            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high };
+            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high, volatile: &volatile, tag };
+            volatile_batch |= volatile(entry);
             if let Err(e) = tr.add_function(entry, &info) {
                 errors.push(format!("translate {entry:#x}: {e}"));
                 failed.push(entry);
@@ -1125,14 +1176,15 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
             }
             let Some(md) = mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
             let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high };
+            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high, volatile: &volatile, tag };
             if tr.add_function(a, &info).is_ok() {
                 queue.extend(tr.direct_targets(a));
             }
         }
         // then neighbours, unless ahead translation runs (the host waits for real
         // time): it gets to them, and the call that is waiting does not pay for them
-        let neighbours = m.engine_ref().idle_calls == 0;
+        // (GMR_NO_NEIGHBOURS: only the entries and their callees, for debugging)
+        let neighbours = m.engine_ref().idle_calls == 0 && std::env::var_os("GMR_NO_NEIGHBOURS").is_none();
         if let Some(md) = entries.first().and_then(|&e| mods.iter().find(|md| e >= md.base && e < md.base + md.size)).filter(|_| tr.len() < fill && neighbours) {
             let at = md.sorted.partition_point(|&a| a < entries[0]);
             let after = md.sorted[at..].iter();
@@ -1146,7 +1198,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
                     continue;
                 }
                 let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high };
+                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high, volatile: &volatile, tag };
                 let _ = tr.add_function(a, &info);
             }
         }
@@ -1190,6 +1242,13 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
     let e = m.engine();
     for ((entry, _), idx) in out.functions.iter().zip(indices) {
         e.funcs.insert(*entry, idx);
+    }
+    if volatile_batch {
+        let list: Vec<u32> = out.functions.iter().map(|(a, _)| *a).collect();
+        for &a in &list {
+            e.tag_of.insert(a, tag);
+        }
+        e.tag_entries.insert(tag, list);
     }
     e.last_batch = hashes;
     e.translated += out.functions.len();
@@ -1577,6 +1636,65 @@ fn stack_continuations<M: Machine>(m: &mut M, addr: u32, max: usize) -> Vec<u32>
         }
     }
     out
+}
+
+/// A stale check fired at `at` in code of batch `tag` (`abi::trap::STALE`): the batch's
+/// functions that are still the current translations are forgotten (and their resolve
+/// cache entries, and the inlining cache), so the jump to `at` that follows, and later
+/// calls, translate what is in memory now.
+fn drop_stale<M: Machine>(m: &mut M, tag: u32, at: u32) {
+    let e = m.engine();
+    e.stale_hits += 1;
+    let first = e.stale_hits <= 20;
+    let list = e.tag_entries.remove(&tag).unwrap_or_default();
+    let mut dropped = Vec::new();
+    for a in list {
+        if e.tag_of.get(&a) == Some(&tag) {
+            e.tag_of.remove(&a);
+            e.funcs.remove(&a);
+            dropped.push(a);
+        }
+    }
+    e.inline_cache = None;
+    for &a in &dropped {
+        uncache_resolved(m, a);
+    }
+    if first {
+        m.print(&format!("code at {at:#x} changed since it was translated: {} functions dropped", dropped.len()));
+    }
+}
+
+/// Ranges of the images the game made writable since the last look: the functions
+/// translated there are forgotten (they may have been translated from bytes that are
+/// about to change); later translations there check their blocks.
+fn note_code_written<M: Machine>(m: &mut M) {
+    let ranges: Vec<(u32, u32)> = {
+        let e = m.engine_ref();
+        let Some(p) = e.p.as_ref() else { return };
+        p.code_written.get(e.code_written_seen..).unwrap_or(&[]).to_vec()
+    };
+    if ranges.is_empty() {
+        return;
+    }
+    let e = m.engine();
+    e.code_written_seen += ranges.len();
+    let dropped: Vec<u32> = e.funcs.keys().copied().filter(|&a| ranges.iter().any(|&(s, end)| a >= s && a < end)).collect();
+    for a in &dropped {
+        e.funcs.remove(a);
+        e.tag_of.remove(a);
+    }
+    e.inline_cache = None;
+    for &a in &dropped {
+        uncache_resolved(m, a);
+    }
+}
+
+/// Forgets a resolve cache entry (the function at `addr` is translated anew).
+fn uncache_resolved<M: Machine>(m: &mut M, addr: u32) {
+    let slot = abi::RESOLVE_CACHE + abi::resolve_slot(addr);
+    if m.read_u32(slot).ok() == Some(addr) {
+        let _ = m.write(slot, &[0u8; 8]);
+    }
 }
 
 /// Enters a translated function in the resolve cache that translated code probes

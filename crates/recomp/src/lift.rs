@@ -98,6 +98,9 @@ enum Label {
     Loop(u32),
     /// The dispatcher loop (`L_BLK` selects the block).
     Dispatch,
+    /// Around the function's blocks when they check their bytes (`Cfg::guard`): a
+    /// branch out with the block's address in `L_T1` leaves through the stale exit.
+    Stale,
 }
 
 pub struct FuncEmit<'a> {
@@ -1184,6 +1187,11 @@ impl<'a> FuncEmit<'a> {
         // jumps back to an earlier block other than a loop's header.
         let items = std::mem::take(&mut self.items);
         let m = items.len() as u32;
+        let guarded = self.cfg.guard != 0;
+        if guarded {
+            self.i(W::Block(BlockType::Empty));
+            self.labels.push(Label::Stale);
+        }
         self.i(W::Block(BlockType::Empty));
         self.i(W::Loop(BlockType::Empty));
         self.labels.push(Label::Dispatch);
@@ -1206,6 +1214,12 @@ impl<'a> FuncEmit<'a> {
         self.labels.pop();
         self.i(W::End); // fail
         self.i(W::Unreachable);
+        if guarded {
+            self.i(W::End);
+            self.labels.pop();
+            self.pending = None;
+            self.stale_exit();
+        }
         self.i(W::End);
     }
 
@@ -1243,7 +1257,50 @@ impl<'a> FuncEmit<'a> {
         }
     }
 
+    /// Volatile code (`Cfg::guard`): when the block's first bytes are no longer the ones
+    /// it was translated from (a protector decrypted it, a packer wrote it), the runtime
+    /// drops this batch's translations and the block is jumped to through the
+    /// dispatcher, which translates what is there now. Blocks start with the registers
+    /// in their locals, as a jump leaves them.
+    fn stale_check(&mut self, at: u32, len: u8, expected: u32) {
+        let mem = MemArg { offset: 0, align: 0, memory_index: 0 };
+        self.c(at);
+        self.i(match len {
+            1 => W::I32Load8U(mem),
+            2 => W::I32Load16U(mem),
+            _ => W::I32Load(mem),
+        });
+        self.c(expected);
+        self.i(W::I32Ne);
+        self.i(W::If(BlockType::Empty));
+        self.c(at);
+        self.set(L_T1);
+        // (past the `if`, and the unlabelled $fail block between $stale and the dispatcher)
+        let out = self.labels.iter().rev().position(|l| matches!(l, Label::Stale)).expect("stale label");
+        self.i(W::Br(out as u32 + 1 + self.depth + 1));
+        self.i(W::End);
+    }
+
+    /// The stale exit (`stale_check`): the runtime drops the batch, then a jump to the
+    /// block's address (`L_T1`) through the dispatcher.
+    fn stale_exit(&mut self) {
+        self.spill_all();
+        self.get(L_T1);
+        self.i(W::GlobalSet(Global::Eip as u32));
+        self.i(W::I32Const(trap::STALE | (self.cfg.guard << 8) as i32));
+        self.get(L_T1);
+        self.call_rt(RtFunc::Trap);
+        self.return_if_ctl(false);
+        self.reload_all();
+        self.tail_dynamic();
+    }
+
     fn emit_block(&mut self, block: &Block) {
+        if self.cfg.guard != 0 {
+            if let Some(&(at, len, expected)) = self.cfg.checks.get(&block.start) {
+                self.stale_check(at, len, expected);
+            }
+        }
         let live_out = self.live_out[&block.start];
         // Flags each instruction must leave available for later readers.
         let mut needs = vec![0u8; block.instrs.len()];

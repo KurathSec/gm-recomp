@@ -605,6 +605,11 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "VirtualProtect", |c| {
         let (addr, size, protect, old) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        // an image's code made writable (a packed DLL unpacking itself): it may change
+        // after it is translated (PAGE_READWRITE, WRITECOPY, EXECUTE_READWRITE, EXECUTE_WRITECOPY)
+        if matches!(protect, 0x04 | 0x08 | 0x40 | 0x80) && c.p.modules.iter().any(|m| addr >= m.base && addr < m.base + m.size) && !c.p.code_written.contains(&(addr, addr + size)) {
+            c.p.code_written.push((addr, addr + size));
+        }
         match c.p.vm.protect(addr, size, protect) {
             Some(o) => {
                 write_out(c, old, o);

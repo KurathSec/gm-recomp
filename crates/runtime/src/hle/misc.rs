@@ -513,7 +513,56 @@ fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
 }
 
 /// APIs only newer runners import (GameMaker Studio 2's 64-bit ones), on demand.
+/// PathCchCombine's result: `more` joined to `path` (a fully qualified `more` stands alone,
+/// a rooted one keeps `path`'s drive), then `.` and `..` resolved.
+fn path_combine(path: &str, more: &str) -> String {
+    let more_rooted = more.starts_with('\\');
+    let joined = if more.len() >= 2 && more.as_bytes()[1] == b':' || more.starts_with("\\\\") {
+        more.to_owned()
+    } else if more_rooted {
+        let drive = if path.len() >= 2 && path.as_bytes()[1] == b':' { &path[..2] } else { "" };
+        format!("{drive}{more}")
+    } else if path.is_empty() || more.is_empty() {
+        format!("{path}{more}")
+    } else {
+        format!("{}\\{more}", path.trim_end_matches('\\'))
+    };
+    let (prefix, rest) = match joined.find('\\') {
+        Some(i) if joined[..i].ends_with(':') => (&joined[..=i], &joined[i + 1..]),
+        _ if joined.starts_with('\\') => ("\\", &joined[1..]),
+        _ => ("", joined.as_str()),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for p in rest.split('\\') {
+        match p {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(p),
+        }
+    }
+    format!("{prefix}{}", parts.join("\\"))
+}
+
 fn register_newer(r: &mut Registry) {
+    // PathCchCombine(pszPathOut, cchPathOut, pszPathIn, pszMore) (GameMaker Studio 2's
+    // runners, through the api-ms-win-core-path set)
+    r.add_on_demand("api-ms-win-core-path-l1-1-0.dll", "PathCchCombine", |c| {
+        let (out, cap, a, b) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        if out == 0 || (a == 0 && b == 0) {
+            return ok(4, 0x8007_0057); // E_INVALIDARG
+        }
+        let path = if a != 0 { c.wstr_arg(2) } else { String::new() };
+        let more = if b != 0 { c.wstr_arg(3) } else { String::new() };
+        let s = path_combine(&path, &more);
+        if s.encode_utf16().count() + 1 > cap as usize {
+            let _ = c.host.write_u16(out, 0);
+            return ok(4, 0x8007_007A); // STRSAFE_E_INSUFFICIENT_BUFFER
+        }
+        let _ = c.host.write_wstr(out, &s);
+        ok(4, 0)
+    });
     // ETW and process settings newer runtimes set up: accepted
     // (EventSetInformation's RegHandle is 64-bit: two slots)
     r.add_on_demand("advapi32.dll", "EventSetInformation", |_c| ok(5, 0));
@@ -2202,4 +2251,20 @@ pub fn register(r: &mut Registry) {
         "AssocQueryStringA" => (6, E_FAIL),
         "SHAutoComplete" => (2, E_FAIL),
     });
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::path_combine;
+
+    #[test]
+    fn combines_as_pathcch() {
+        assert_eq!(path_combine("C:\\game", "data\\a.txt"), "C:\\game\\data\\a.txt");
+        assert_eq!(path_combine("C:\\game\\", "a.txt"), "C:\\game\\a.txt");
+        assert_eq!(path_combine("C:\\game\\sub", "..\\a.txt"), "C:\\game\\a.txt");
+        assert_eq!(path_combine("C:\\game", ".\\a.txt"), "C:\\game\\a.txt");
+        assert_eq!(path_combine("C:\\game", "D:\\x\\y"), "D:\\x\\y");
+        assert_eq!(path_combine("C:\\game\\sub", "\\root.txt"), "C:\\root.txt");
+        assert_eq!(path_combine("C:\\game", ""), "C:\\game");
+    }
 }
