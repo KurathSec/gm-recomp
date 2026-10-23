@@ -688,6 +688,66 @@ pub fn register(r: &mut Registry) {
         let r = alertable_wait(c, c.arg(4) != 0, |c| wait(c, handles, all, ms))?;
         ok(5, r)
     });
+    // I/O completion ports, for packets the program posts itself (no I/O completes here:
+    // files are read at once and sockets have no overlapped I/O). A get with none
+    // waiting fails with WAIT_TIMEOUT, as a timeout does; a secondary thread sleeps a
+    // little first, as Boost.Asio's thread asks again at once.
+    r.add_on_demand(k, "CreateIoCompletionPort", |c| {
+        let (file, port) = (c.arg(0), c.arg(1));
+        if port != 0 {
+            return ok(4, if c.p.ports.contains_key(&port) { port } else { 0 });
+        }
+        let _ = file;
+        let h = c.p.new_handle(Handle::Event { manual: true, signaled: false });
+        c.p.ports.insert(h, Default::default());
+        ok(4, h)
+    });
+    r.add_on_demand(k, "PostQueuedCompletionStatus", |c| {
+        let (port, bytes, key, ov) = (c.arg(0), c.arg(1), c.arg64(2), c.arg64(3));
+        let Some(q) = c.p.ports.get_mut(&port) else { return ok(4, 0) };
+        q.push_back((bytes, key, ov));
+        if let Some(Handle::Event { signaled, .. }) = c.p.handles.get_mut(&port) {
+            *signaled = true;
+        }
+        ok(4, 1)
+    });
+    r.add_on_demand(k, "GetQueuedCompletionStatus", |c| {
+        let (port, p_bytes, p_key, p_ov, ms) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4));
+        let take = |c: &mut Ctx| -> bool {
+            let Some(q) = c.p.ports.get_mut(&port) else { return false };
+            let Some((bytes, key, ov)) = q.pop_front() else { return false };
+            let empty = q.is_empty();
+            if empty && let Some(Handle::Event { signaled, .. }) = c.p.handles.get_mut(&port) {
+                *signaled = false;
+            }
+            let _ = c.host.write_u32(p_bytes, bytes);
+            for (at, v) in [(p_key, key), (p_ov, ov)] {
+                let _ = if c.x64() { c.host.write_u64(at, v) } else { c.host.write_u32(at, v as u32) };
+            }
+            true
+        };
+        if !c.p.ports.contains_key(&port) {
+            c.set_last_error(6); // ERROR_INVALID_HANDLE
+            return ok(5, 0);
+        }
+        if take(c) {
+            return ok(5, 1);
+        }
+        let _ = c.host.write_u32(p_bytes, 0);
+        c.write_ptr(p_key, 0);
+        c.write_ptr(p_ov, 0);
+        if ms != 0 {
+            if c.p.current == 0 {
+                if wait(c, vec![port], false, ms) == WAIT_OBJECT_0 && take(c) {
+                    return ok(5, 1);
+                }
+            } else {
+                sleep(c, ms.min(100));
+            }
+        }
+        c.set_last_error(WAIT_TIMEOUT);
+        ok(5, 0)
+    });
     // An APC for a thread: it runs at the thread's next alertable wait.
     r.add_on_demand(k, "QueueUserAPC", |c| {
         let (f, h, data) = (c.arg(0), c.arg(1), c.arg64(2));

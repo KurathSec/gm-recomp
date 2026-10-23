@@ -344,6 +344,9 @@ pub struct Process {
     pub slice_polls: u32,
     /// Winsock sockets and the names behind their stand-in addresses
     pub sockets: crate::hle::winsock::Sockets,
+    /// I/O completion ports (their handles are manual-reset events, set while packets
+    /// wait): queued (bytes, key, OVERLAPPED*).
+    pub ports: HashMap<u32, std::collections::VecDeque<(u32, u64, u64)>>,
     /// http_dll_2_3.dll's buffers and sockets (hle::httpdll)
     pub httpdll: crate::hle::httpdll::State,
     pub gdiplus: crate::hle::gdiplus::State,
@@ -529,6 +532,7 @@ impl Process {
             idle_streak: 0,
             slice_polls: 0,
             sockets: Default::default(),
+            ports: HashMap::default(),
             httpdll: Default::default(),
             gdiplus: Default::default(),
             dll_dir: None,
