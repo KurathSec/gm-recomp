@@ -1469,7 +1469,7 @@ pub const CORE_DLLS: &[&str] = &["kernel32", "kernelbase", "user32", "gdi32", "n
 pub const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "d3d11", "dxgi", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
 /// DLLs emulated only when the game has no file for them (the importers do not count
 /// them as emulated, so a game that imports one statically still gets the real DLL).
-const FALLBACK_DLLS: &[&str] = &["msacm32"];
+const FALLBACK_DLLS: &[&str] = &["msacm32", "iphlpapi", "mswsock"];
 
 fn dll_stem(name: &str) -> String {
     let lower = name.to_lowercase();
