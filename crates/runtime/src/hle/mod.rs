@@ -21,6 +21,7 @@ pub mod threads;
 pub mod mci;
 pub mod midi;
 pub mod misc;
+pub mod shlwapi;
 pub mod msvcrt;
 pub mod nls;
 pub mod pads;
@@ -524,6 +525,7 @@ impl Registry {
         user32::register(&mut r);
         gdi32::register(&mut r);
         misc::register(&mut r);
+        shlwapi::register(&mut r);
         winsock::register(&mut r);
         httpdll::register(&mut r);
         d3d8::register(&mut r);
