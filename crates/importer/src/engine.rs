@@ -32,8 +32,14 @@ fn u32_at(d: &[u8], off: usize) -> Option<u32> {
     d.get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
+/// A GM8.0 game's data header where its runner looks for it: at 1,980,000 or every
+/// 10,000 bytes from 2,000,000 on (the runner builds differ in size).
+pub fn gm80_header(exe: &[u8]) -> Option<usize> {
+    std::iter::once(1_980_000).chain((2_000_000..exe.len()).step_by(10_000)).find(|&p| u32_at(exe, p) == Some(GM8_MAGIC) && u32_at(exe, p + 4) == Some(800))
+}
+
 pub fn detect(exe: &[u8], game_dir: &Path) -> Engine {
-    if u32_at(exe, 2_000_000) == Some(GM8_MAGIC) && u32_at(exe, 2_000_004) == Some(800) {
+    if gm80_header(exe).is_some() {
         return Engine::Gm80;
     }
     let (off, sig) = GM81_SIGNATURE;

@@ -237,6 +237,7 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
     let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None };
     game.iexpress = unwrap_iexpress(&mut game.files)?;
+    game.reroot();
     game.files.sort_by(|a, b| a.0.cmp(&b.0));
     let (entry, _) = game.entry();
     if game.find(&entry).is_some_and(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")) {
@@ -399,7 +400,37 @@ pub fn dx8_build(exes: &[&str]) -> Option<String> {
     }).map(|a| a.to_string())
 }
 
+/// An exe that may be the game (not an uninstaller or a runtime's installer).
+fn game_exe(path: &str) -> bool {
+    let l = path.to_lowercase();
+    let file = l.rsplit('/').next().unwrap_or(&l);
+    l.ends_with(".exe") && !["unins", "vcredist", "vc_redist", "dxsetup", "dxwebsetup", "oalinst", "dotnet", "directx"].iter().any(|p| file.starts_with(p))
+}
+
 impl Game {
+    /// A game whose exe is not at the top (a folder in the shared folder, a readme beside
+    /// the game's folder): the folder of the exe to run becomes the top, and what lies
+    /// outside it is left out. The exe is one GameMaker made if any, else the shallowest,
+    /// then the largest.
+    fn reroot(&mut self) {
+        if self.iexpress.is_some() || self.files.iter().any(|(p, _)| !p.contains('/') && game_exe(p)) {
+            return;
+        }
+        let best = self
+            .files
+            .iter()
+            .filter(|(p, _)| game_exe(p))
+            .max_by_key(|(p, d)| (self.engine(p)["kind"] != "unknown", std::cmp::Reverse(p.matches('/').count()), d.len()))
+            .map(|(p, _)| p.clone());
+        let Some((dir, _)) = best.as_deref().and_then(|b| b.rsplit_once('/')) else { return };
+        let prefix = format!("{dir}/");
+        let files = std::mem::take(&mut self.files);
+        self.files = files.into_iter().filter_map(|(p, d)| p.strip_prefix(&prefix).map(|q| (q.to_owned(), d))).collect();
+        if let Some(name) = dir.rsplit('/').next() {
+            self.title = name.to_owned();
+        }
+    }
+
     fn find(&self, name: &str) -> Option<&(String, Vec<u8>)> {
         self.files.iter().find(|(p, _)| p.eq_ignore_ascii_case(name))
     }
@@ -410,7 +441,7 @@ impl Game {
         let top: Vec<&(String, Vec<u8>)> = self
             .files
             .iter()
-            .filter(|(p, _)| !p.contains('/') && p.to_lowercase().ends_with(".exe") && !p.to_lowercase().starts_with("unins"))
+            .filter(|(p, _)| !p.contains('/') && game_exe(p))
             .collect();
         let candidates = top.iter().map(|(p, _)| p.clone()).collect();
         if let Some((_, run, _)) = &self.iexpress {
@@ -428,7 +459,10 @@ impl Game {
     /// The runner, as the native importer's `engine::detect` reports it.
     pub fn engine(&self, entry: &str) -> Value {
         let Some((_, exe)) = self.find(entry) else { return json!({ "kind": "unknown" }) };
-        if u32_at(exe, 2_000_000) == Some(1_234_321) && u32_at(exe, 2_000_004) == Some(800) {
+        // (GM8.0: the data header where the runner looks, at 1,980,000 or every 10,000
+        // bytes from 2,000,000 on: runner builds differ in size)
+        let gm80 = std::iter::once(1_980_000).chain((2_000_000..exe.len()).step_by(10_000)).any(|p| u32_at(exe, p) == Some(1_234_321) && u32_at(exe, p + 4) == Some(800));
+        if gm80 {
             return json!({ "kind": "gm80" });
         }
         const GM81: (usize, [u8; 8]) = (0x226CF3, [0xE8, 0x80, 0xF2, 0xDD, 0xFF, 0xC7, 0x45, 0xF0]);
