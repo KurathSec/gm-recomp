@@ -244,6 +244,13 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                 term = Term::Bad(ip);
                 break;
             }
+            // Volatile code may rewrite a branch's displacement just before it (Petite
+            // decrypts the jump to the original entry point in the block that takes it):
+            // each direct branch starts a block, so the block's check covers it.
+            if guard && !instrs.is_empty() && is_near(&instr) && matches!(instr.flow_control(), FlowControl::Call | FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch) {
+                term = Term::Fall(ip);
+                break;
+            }
             total += 1;
             if is_x87(instr.mnemonic()) && instr.mnemonic() != Mnemonic::Femms {
                 // skip legacy prefixes to find the D8..DF escape byte
@@ -380,13 +387,17 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
         }
         let block = Block { start, instrs, term };
         if guard && let Some(first) = block.instrs.first() {
-            // the bytes the block was decoded from, as far as its first instruction goes
-            let at = first.ip() as u32;
+            // the bytes the block was decoded from, as far as its first instruction goes;
+            // for a direct branch, its displacement (an immediate is read as the code runs)
+            let mut at = first.ip() as u32;
             let len: u8 = match first.len() {
                 1 => 1,
                 2 | 3 => 2,
                 _ => 4,
             };
+            if is_near(first) && first.len() > 4 {
+                at += first.len() as u32 - 4;
+            }
             let mut b = [0u8; 4];
             if mem.read(at, &mut b[..len as usize]) {
                 checks.insert(start, (at, len, u32::from_le_bytes(b)));

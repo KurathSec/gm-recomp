@@ -1282,7 +1282,7 @@ impl<'a> FuncEmit<'a> {
     /// drops this batch's translations and the block is jumped to through the
     /// dispatcher, which translates what is there now. Blocks start with the registers
     /// in their locals, as a jump leaves them.
-    fn stale_check(&mut self, at: u32, len: u8, expected: u32) {
+    fn stale_check(&mut self, start: u32, at: u32, len: u8, expected: u32) {
         let mem = MemArg { offset: 0, align: 0, memory_index: 0 };
         self.c(at);
         self.i(match len {
@@ -1293,7 +1293,7 @@ impl<'a> FuncEmit<'a> {
         self.c(expected);
         self.i(W::I32Ne);
         self.i(W::If(BlockType::Empty));
-        self.c(at);
+        self.c(start);
         self.set(L_T1);
         // (past the `if`, and the unlabelled $fail block between $stale and the dispatcher)
         let out = self.labels.iter().rev().position(|l| matches!(l, Label::Stale)).expect("stale label");
@@ -1318,7 +1318,9 @@ impl<'a> FuncEmit<'a> {
     fn emit_block(&mut self, block: &Block) {
         if self.cfg.guard != 0 {
             if let Some(&(at, len, expected)) = self.cfg.checks.get(&block.start) {
-                self.stale_check(at, len, expected);
+                // (an inlined callee's block is keyed apart from its address)
+                let start = block.instrs.first().map_or(at, |i| i.ip() as u32);
+                self.stale_check(start, at, len, expected);
             }
         }
         let live_out = self.live_out[&block.start];
