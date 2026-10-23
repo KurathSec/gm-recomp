@@ -16,6 +16,8 @@ pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WM_SETFOCUS: u32 = 0x0007;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_CLOSE: u32 = 0x0010;
+const WM_COMMAND: u32 = 0x0111;
+const WM_CHAR: u32 = 0x0102;
 pub const WM_QUIT: u32 = 0x0012;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
@@ -230,6 +232,9 @@ pub fn register(r: &mut Registry) {
         ok(5, if c.p.messages.is_empty() { c.advance_clock(1000); 0x102 } else { c.arg(0) })
     });
     r.add(u, "WaitMessage", |c| {
+        if answer_dialog(c) {
+            return ok(0, 1);
+        }
         c.advance_clock(1000);
         pump_timers(c);
         ok(0, 1)
@@ -1934,12 +1939,119 @@ fn draw_text(c: &mut Ctx, wide: bool, ex: bool) -> ApiResult {
             _ => 16,
         }
     };
+    // the text of a GameMaker 8 dialog (a label drawn on the form): for `answer_dialog`
+    let hwnd = match c.p.handles.get(&hdc) {
+        Some(Handle::Gdi(crate::process::GdiObject::Dc { hwnd, .. })) => *hwnd,
+        _ => 0,
+    };
+    // (painted: not a measurement, which the label also makes of its caption before it shows)
+    if flags & 0x400 == 0 && c.p.windows.get(&hwnd).is_some_and(|w| w.class == DIALOG_FORM && w.visible) && n > 0 {
+        let text = if wide {
+            let mut b = vec![0u8; n * 2];
+            let _ = c.host.read(s, &mut b);
+            String::from_utf16_lossy(&b.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect::<Vec<_>>())
+        } else {
+            let mut b = vec![0u8; n];
+            let _ = c.host.read(s, &mut b);
+            String::from_utf8_lossy(&b).into_owned()
+        };
+        let drawn = c.p.dialog_text.entry(hwnd).or_default();
+        if !drawn.contains(&text) && drawn.len() < 16 {
+            drawn.push(text);
+        }
+    }
     let width = (n as i32) * (h / 2).max(1);
     if flags & 0x400 != 0 && rect != 0 {
         let (l, t, _, _) = read_rect(c, rect);
         write_rect(c, rect, l, t, l + width, t + h);
     }
     ok(if ex { 6 } else { 5 }, h as u32)
+}
+
+/// GameMaker 8's dialog form: show_message, show_question, get_string, get_integer (and
+/// Delphi's MessageDlg).
+const DIALOG_FORM: &str = "TMessageForm";
+
+/// GameMaker 8's dialogs are VCL forms the browser never shows: when the game waits in such a
+/// form's modal loop (WaitMessage), the player is asked instead (`Host::prompt`), the answer
+/// goes into its edit box, and the button it stands for is clicked. True when one was
+/// answered. The form is answered once its text has been painted (right after it shows),
+/// or after a few waits without.
+fn answer_dialog(c: &mut Ctx) -> bool {
+    use super::Ask;
+    let Some(form) = c.p.windows.iter().filter(|(_, w)| w.class == DIALOG_FORM && w.visible && w.enabled).map(|(&h, _)| h).max() else {
+        return false;
+    };
+    if c.p.dialog.0 != form {
+        c.p.dialog = (form, 0, false);
+    }
+    c.p.dialog.1 += 1;
+    let (_, waits, answered) = c.p.dialog;
+    if answered {
+        // the click did not end it: close it, once, then leave it be
+        if waits == 8 {
+            post(c, form, WM_CLOSE, 0, 0);
+        }
+        return false;
+    }
+    if !c.p.dialog_text.contains_key(&form) && waits < 20 {
+        return false;
+    }
+    c.p.dialog = (form, 0, true);
+    let mut edit = None;
+    let mut buttons: Vec<(u32, String)> = Vec::new();
+    for k in c.p.windows[&form].children.clone() {
+        let Some(w) = c.p.windows.get(&k) else { continue };
+        if !w.visible {
+            continue;
+        }
+        if w.class.ends_with("Edit") {
+            edit = Some(k);
+        } else if w.class.ends_with("Button") {
+            buttons.push((k, w.title.replace('&', "")));
+        }
+    }
+    let title = c.p.windows[&form].title.clone();
+    // The buttons' captions are painted on the form too (GameMaker 8's buttons are painted
+    // controls, not windows): they tell a question from a message.
+    const CAPTIONS: [&str; 7] = ["OK", "Cancel", "Yes", "No", "Abort", "Retry", "Ignore"];
+    let (captions, lines): (Vec<String>, Vec<String>) = c.p.dialog_text.remove(&form).unwrap_or_default().into_iter().partition(|t| {
+        let t = t.replace('&', "");
+        CAPTIONS.iter().any(|b| t.eq_ignore_ascii_case(b)) || buttons.iter().any(|(_, b)| t == *b)
+    });
+    let text = lines.join("\n");
+    let choices = buttons.len().max(captions.len());
+    let default = edit.map(|e| c.p.windows[&e].title.clone()).unwrap_or_default();
+    let ask = if edit.is_some() { Ask::Text(&default) } else if choices > 1 { Ask::Question } else { Ask::Message };
+    c.p.log(format!("dialog [{title}]: {text:?} ({ask:?})"));
+    let answer = c.host.prompt(ask, &title, &text);
+    if let (Some(e), Some(a)) = (edit, &answer) {
+        if let Some(w) = c.p.windows.get_mut(&e) {
+            w.title = a.clone();
+            let n = a.encode_utf16().count() as u32;
+            w.sel = (n, n);
+        }
+    }
+    // OK / Yes, else Cancel / No: by caption, else the first or the last button
+    let yes = ["OK", "Yes", "Retry", "All"];
+    let pick = |want: &[&str], first: bool| {
+        buttons.iter().find(|(_, t)| want.iter().any(|w| t.eq_ignore_ascii_case(w))).or(if first { buttons.first() } else { buttons.last() }).map(|&(h, _)| h)
+    };
+    let button = if answer.is_some() { pick(&yes, true) } else { pick(&["Cancel", "No", "Abort", "Ignore"], false) };
+    match button {
+        // as the button's click: WM_COMMAND (BN_CLICKED) to the form, which hands it to the button
+        Some(b) => post(c, form, WM_COMMAND, 0, b),
+        // GameMaker 8's buttons are painted, not windows: Enter (OK, Yes) or Escape (Cancel,
+        // No) to the focused control, as the player would press it
+        None => {
+            let to = edit.unwrap_or(form);
+            let (vk, scan) = if answer.is_some() { (0x0D, 0x1C) } else { (0x1B, 0x01) };
+            post(c, to, WM_KEYDOWN, vk, 1 | scan << 16);
+            post(c, to, WM_CHAR, vk, 1 | scan << 16);
+            post(c, to, WM_KEYUP, vk, 1 | scan << 16 | 0xC000_0000);
+        }
+    }
+    true
 }
 
 /// A child window created on behalf of an HLE component (no window procedure).

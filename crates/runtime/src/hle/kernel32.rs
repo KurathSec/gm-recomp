@@ -1382,6 +1382,10 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
     let base_name = with_ext.rsplit(['\\', '/']).next().unwrap_or(&with_ext).to_string();
     if c.p.fs.is_file(&key) {
         if let Some(bytes) = c.p.fs.read_all(&key) {
+            // a game I wanna play online converted: its http_dll_2_3.dll is the port
+            if bytes == super::httpdll::MARKER {
+                return Ok(c.p.fake_module("http_dll_2_3"));
+            }
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
             return load_image(c, &base_name, &guest_path, bytes, true);
         }

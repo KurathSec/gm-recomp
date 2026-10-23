@@ -45,7 +45,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   without `profile`: what other games with the same modules needed (a runner's code is the same
  *   in every game built with it)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl, prompt }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -373,6 +373,21 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // read at the guest's every message poll, also while the worker blocks in a wait.
   const keyRing = inputRing && { idx: new Int32Array(inputRing, 0, 2), ev: new Int32Array(inputRing, 8, 256 * 3), when: new Float64Array(inputRing, 8 + 256 * 12, 256) };
   const host = {
+    // A dialog for the player (hle Host::prompt: GameMaker 8's message, question and text
+    // dialogs, I wanna play online's input_box): `prompt(title, text, default | null, kind)`
+    // (kind 0 a message, 1 text, 2 a yes/no question) answers synchronously (worker.mjs
+    // waits for the page), a string or null when cancelled. Without one it is cancelled.
+    prompt(tPtr, tLen, xPtr, xLen, dPtr, dLen, kind, out, cap) {
+      const str = (p, n) => dec.decode(mem().subarray(p, p + n));
+      const title = str(tPtr, tLen);
+      const text = str(xPtr, xLen);
+      const answer = prompt ? prompt(title, text, kind === 1 ? str(dPtr, dLen) : null, kind) : null;
+      if (!prompt) print(`prompt [${title}]: ${text}`);
+      if (answer == null) return -1;
+      const bytes = new TextEncoder().encode(answer);
+      mem().set(bytes.subarray(0, cap), out);
+      return bytes.length;
+    },
     input_drain() {
       if (!keyRing) return;
       const w = Atomics.load(keyRing.idx, 0);

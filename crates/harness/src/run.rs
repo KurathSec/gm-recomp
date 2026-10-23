@@ -232,6 +232,18 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn net_close(&mut self, id: u32) {
         self.cx.hd().net.close(id)
     }
+    /// Nobody to ask: OK, Yes, or the default text. GMR_PROMPT=<text> answers a text
+    /// prompt with that instead, and GMR_PROMPT=no answers a question No.
+    fn prompt(&mut self, ask: runtime::hle::Ask, title: &str, text: &str) -> Option<String> {
+        use runtime::hle::Ask;
+        eprintln!("prompt [{title}]: {text}");
+        let given = std::env::var("GMR_PROMPT").ok();
+        match ask {
+            Ask::Message => Some(String::new()),
+            Ask::Question => (given.as_deref() != Some("no")).then(String::new),
+            Ask::Text(d) => Some(given.unwrap_or_else(|| d.to_owned())),
+        }
+    }
     fn xmm(&mut self, i: u32) -> u128 {
         self.cpu.globals[G::Xmm0 as usize + i as usize].get(&mut *self.cx).v128().map(|v| v.as_u128()).unwrap_or(0)
     }

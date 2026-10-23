@@ -110,7 +110,11 @@ engine allows.
   VM games:
   - GodMode, CrimsonKid and DotKid;
   - DbgHelper: gm8x_fix's patches on GameMaker 8, the sleep margin on GameMaker: Studio;
-  - AllowFullscreen and PlayOnline, on GameMaker 8 only.
+  - AllowFullscreen, on GameMaker 8 only.
+- **Play online** (GameMaker 8): [I wanna play online 1.2.3](https://github.com/Pardocaninacting/i-wanna-play-online-1.2.3)'s
+  converter runs in the page and changes the game before it starts: the others playing the
+  same game show up, with chat and their saves. Its `http_dll_2_3.dll` is replaced by a port
+  in the runtime (`crates/runtime/src/hle/httpdll.rs`).
 
 A GameMaker: Studio data.win is changed in place where sizes allow, and grows at its
 end otherwise; `crates/gmmod/src/gms.rs` explains how. The mods' own files (sprites,
@@ -123,13 +127,26 @@ CARGO_PROFILE_RELEASE_DEBUG=0 cargo +nightly build --release --target wasm32-unk
 web/tools/mods.sh path/to/Fangame.ModLoader
 ```
 
-A browser cannot open TCP or UDP connections itself, so a game's network connections
-(Winsock) go through a WebSocket relay that you run. PlayOnline's settings name that
-relay (`ws://…`):
+The converter is built from a checkout of I wanna play online into `web/src/iwpo-gm8.mjs`
+(not in the repository):
 
 ```sh
-node web/tools/relay.mjs --port 8790 --allow iwannastartaparty.com
+npm ci --prefix web/tools/iwpo
+node web/tools/iwpo/build.mjs path/to/i-wanna-play-online-1.2.3
 ```
+
+A browser cannot open TCP or UDP connections itself, so a game's network connections go
+over WebSockets: to a server that takes them (I wanna play online's server does at `/ws`
+on its HTTP port), or through a relay you run. Play online's settings name the WebSocket
+URL (`ws://…` or `wss://…`):
+
+```sh
+node web/tools/relay.mjs --port 8790 --allow 123.iwannaplay.online
+```
+
+GameMaker 8's own dialogs (show_message, show_question, get_string, get_integer) are not
+drawn in the page: the player's browser asks instead (its alert, confirm and prompt, or
+the embedding site's `onPrompt`).
 
 ## Embedding the player
 
@@ -245,6 +262,9 @@ runtime with audio, threads, Direct3D 9, shaders and performance.
 - [gm8x_fix](https://github.com/skyfloogle/gm8x_fix) (MIT): DbgHelper's GameMaker 8
   patches are its patch table, converted.
 - Fangame.ModLoader and patcher.rs are the mods reimplemented here.
+- [I wanna play online 1.2.3](https://github.com/Pardocaninacting/i-wanna-play-online-1.2.3) (MIT):
+  its converter runs in the page as Play online, and `hle/httpdll.rs` ports its
+  http_dll_2_3 (Exports.cs).
 
 ## License
 

@@ -1365,6 +1365,7 @@ dependencies = [
  "fpu",
  "iced-x86",
  "libm",
+ "md5",
  "pe",
  "recomp",
  "rustysynth",

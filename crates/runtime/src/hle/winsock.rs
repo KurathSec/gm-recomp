@@ -73,7 +73,7 @@ pub struct Sockets {
 }
 
 impl Sockets {
-    fn net_id(&mut self) -> u32 {
+    pub(crate) fn net_id(&mut self) -> u32 {
         self.next_net += 1;
         self.next_net
     }

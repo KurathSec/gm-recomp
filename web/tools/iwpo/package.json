@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Builds the PlayOnline mod (I wanna play online's GameMaker 8 converter) for the browser: node build.mjs <checkout>",
+  "devDependencies": {
+    "buffer": "6.0.3",
+    "esbuild": "0.25.10",
+    "iconv-lite": "0.6.3",
+    "md5": "2.3.0",
+    "pako": "2.1.0",
+    "path-browserify": "1.0.1",
+    "smart-buffer": "4.2.0",
+    "string_decoder": "1.3.0"
+  }
+}

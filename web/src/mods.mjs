@@ -68,19 +68,17 @@ export const MODS = [
   },
   {
     id: 'PlayOnline',
-    name: 'PlayOnline',
-    about: 'Play online with others in the same game: you see each other, chat (Space) and see where they saved. The browser reaches the server through a WebSocket relay you run (web/tools/relay.mjs).',
+    name: 'Play online',
+    about: 'I wanna play online 1.2.3 (github.com/Pardocaninacting/i-wanna-play-online-1.2.3): see the others playing the same game, chat and see where they saved. Its converter changes the game here before it starts; the browser reaches the server over a WebSocket (one the server offers, or web/tools/relay.mjs).',
     applies: gm8,
     options: [
-      { key: 'RelayUrl', label: 'Relay (WebSocket URL)', type: 'text', default: 'ws://localhost:8790/' },
-      { key: 'ServerIp', label: 'Server', type: 'text', default: 'iwannastartaparty.com' },
+      { key: 'Server', label: 'Server', type: 'text', default: '123.iwannaplay.online' },
       { key: 'TcpPort', label: 'TCP port', type: 'number', default: 8002 },
       { key: 'UdpPort', label: 'UDP port', type: 'number', default: 8003 },
-      { key: 'PlayerName', label: 'Your name', type: 'text', default: 'Player' },
-      { key: 'Password', label: 'Password (players with the same one see each other)', type: 'text', default: '' },
-      { key: 'RaceMode', label: 'Race mode (others’ saves are not shown)', type: 'bool', default: false },
+      { key: 'RelayUrl', label: 'WebSocket URL', type: 'text', default: 'ws://localhost:8790/' },
+      { key: 'Language', label: 'Menu language (en, zh-CN)', type: 'text', default: 'en' },
     ],
-    files: ["GML/Config/po_config.gml", "GML/GM8/po_asset_get_index.gml", "GML/GM8/po_load_assets.gml", "GML/GM8/po_sound_play.gml", "GML/po_chatbox_create.gml", "GML/po_chatbox_draw.gml", "GML/po_chatbox_endstep.gml", "GML/po_find_player.gml", "GML/po_get_player_grav.gml", "GML/po_get_player_xscale.gml", "GML/po_get_player_yscale.gml", "GML/po_onlineplayer_create.gml", "GML/po_onlineplayer_draw.gml", "GML/po_onlineplayer_endstep.gml", "GML/po_playersaved_draw.gml", "GML/po_playersaved_endstep.gml", "GML/po_set_player_grav.gml", "GML/po_someonesave_load.gml", "GML/po_someonesave_send.gml", "GML/po_temp_socketstate_load.gml", "GML/po_temp_socketstate_save.gml", "GML/po_temp_someonesave_load.gml", "GML/po_temp_someonesave_save.gml", "GML/po_world_create.gml", "GML/po_world_endstep.gml", "GML/po_world_gameend.gml", "po_http_dll_2_3.dll", "po_http_dll_2_3.gml", "po_snd_chatbox.wav", "po_snd_saved.wav"],
+    files: [],
   },
   {
     id: 'GodMode',
@@ -135,7 +133,41 @@ const same = (a, b) => a.replaceAll('\\', '/').toLowerCase() === b.replaceAll('\
  * list (changed files replaced, new ones added). `print` gets the mods' log.
  */
 export async function applyMods(files, manifest, mods, print) {
-  if (!mods.length) return files;
+  const online = mods.find((m) => m.id === 'PlayOnline');
+  const patches = mods.filter((m) => m !== online);
+  let out = patches.length ? await patchFiles(files, manifest, patches, print) : files;
+  // after the others: it converts whatever exe they leave
+  if (online) out = await playOnline(out, manifest, online.config, print);
+  return out;
+}
+
+/**
+ * PlayOnline: I wanna play online's GameMaker 8 converter (iwpo-gm8.mjs, built by
+ * tools/iwpo/build.mjs) rewrites the exe and adds its files next to it. Its
+ * http_dll_2_3.dll is a marker the runtime replaces with its port of that DLL
+ * (crates/runtime hle/httpdll.rs), whose connections go to `RelayUrl`.
+ */
+async function playOnline(files, manifest, config, print) {
+  const { convertGM8, VERSION } = await import('./iwpo-gm8.mjs');
+  const at = files.findIndex(([p]) => same(p, manifest.entry));
+  if (at < 0) throw new Error('PlayOnline: the game exe is missing');
+  const cut = manifest.entry.lastIndexOf('/') + 1;
+  const dir = manifest.entry.slice(0, cut);
+  const r = await convertGM8(files[at][1], manifest.entry.slice(cut), { server: String(config.Server), tcp: Number(config.TcpPort), udp: Number(config.UdpPort), lang: config.Language || undefined });
+  const next = files.slice();
+  next[at] = [next[at][0], r.exe, next[at][2] ?? 0];
+  for (const [p, data] of r.files) {
+    const path = dir + p;
+    const i = next.findIndex(([q]) => same(q, path));
+    if (i >= 0) next[i] = [next[i][0], data, 0];
+    else next.push([path, data, 0]);
+  }
+  print(`mod PlayOnline: converted by I wanna play online ${VERSION} (server ${config.Server}:${config.TcpPort}/${config.UdpPort})`);
+  return next;
+}
+
+/** The mods crates/gmmod applies (gmmod/gmmod.wasm). */
+async function patchFiles(files, manifest, mods, print) {
   compiled ??= WebAssembly.compileStreaming(fetch(asset('gmmod/gmmod.wasm')));
   const module = await compiled;
   const imports = {};

@@ -22,7 +22,10 @@ const GAME_KEYS = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|D
  * capture, monitor, replay, slowMs, useProfile.
  * Callbacks: onLog(line), onSize(w, h) (the game's resolution), onStats(stats),
  * onCapture(frame, png), onMonitor(line), onSoundPending(waiting) (sound waits for a click
- * or key press), onSaved() (saves stored), onDone(status) (the game ended: 0, or why not).
+ * or key press), onSaved() (saves stored), onDone(status) (the game ended: 0, or why not),
+ * onPrompt({title, text, def, kind}) (a dialog the game opened, kind 'message', 'text' or
+ * 'question': resolve to the text, '' for OK or Yes, null to cancel or for No; the browser's
+ * alert/prompt/confirm without it).
  * @returns {{worker: Worker, setKeymap(map): void, soundStats(): Promise<string | null>, stop(): void}}
  */
 export function playGame(o) {
@@ -72,6 +75,32 @@ export function playGame(o) {
     audioNode.port.postMessage(0);
   });
 
+  // A dialog the game opened (worker.mjs `prompt`): o.onPrompt answers (a string, or null
+  // to cancel or for No), else the browser's own.
+  const answerPrompt = async ({ title, text, def, kind: k, sab }) => {
+    const kind = k === 2 ? 'question' : k === 1 ? 'text' : 'message';
+    const shown = title ? `${title}\n\n${text}` : text;
+    let answer = null;
+    try {
+      if (o.onPrompt) answer = await o.onPrompt({ title, text, def: kind === 'text' ? def ?? '' : null, kind });
+      else if (kind === 'question') answer = window.confirm(shown) ? '' : null;
+      else if (kind === 'text') answer = window.prompt(shown, def ?? '');
+      else {
+        window.alert(shown);
+        answer = '';
+      }
+    } catch {}
+    const st = new Int32Array(sab, 0, 2);
+    if (answer == null) Atomics.store(st, 0, 2);
+    else {
+      const bytes = new TextEncoder().encode(answer).subarray(0, 4096);
+      new Uint8Array(sab, 8).set(bytes);
+      Atomics.store(st, 1, bytes.length);
+      Atomics.store(st, 0, 1);
+    }
+    Atomics.notify(st, 0);
+  };
+
   const w = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
   w.onmessage = ({ data }) => {
     if (data.type === 'log') o.onLog?.(data.line);
@@ -86,6 +115,7 @@ export function playGame(o) {
     else if (data.type === 'stats') o.onStats?.(data);
     else if (data.type === 'capture') o.onCapture?.(data.frame, data.png);
     else if (data.type === 'saved') o.onSaved?.();
+    else if (data.type === 'prompt') answerPrompt(data);
     else if (data.type === 'done') o.onDone?.(data.status);
   };
   w.onerror = (e) => {

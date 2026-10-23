@@ -12,6 +12,7 @@ pub mod dmusic;
 pub mod dsound;
 pub mod gpu;
 pub mod gdi32;
+pub mod httpdll;
 pub mod kernel32;
 pub mod threads;
 pub mod mci;
@@ -76,6 +77,17 @@ pub struct ApiError(pub String);
 
 pub type ApiResult = Result<Ret, ApiError>;
 
+/// What a dialog asks the player (`Host::prompt`).
+#[derive(Clone, Copy, Debug)]
+pub enum Ask<'a> {
+    /// a message, with OK
+    Message,
+    /// a question answered yes or no
+    Question,
+    /// a line of text, with this default
+    Text(&'a str),
+}
+
 /// Services the host provides to APIs beyond raw memory: calling back into guest code.
 pub trait Host: Guest {
     /// Calls guest `addr` with stdcall `args`; returns EAX.
@@ -137,6 +149,11 @@ pub trait Host: Guest {
         winsock::NetState::Failed
     }
     fn net_close(&mut self, _id: u32) {}
+    /// Asks the player (`Ask`): the text typed, Some("") for OK or Yes, None when cancelled
+    /// (or No). The game waits meanwhile, as it does on a Windows dialog.
+    fn prompt(&mut self, _ask: Ask, _title: &str, _text: &str) -> Option<String> {
+        None
+    }
     /// Input that arrived since the last call (keyboard, mouse); `frame` is the number
     /// of frames presented so far, `clock_us` the guest's clock (a replay delivers each
     /// event at the poll it was taken at).
@@ -324,6 +341,7 @@ impl Registry {
         gdi32::register(&mut r);
         misc::register(&mut r);
         winsock::register(&mut r);
+        httpdll::register(&mut r);
         d3d8::register(&mut r);
         d3d9::register(&mut r);
         com::register(&mut r);

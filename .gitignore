@@ -8,3 +8,5 @@
 /web/public/system32
 # mods' files come from a Fangame.ModLoader folder (web/tools/mods.sh)
 /web/public/mods
+/web/src/iwpo-gm8.mjs
+/web/tools/iwpo/node_modules

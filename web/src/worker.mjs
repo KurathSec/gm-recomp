@@ -209,9 +209,21 @@ self.onmessage = async ({ data }) => {
       : undefined;
     // monitor: input lines go to the page as monitor lines, everything else to the log
     const print = monitor ? (line) => (line.startsWith('input ') ? self.postMessage({ type: 'monitor', line }) : post(line)) : post;
+    // A dialog the game opens (GameMaker 8's dialogs, http_dll's input_box): the page
+    // answers through a shared buffer ([state: 0 waiting, 1 answered, 2 cancelled;
+    // length], then the UTF-8 text) while the game's thread waits, as on Windows.
+    const promptSab = new SharedArrayBuffer(8 + 4096);
+    const prompt = (title, text, def, kind) => {
+      const st = new Int32Array(promptSab, 0, 2);
+      Atomics.store(st, 0, 0);
+      self.postMessage({ type: 'prompt', title, text, def, kind, sab: promptSab });
+      while (Atomics.load(st, 0) === 0) Atomics.wait(st, 0, 0);
+      if (Atomics.load(st, 0) === 2) return null;
+      return new TextDecoder().decode(new Uint8Array(promptSab, 8, Math.min(Atomics.load(st, 1), 4096)).slice());
+    };
     // the guest's network connections go through PlayOnline's relay, when it is on
     const relayUrl = mods.find((m) => m.id === 'PlayOnline')?.config.RelayUrl || undefined;
-    const status = await runGame({ relayUrl, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile });
+    const status = await runGame({ relayUrl, prompt, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile });
     await saving;
     await profileSaving;
     self.postMessage({ type: 'done', status });

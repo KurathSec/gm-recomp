@@ -300,6 +300,10 @@ pub trait Machine: Guest {
         crate::hle::winsock::NetState::Failed
     }
     fn net_close(&mut self, _id: u32) {}
+    /// See `Host::prompt`.
+    fn prompt(&mut self, _ask: crate::hle::Ask, _title: &str, _text: &str) -> Option<String> {
+        None
+    }
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -484,6 +488,9 @@ impl<M: Machine> Host for M {
     }
     fn net_close(&mut self, id: u32) {
         Machine::net_close(self, id)
+    }
+    fn prompt(&mut self, ask: crate::hle::Ask, title: &str, text: &str) -> Option<String> {
+        Machine::prompt(self, ask, title, text)
     }
 
     fn set_fpu_state(&mut self, f: &fpu::Fpu) {

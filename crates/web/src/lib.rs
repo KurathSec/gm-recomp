@@ -16,6 +16,10 @@ use runtime::{Guest, Process};
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
+    /// Asks the player (hle `Host::prompt`): `kind` 0 a message, 1 a line of text (default
+    /// `def`), 2 a yes/no question. Writes the answer (UTF-8, cut to `cap`) at `out`;
+    /// returns its full length, or -1 when cancelled (or No). The game's thread waits for it.
+    fn prompt(title: *const u8, title_len: usize, text: *const u8, text_len: usize, def: *const u8, def_len: usize, kind: u32, out: *mut u8, cap: usize) -> i32;
     /// Compiles and instantiates a translated module; writes the table index of each
     /// export named in `names` (newline-separated) to `out`. Returns 1 on success.
     fn instantiate(wasm: *const u8, len: usize, names: *const u8, names_len: usize, out: *mut u32) -> i32;
@@ -414,6 +418,21 @@ impl Machine for Web {
     }
     fn net_close(&mut self, id: u32) {
         unsafe { net_close(id) }
+    }
+    fn prompt(&mut self, ask: runtime::hle::Ask, title: &str, text: &str) -> Option<String> {
+        use runtime::hle::Ask;
+        let (def, kind) = match ask {
+            Ask::Message => ("", 0),
+            Ask::Text(d) => (d, 1),
+            Ask::Question => ("", 2),
+        };
+        let mut out = vec![0u8; 4096];
+        let n = unsafe { prompt(title.as_ptr(), title.len(), text.as_ptr(), text.len(), def.as_ptr(), def.len(), kind, out.as_mut_ptr(), out.len()) };
+        if n < 0 {
+            return None;
+        }
+        out.truncate((n as usize).min(out.len()));
+        Some(String::from_utf8_lossy(&out).into_owned())
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         let st = state();

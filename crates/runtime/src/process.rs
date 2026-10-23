@@ -320,9 +320,15 @@ pub struct Process {
     pub idle_streak: u32,
     /// Winsock sockets and the names behind their stand-in addresses
     pub sockets: crate::hle::winsock::Sockets,
+    /// http_dll_2_3.dll's buffers and sockets (hle::httpdll)
+    pub httpdll: crate::hle::httpdll::State,
     /// SetDllDirectory's folder: LoadLibrary looks there after the game's folder
     /// (gm82core points it at the extensions' DLLs it extracted).
     pub dll_dir: Option<String>,
+    /// Text drawn on GameMaker 8's dialog forms (hle::user32 `answer_dialog`), by window.
+    pub dialog_text: HashMap<u32, Vec<String>>,
+    /// The dialog form being waited in, the waits so far, and whether it was answered.
+    pub dialog: (u32, u32, bool),
     pub exit_code: Option<u32>,
     pub tls_used: Vec<bool>,
     pub atoms: HashMap<String, u16>,
@@ -480,7 +486,10 @@ impl Process {
             clock_us: 0,
             idle_streak: 0,
             sockets: Default::default(),
+            httpdll: Default::default(),
             dll_dir: None,
+            dialog_text: Default::default(),
+            dialog: (0, 0, false),
             exit_code: None,
             tls_used: vec![false; 1088],
             atoms: HashMap::default(),
