@@ -88,6 +88,12 @@ pub fn ready(p: &mut Process, i: usize, wake: bool) -> bool {
             // free (the owner left it): the thread takes it as it wakes
             if cs_owner(p, cs) == 0 { Some(None) } else { None }
         }
+        // timed out (FALSE): then the critical section again, as after a wake
+        ThreadState::CondVar { cs, until, .. } if until.is_some_and(|u| u <= now) => {
+            p.threads[i].state = ThreadState::CritSec(cs);
+            p.threads[i].resume_eax = Some(0);
+            if cs_owner(p, cs) == 0 { Some(Some(0)) } else { None }
+        }
         _ => None,
     };
     match result {
@@ -115,7 +121,7 @@ fn next_wake(p: &Process) -> Option<u64> {
         .iter()
         .filter_map(|t| match &t.state {
             ThreadState::Sleeping(at) => Some(*at),
-            ThreadState::Waiting { until, .. } => *until,
+            ThreadState::Waiting { until, .. } | ThreadState::CondVar { until, .. } => *until,
             _ => None,
         })
         .chain(p.timers_due.iter().map(|&(_, at)| at))
@@ -239,6 +245,54 @@ fn cs_owner(p: &Process, cs: u32) -> u32 {
 /// CRITICAL_SECTION offsets of LockCount, RecursionCount and OwningThread.
 pub fn cs_fields(c: &Ctx) -> [u32; 3] {
     if c.x64() { [8, 12, 16] } else { [4, 8, 12] }
+}
+
+/// SleepConditionVariable*: lets go of `cs` and sleeps until a wake on `cv` or `ms`
+/// pass, then takes `cs` again. TRUE when woken; FALSE (ERROR_TIMEOUT) at the timeout.
+/// A secondary thread blocks (it gets `cs` back as it wakes); the main thread lets time
+/// and the other threads run meanwhile.
+fn sleep_cv(c: &mut Ctx, cv: u32, cs: u32, ms: u32) -> u32 {
+    let until = timeout_until(c, ms);
+    leave_cs(c, cs);
+    if c.p.current == 0 {
+        c.p.main_cv = Some((cv, false));
+        let r = main_wait(c, until, |p| matches!(p.main_cv, Some((_, true))).then_some(0));
+        c.p.main_cv = None;
+        enter_cs(c, cs, false);
+        if r != 0 {
+            c.set_last_error(1460);
+            return 0;
+        }
+        return 1;
+    }
+    if can_yield(c) {
+        // (TRUE unless the timeout comes first: `ready`)
+        c.p.current_thread_mut().resume_eax = Some(1);
+        block(c, ThreadState::CondVar { cv, cs, until });
+        return 1;
+    }
+    enter_cs(c, cs, false);
+    1
+}
+
+/// Wakes one (or every) thread sleeping in `cv`: it waits for its critical section.
+fn wake_cv(c: &mut Ctx, cv: u32, all: bool) {
+    for i in 1..c.p.threads.len() {
+        if let ThreadState::CondVar { cv: v, cs, .. } = c.p.threads[i].state {
+            if v == cv {
+                c.p.threads[i].state = ThreadState::CritSec(cs);
+                c.p.threads[i].resume_eax = Some(1);
+                if !all {
+                    return;
+                }
+            }
+        }
+    }
+    if let Some((v, woken)) = c.p.main_cv.as_mut() {
+        if *v == cv {
+            *woken = true;
+        }
+    }
 }
 
 /// The critical section a slim reader/writer lock is taken as (made at first use).
@@ -574,13 +628,9 @@ pub fn register(r: &mut Registry) {
         ok(1, 0)
     });
     r.add(k, "SleepConditionVariableCS", |c| {
-        let (cs, ms) = (c.arg(1), c.arg(2));
-        leave_cs(c, cs);
-        if c.p.current == 0 {
-            sleep(c, ms.min(1));
-        }
-        enter_cs(c, cs, false);
-        ok(3, 1)
+        let (cv, cs, ms) = (c.arg(0), c.arg(1), c.arg(2));
+        let r = sleep_cv(c, cv, cs, ms);
+        ok(3, r)
     });
     // Slim reader/writer locks, shared or not, are taken as a critical section of their
     // own (recursive for the owner, which a shared lock may be); the lock word says
@@ -621,17 +671,20 @@ pub fn register(r: &mut Registry) {
         });
     }
     r.add_on_demand(k, "SleepConditionVariableSRW", |c| {
-        let (srw, ms) = (c.arg(1), c.arg(2));
+        let (cv, srw, ms) = (c.arg(0), c.arg(1), c.arg(2));
         let cs = srw_cs(c, srw);
-        leave_cs(c, cs);
-        if c.p.current == 0 {
-            sleep(c, ms.min(1));
-        }
-        enter_cs(c, cs, false);
-        ok(4, 1)
+        let r = sleep_cv(c, cv, cs, ms);
+        let _ = c.host.write_u32(srw, 1);
+        ok(4, r)
     });
-    r.add(k, "WakeConditionVariable", |_c| ok(1, 0));
-    r.add(k, "WakeAllConditionVariable", |_c| ok(1, 0));
+    r.add(k, "WakeConditionVariable", |c| {
+        wake_cv(c, c.arg(0), false);
+        ok(1, 0)
+    });
+    r.add(k, "WakeAllConditionVariable", |c| {
+        wake_cv(c, c.arg(0), true);
+        ok(1, 0)
+    });
     r.alias("ntdll.dll", "RtlEnterCriticalSection", k, "EnterCriticalSection");
     r.alias("ntdll.dll", "RtlLeaveCriticalSection", k, "LeaveCriticalSection");
     r.alias("ntdll.dll", "RtlTryEnterCriticalSection", k, "TryEnterCriticalSection");

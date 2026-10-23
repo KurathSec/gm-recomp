@@ -225,6 +225,9 @@ pub enum ThreadState {
     Waiting { handles: Vec<u32>, all: bool, until: Option<u64> },
     /// For a critical section another thread owns.
     CritSec(u32),
+    /// In a condition variable's sleep (`cv`), its critical section `cs` let go: a wake
+    /// on `cv` or the time `until` makes it wait for `cs` again.
+    CondVar { cv: u32, cs: u32, until: Option<u64> },
     Suspended(u32),
     Exited(u32),
 }
@@ -308,6 +311,8 @@ pub struct Process {
     /// and the API caller's registers and return address, for exception dispatch to
     /// walk on past them (hle::seh64).
     pub host_frames64: Vec<(u32, [u64; 16], u64)>,
+    /// The condition variable the main thread sleeps in, and whether a wake reached it.
+    pub main_cv: Option<(u32, bool)>,
     /// Slim reader/writer locks: the critical section (in guest memory) each one is
     /// taken as.
     pub srw_locks: HashMap<u32, u32>,
@@ -481,6 +486,7 @@ impl Process {
             cs_pending: Vec::new(),
             srw_locks: HashMap::default(),
             host_frames64: Vec::new(),
+            main_cv: None,
             cmdline: cmdline.to_string(),
             exe_path: exe_path.to_string(),
             cwd,

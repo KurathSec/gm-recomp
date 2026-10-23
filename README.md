@@ -46,8 +46,9 @@ their DXBC shaders translated to GLSL (`hle/dxbc.rs`), and their sound goes thro
 WASAPI (`hle/wasapi.rs`). 64-bit code is recompiled as 32-bit code is (`crates/recomp/src/lift64.rs`)
 and calls the same Windows APIs by the Win64 convention (docs/x64.md). In Chrome, I wanna
 cat addiction, I wanna Dodge The Bullets and Night Guy (32-bit), Sunshine, I Wanna Find A
-New Puter and I Wanna be the State of Destruction (64-bit) show their title screens and
-take input; State of Destruction plays.
+New Puter, I Wanna be the State of Destruction, I Wanna Rob Santa Claus, I Wanna Be The
+Furry Guy, I Wanna Horizon, Super I Just Wanna Play The Needle Game and two more (64-bit)
+show their title screens at 50 fps; New Puter takes input and State of Destruction plays.
 
 ## Getting started
 
