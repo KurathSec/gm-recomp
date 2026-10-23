@@ -2041,7 +2041,7 @@ fn collect_order(name: &str, x64: bool, read: &dyn Fn(&str) -> Option<Vec<u8>>, 
     if pe.pe64 != x64 {
         return Ok(());
     }
-    for d in pe.imports().map_err(|e| e.to_string())? {
+    for d in pe.imports().map_err(|e| format!("{name}: imports: {e}"))? {
         let dll = crate::api_set(&d.dll).unwrap_or(&d.dll);
         if read(dll).is_some() {
             collect_order(dll, x64, read, seen, order)?;

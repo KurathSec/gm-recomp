@@ -381,32 +381,36 @@ impl<'a> Pe<'a> {
                 desc += 20;
             }
         }
+        // Delay imports are the exe's own business (its helper loads them when first
+        // called): the loader never reads them, and a packer (UPX) leaves the original's
+        // table pointing at what is packed data now. A table that does not parse ends there.
         let dir = self.dir(DIR_DELAY_IMPORT);
         if dir.rva != 0 {
             let mut desc = dir.rva;
-            loop {
-                let attrs = self.u32_at_rva(desc)?;
-                let name = self.u32_at_rva(desc + 4)?;
-                if name == 0 {
-                    break;
-                }
-                // Bit 0 of attributes: fields are RVAs (VC7+). Older Borland/VC6 tables hold VAs.
-                let rva_based = attrs & 1 != 0;
-                let fix = |v: u32| if rva_based { Some(v) } else { self.va_to_rva(v) };
-                let name_rva = fix(name).ok_or(Error::BadRva(name))?;
-                let iat_raw = self.u32_at_rva(desc + 12)?;
-                let int_raw = self.u32_at_rva(desc + 16)?;
-                let iat = fix(iat_raw).ok_or(Error::BadRva(iat_raw))?;
-                let int = fix(int_raw).ok_or(Error::BadRva(int_raw))?;
-                out.push(ImportDll {
-                    dll: self.cstr_at_rva(name_rva)?,
-                    delay_load: true,
-                    entries: self.read_thunks(int, iat, rva_based)?,
-                });
+            while let Ok(Some(dll)) = self.delay_import_at(desc) {
+                out.push(dll);
                 desc += 32;
             }
         }
         Ok(out)
+    }
+
+    /// The delay import descriptor at `desc`, None at the table's end.
+    fn delay_import_at(&self, desc: u32) -> Result<Option<ImportDll>> {
+        let attrs = self.u32_at_rva(desc)?;
+        let name = self.u32_at_rva(desc + 4)?;
+        if name == 0 {
+            return Ok(None);
+        }
+        // Bit 0 of attributes: fields are RVAs (VC7+). Older Borland/VC6 tables hold VAs.
+        let rva_based = attrs & 1 != 0;
+        let fix = |v: u32| if rva_based { Some(v) } else { self.va_to_rva(v) };
+        let name_rva = fix(name).ok_or(Error::BadRva(name))?;
+        let iat_raw = self.u32_at_rva(desc + 12)?;
+        let int_raw = self.u32_at_rva(desc + 16)?;
+        let iat = fix(iat_raw).ok_or(Error::BadRva(iat_raw))?;
+        let int = fix(int_raw).ok_or(Error::BadRva(int_raw))?;
+        Ok(Some(ImportDll { dll: self.cstr_at_rva(name_rva)?, delay_load: true, entries: self.read_thunks(int, iat, rva_based)? }))
     }
 
     pub fn exports(&self) -> Result<Vec<Export>> {
