@@ -490,7 +490,77 @@ fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
     if rva == 0 { 0 } else { base + rva }
 }
 
+/// APIs only newer runners import (GameMaker Studio 2's 64-bit ones), on demand.
+fn register_newer(r: &mut Registry) {
+    // No network adapters, and no notifications about them.
+    let ip = "iphlpapi.dll";
+    r.add_on_demand(ip, "GetAdaptersAddresses", |c| {
+        let size = c.arg(4);
+        if size != 0 {
+            let _ = c.host.write_u32(size, 0);
+        }
+        ok(5, 232) // ERROR_NO_DATA
+    });
+    r.add_on_demand(ip, "NotifyIpInterfaceChange", |c| {
+        let h = c.arg(4);
+        c.write_ptr(h, 0);
+        ok(5, 50) // ERROR_NOT_SUPPORTED
+    });
+    r.add_on_demand(ip, "CancelMibChangeNotify2", |_c| ok(1, 0));
+    // UUIDs from the process's own sequence
+    let rpc = "rpcrt4.dll";
+    r.add_on_demand(rpc, "UuidCreate", |c| {
+        let p = c.arg(0);
+        c.p.next_luid += 1;
+        let n = c.p.next_luid;
+        let mut g = [0u8; 16];
+        g[..8].copy_from_slice(&(0x6d72_6700_0000_0000u64 | n).to_le_bytes());
+        g[8..].copy_from_slice(&0x4000_8000_1234_5678u64.to_le_bytes());
+        g[7] = (g[7] & 0x0F) | 0x40; // version 4
+        g[8] = (g[8] & 0x3F) | 0x80; // variant
+        let _ = c.host.write(p, &g);
+        ok(1, 0)
+    });
+    r.add_on_demand(rpc, "UuidToStringW", |c| {
+        let (p, out) = (c.arg(0), c.arg(1));
+        let mut g = [0u8; 16];
+        let _ = c.host.read(p, &mut g);
+        let s = super::com::format_iid(&g).trim_matches(|ch| ch == '{' || ch == '}').to_lowercase();
+        let w = galloc(c, 2 * s.len() as u32 + 2);
+        let _ = c.host.write_wstr(w, &s);
+        c.write_ptr(out, w);
+        ok(2, 0)
+    });
+    r.add_on_demand(rpc, "RpcStringFreeW", |c| {
+        let p = c.host.read_u32(c.arg(0)).unwrap_or(0);
+        if p != 0 {
+            c.p.heap_free(p);
+        }
+        ok(1, 0)
+    });
+    // Media Foundation (video playback): not available
+    let mfp = "mfplat.dll";
+    r.add_on_demand(mfp, "MFStartup", |_c| ok(2, 0x8000_4001));
+    r.add_on_demand(mfp, "MFShutdown", |_c| ok(0, 0));
+    // (each fails with E_NOTIMPL, its out pointer cleared: the argument after `n` inputs)
+    fn mf_fail(c: &mut Ctx, n: u32) -> ApiResult {
+        let pp = c.arg(n);
+        c.write_ptr(pp, 0);
+        ok(n + 1, 0x8000_4001)
+    }
+    r.add_on_demand(mfp, "MFCreateSourceResolver", |c| mf_fail(c, 0));
+    r.add_on_demand(mfp, "MFCreateMediaType", |c| mf_fail(c, 0));
+    let mf = "mf.dll";
+    r.add_on_demand(mf, "MFCreateAudioRendererActivate", |c| mf_fail(c, 0));
+    r.add_on_demand(mf, "MFCreateMediaSession", |c| mf_fail(c, 1));
+    r.add_on_demand(mf, "MFCreateSampleGrabberSinkActivate", |c| mf_fail(c, 2));
+    r.add_on_demand(mf, "MFCreateTopology", |c| mf_fail(c, 0));
+    r.add_on_demand(mf, "MFCreateTopologyNode", |c| mf_fail(c, 1));
+    r.add_on_demand(mf, "MFGetService", |c| mf_fail(c, 3));
+}
+
 pub fn register(r: &mut Registry) {
+    register_newer(r);
     // ---- advapi32 ------------------------------------------------------------
     let a = "advapi32.dll";
     r.add(a, "RegOpenKeyExA", |c| {
@@ -748,7 +818,8 @@ pub fn register(r: &mut Registry) {
         let mut g = [0u8; 16];
         let _ = c.host.read(clsid_p, &mut g);
         let clsid = super::com::format_iid(&g);
-        match super::com::create_instance(c, &clsid, iid_p, ppv) {
+        let made = super::wasapi::create_instance(c, &clsid, iid_p, ppv).or_else(|| super::com::create_instance(c, &clsid, iid_p, ppv));
+        match made {
             Some(hr) => {
                 c.trace(format!("({clsid}) = {hr:#x}"));
                 ok(5, hr)

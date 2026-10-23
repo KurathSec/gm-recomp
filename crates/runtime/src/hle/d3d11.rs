@@ -60,6 +60,8 @@ pub struct State11 {
     pub scissor: [i32; 4],
     /// The current GPU target (texture object, 0: back buffer) and its size.
     pub target: (u32, u32, u32),
+    /// The virtual time of the last Present.
+    pub last_present_us: u64,
     pub shaders: HashMap<u32, super::dxbc::Shader>,
     /// Input layouts: (semantic name, index, DXGI format, slot, offset).
     pub layouts: HashMap<u32, Vec<(String, u32, u32, u32, u32)>>,
@@ -618,7 +620,18 @@ fn output_find_closest_mode(c: &mut Ctx) -> ApiResult {
 
 // ---- IDXGISwapChain -------------------------------------------------------------------------
 
+/// A display's frame (µs): what a runner that does not wait for its next frame gets.
+const DISPLAY_FRAME_US: u64 = 1_000_000 / 60;
+
 fn sc_present(c: &mut Ctx) -> ApiResult {
+    // A runner that does not wait between frames (a game speed above what a display
+    // shows, such as 9999) gets a display's frame, as vsync would give it: its
+    // delta_time then follows what the player sees instead of a tenth of a millisecond.
+    let since = c.p.clock_us.saturating_sub(c.p.d3d11.last_present_us);
+    if c.p.d3d11.last_present_us != 0 && since < DISPLAY_FRAME_US / 2 {
+        c.advance_clock(DISPLAY_FRAME_US - since);
+    }
+    c.p.d3d11.last_present_us = c.p.clock_us;
     c.p.frames_presented += 1;
     let n = c.p.frames_presented;
     let draws = c.p.draw_calls;

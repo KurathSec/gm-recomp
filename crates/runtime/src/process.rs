@@ -367,6 +367,8 @@ pub struct Process {
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
     /// The sound mix and where finished samples go.
     pub mixer: crate::hle::audio::Mixer,
+    /// WASAPI streams, by IAudioClient (hle::wasapi).
+    pub wasapi: HashMap<u32, crate::hle::wasapi::Stream>,
     /// DirectMusic: loaded sounds, playing segments, master volume (mB), default path,
     /// loader search directories.
     pub dm_sounds: Vec<crate::hle::dmusic::DmSound>,
@@ -528,6 +530,7 @@ impl Process {
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),
             mixer: Default::default(),
+            wasapi: HashMap::default(),
             dm_sounds: Vec::new(),
             dm_voices: Vec::new(),
             dm_master_volume: 0,

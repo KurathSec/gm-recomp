@@ -1504,6 +1504,13 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
 /// Maps a PE image, binds its imports, runs TLS callbacks and DllMain. Shared by
 /// LoadLibrary and the harness's static-import preloading.
 pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>, attach: bool) -> Result<u32, ApiError> {
+    // A process runs images of its own bitness only (games ship 32-bit extensions their
+    // 64-bit runner cannot load, and expect LoadLibrary to fail).
+    if pe::Pe::parse(&bytes).is_ok_and(|pe| pe.pe64 != c.x64()) {
+        c.p.log(format!("LoadLibrary({base_name:?}): a {}-bit image in a {}-bit process", if c.x64() { 32 } else { 64 }, if c.x64() { 64 } else { 32 }));
+        c.set_last_error(193); // ERROR_BAD_EXE_FORMAT
+        return Ok(0);
+    }
     // DLLs it imports that are files (the game's or the system directory's) load first.
     if let Ok(pe) = pe::Pe::parse(&bytes) {
         for d in pe.imports().unwrap_or_default() {

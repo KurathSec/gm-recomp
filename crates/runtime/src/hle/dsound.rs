@@ -95,6 +95,7 @@ pub fn tick(c: &mut Ctx) {
     }
     super::dmusic::tick(c);
     super::mci::tick(c);
+    super::wasapi::tick(c);
 }
 
 /// Hands the finished part of the mix to the host (called at each Present).

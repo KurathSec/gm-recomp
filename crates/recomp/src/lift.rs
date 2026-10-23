@@ -2543,7 +2543,7 @@ impl<'a> FuncEmit<'a> {
         self.materialize(flags::ALL);
     }
 
-    fn x87(&mut self, instr: &Instruction) {
+    pub(crate) fn x87(&mut self, instr: &Instruction) {
         self.count(crate::abi::COUNT_X87);
         if self.x87_inline && self.x87_inline_form(instr) {
             return;
@@ -3141,7 +3141,11 @@ impl<'a> FuncEmit<'a> {
             }
             None => self.x87_call(instr),
         }
-        if writes_ax {
+        if writes_ax && self.x64 {
+            self.i(W::I64ExtendI32U);
+            self.lset(crate::lift64::X_T1);
+            self.rset_from(Register::AX, crate::lift64::X_T1);
+        } else if writes_ax {
             self.set(L_T1);
             self.write_reg_from(Register::AX, L_T1);
         } else if writes_flags {

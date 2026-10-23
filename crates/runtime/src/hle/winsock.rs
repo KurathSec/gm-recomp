@@ -549,6 +549,33 @@ pub fn register(r: &mut Registry) {
         }
         ok(1, 0xFFFF_FFFF)
     });
+    // inet_pton(family, text, out) / inet_ntop(family, addr, buf, size): IPv4 only
+    r.add_on_demand(w, "inet_pton", |c| {
+        let (family, text, out) = (c.arg(0), c.arg(1), c.arg(2));
+        let s = c.host.read_cstr_lossy(text);
+        let parts: Vec<&str> = s.trim().split('.').collect();
+        if family == 2 && parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+            let b: Vec<u8> = parts.iter().map(|p| p.parse().unwrap()).collect();
+            let _ = c.host.write(out, &b);
+            return ok(3, 1);
+        }
+        ok(3, 0)
+    });
+    r.add_on_demand(w, "inet_ntop", |c| {
+        let (family, addr, buf, size) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        if family != 2 {
+            return ok(4, 0);
+        }
+        let mut b = [0u8; 4];
+        let _ = c.host.read(addr, &mut b);
+        let text = format!("{}.{}.{}.{}\0", b[0], b[1], b[2], b[3]);
+        if (text.len() as u32) > size {
+            return ok(4, 0);
+        }
+        let _ = c.host.write(buf, text.as_bytes());
+        ok(4, buf)
+    });
+    r.add_on_demand(w, "getnameinfo", |_c| ok(7, WSAHOST_NOT_FOUND));
     r.add(w, "inet_ntoa", |c| {
         if !c.host.net_enabled() {
             return ok(1, 0);

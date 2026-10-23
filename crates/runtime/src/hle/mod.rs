@@ -26,6 +26,7 @@ pub mod pads;
 pub mod profile;
 pub mod seh64;
 pub mod user32;
+pub mod wasapi;
 pub mod winsock;
 
 use crate::mem::Guest;

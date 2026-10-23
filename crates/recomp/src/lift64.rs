@@ -1295,7 +1295,13 @@ impl<'a> FuncEmit<'a> {
                 // Only reached when not a block terminator (cannot happen); treat as trap.
                 self.trap(trap::UNIMPLEMENTED, self.ip);
             }
-            m if crate::cfg::is_x87(m) || matches!(m, Emms | Femms) => self.unimplemented(instr),
+            // x87 in 64-bit code (setjmp's control word, the odd long double routine):
+            // the 32-bit path's helper, out of line
+            m if crate::cfg::is_x87(m) || matches!(m, Emms | Femms | Wait) => {
+                let inline = std::mem::replace(&mut self.x87_inline, false);
+                self.x87(instr);
+                self.x87_inline = inline;
+            }
             _ => {
                 if !self.sse(instr) {
                     self.unimplemented(instr);
