@@ -9,6 +9,8 @@
 //! The page drives it through the exports at the end: `alloc`, `import`, `needs`,
 //! `add_file`, `manifest` and `file_*`; text comes back through `out_ptr`/`out_len`.
 
+mod nsis;
+
 use pe::{Pe, RT_RCDATA, ResId};
 use serde_json::{Value, json};
 use std::io::Read;
@@ -309,8 +311,23 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     game.dirs.sort();
     game.dirs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     let (entry, _) = game.entry();
-    if game.find(&entry).is_some_and(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")) {
-        return Err(format!("{entry} is an NSIS installer, which cannot be imported in the browser yet"));
+    // an installer (GameMaker: Studio's NSIS export): the files it installs instead
+    let installer = game.find(&entry).filter(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")).map(|(_, d)| d.clone());
+    if let Some(exe) = installer {
+        let installed = nsis::extract(&exe).map_err(|e| format!("{entry} is an NSIS installer, which cannot be imported in the browser ({e})"))?;
+        let dir = entry.rsplit_once('/').map_or(String::new(), |(d, _)| format!("{d}/"));
+        game.files.retain(|(p, _)| !p.eq_ignore_ascii_case(&entry));
+        for (p, data) in installed {
+            let p = format!("{dir}{p}");
+            game.files.retain(|(q, _)| !q.eq_ignore_ascii_case(&p));
+            game.files.push((p, data));
+        }
+        game.files.sort_by(|a, b| a.0.cmp(&b.0));
+        game.reroot();
+        let (entry, _) = game.entry();
+        if game.find(&entry).is_none_or(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")) {
+            return Err(format!("{entry}: the NSIS installer holds no game to run"));
+        }
     }
     Ok(game)
 }

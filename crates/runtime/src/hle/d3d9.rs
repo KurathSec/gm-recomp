@@ -1591,6 +1591,10 @@ const IDIRECT3DDEVICE9: &[Method] = &[
     ("EndStateBlock", 2, dev_end_state_block),
     ("SetClipStatus", 2, okn),
     ("GetClipStatus", 2, |c| {
+        // (D3D9 refuses a NULL pointer; GameMaker 8.2's runner calls it so)
+        if c.arg(1) == 0 {
+            return ret(c, D3DERR_INVALIDCALL);
+        }
         let _ = c.host.fill(c.arg(1), 8, 0);
         ret(c, D3D_OK)
     }),
