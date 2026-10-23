@@ -622,6 +622,26 @@ impl<'a> FuncEmit<'a> {
                 let w = (instr.memory_size().size() * 8) as u8;
                 self.load(w);
             }
+            // Code that may change (`Cfg::guard`): the immediate is read from the instruction
+            // as it runs, as code that rewrites its own constants needs (a protected runner's
+            // decryption loop updates its key in the `xor eax, imm32` it executes). An
+            // instruction's immediate is its last bytes.
+            kind @ (OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32 | OpKind::Immediate8to16 | OpKind::Immediate8to32) if self.cfg.guard != 0 => {
+                let w = Self::op_width(instr, 0).max(8);
+                let mem = MemArg { offset: 0, align: 0, memory_index: 0 };
+                let (size, load) = match kind {
+                    OpKind::Immediate8 => (1, W::I32Load8U(mem)),
+                    OpKind::Immediate8to16 | OpKind::Immediate8to32 => (1, W::I32Load8S(mem)),
+                    OpKind::Immediate16 => (2, W::I32Load16U(mem)),
+                    _ => (4, W::I32Load(mem)),
+                };
+                self.c(instr.next_ip() as u32 - size);
+                self.i(load);
+                if w < 32 {
+                    self.c(mask(w));
+                    self.i(W::I32And);
+                }
+            }
             OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32 | OpKind::Immediate8to16 | OpKind::Immediate8to32
             | OpKind::Immediate8_2nd => {
                 let w = Self::op_width(instr, 0).max(8);
