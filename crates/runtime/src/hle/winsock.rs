@@ -5,8 +5,8 @@
 //! Calls do not block unless the guest made the socket blocking, and then they wait on
 //! the virtual clock (the host's events come in while it waits). Host names resolve to
 //! stand-in addresses (10.77.x.y) the host connects to by name. Without a network on the
-//! host every call returns what the stubs before it did (WSASYSNOTREADY and failures), so
-//! games that look at the network see no change.
+//! host, winsock starts as on a computer that is offline and every call that would use
+//! the network fails (WSAENETDOWN).
 
 use super::{ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
@@ -18,6 +18,7 @@ fn ok(nargs: u32, v: u32) -> ApiResult {
 
 const SOCKET_ERROR: u32 = 0xFFFF_FFFF;
 const WSAEWOULDBLOCK: u32 = 10035;
+const WSAENETDOWN: u32 = 10050;
 const WSAEINPROGRESS: u32 = 10036;
 const WSAENOTSOCK: u32 = 10038;
 const WSAEOPNOTSUPP: u32 = 10045;
@@ -205,10 +206,8 @@ pub fn register(r: &mut Registry) {
     let w = "ws2_32.dll";
     r.add(w, "WSAStartup", |c| {
         let (version, data) = (c.arg(0), c.arg(1));
-        if !c.host.net_enabled() {
-            // WSASYSNOTREADY: no network here (as before sockets existed)
-            return ok(2, 10091);
-        }
+        // (it starts without a network too: Boost.Asio in a GM extension aborted when it
+        // did not; the calls that use the network then fail)
         if data != 0 {
             // WSADATA: version, high version, description, system status
             let _ = c.host.fill(data, 400, 0);
@@ -230,7 +229,7 @@ pub fn register(r: &mut Registry) {
     });
     r.add(w, "WSAGetLastError", |c| {
         if !c.host.net_enabled() {
-            return ok(0, 10093);
+            return ok(0, WSAENETDOWN);
         }
         let e = c.p.current_thread_mut().last_error;
         ok(0, e)
