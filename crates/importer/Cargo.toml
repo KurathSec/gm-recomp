@@ -1,7 +1,11 @@
 [package]
 name = "importer"
-version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+version.workspace = true
+description = "Unpacks games, detects their engine, inventories their modules and APIs"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"

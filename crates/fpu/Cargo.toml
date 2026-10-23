@@ -2,6 +2,10 @@
 name = "fpu"
 edition.workspace = true
 version.workspace = true
+description = "The x87 FPU model: 80-bit extended precision, bit-exact in every precision and rounding mode"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "instr_info"] }

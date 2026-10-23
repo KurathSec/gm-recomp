@@ -2,6 +2,10 @@
 name = "web"
 edition.workspace = true
 version.workspace = true
+description = "The browser build of the runtime"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

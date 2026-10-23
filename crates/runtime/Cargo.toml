@@ -2,6 +2,10 @@
 name = "runtime"
 edition.workspace = true
 version.workspace = true
+description = "PE loader, process state, the Windows API implementations and the engine that runs translated code"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 encoding_rs = "0.8.42"

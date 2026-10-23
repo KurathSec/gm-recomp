@@ -2,6 +2,10 @@
 name = "recomp"
 edition.workspace = true
 version.workspace = true
+description = "The x86 to WebAssembly translator"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 fpu = { version = "0.1.0", path = "../fpu" }

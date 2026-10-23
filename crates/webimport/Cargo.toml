@@ -2,6 +2,10 @@
 name = "webimport"
 edition.workspace = true
 version.workspace = true
+description = "The importer's unpacking and engine detection, built for the page"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

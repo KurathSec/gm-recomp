@@ -2,6 +2,10 @@
 name = "gmmod"
 edition.workspace = true
 version.workspace = true
+description = "Mods applied to GameMaker games' files before they run (a debug switch, Fangame.ModLoader's mods)"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

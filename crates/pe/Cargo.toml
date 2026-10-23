@@ -2,5 +2,9 @@
 name = "pe"
 edition.workspace = true
 version.workspace = true
+description = "Parsing of PE (Windows executable) images"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]

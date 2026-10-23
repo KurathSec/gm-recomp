@@ -2,6 +2,10 @@
 name = "harness"
 edition.workspace = true
 version.workspace = true
+description = "Runs the runtime natively on wasmtime: games headless, state hashes, traces, CPU differential tests"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"

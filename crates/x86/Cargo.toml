@@ -2,6 +2,10 @@
 name = "x86"
 edition.workspace = true
 version.workspace = true
+description = "x86 decoding and static code discovery"
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "fast_fmt", "instr_info"] }
