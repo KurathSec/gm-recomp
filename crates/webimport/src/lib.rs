@@ -295,6 +295,11 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
         files.retain(|(p, _): &(String, Vec<u8>)| !p.eq_ignore_ascii_case(&path));
         files.push((path, data));
     }
+    for (_, data) in &mut files {
+        if let Some(Ok(original)) = neshta(data) {
+            *data = original;
+        }
+    }
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
     let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs };
@@ -311,6 +316,9 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     game.dirs.sort();
     game.dirs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     let (entry, _) = game.entry();
+    if game.find(&entry).is_some_and(|(_, d)| neshta(d).is_some()) {
+        return Err(format!("{entry} is infected with the Neshta virus"));
+    }
     // an installer (GameMaker: Studio's NSIS export): the files it installs instead
     let installer = game.find(&entry).filter(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")).map(|(_, d)| d.clone());
     if let Some(exe) = installer {
@@ -672,6 +680,34 @@ fn pe_image_end(exe: &[u8]) -> usize {
         .unwrap_or(exe.len())
 }
 
+/// The size of the Neshta virus, a Delphi file infector: its body replaces the start of an
+/// exe, and the exe's own first `NESHTA` bytes go to the end of the file (their first
+/// `NESHTA_KEPT` encrypted).
+const NESHTA: usize = 0xa200;
+const NESHTA_KEPT: usize = 1000;
+
+/// An exe infected with Neshta, put back together: `Some(Ok(original))` when antivirus
+/// cleaning has restored only the encrypted part (the PE header, which then describes the
+/// original's sections) and left the virus in the code, where the exe crashes at its first
+/// call (on Windows too); `Some(Err(()))` for an exe still infected; `None` for the others.
+fn neshta(exe: &[u8]) -> Option<Result<Vec<u8>, ()>> {
+    let head = exe.get(..NESHTA)?;
+    if !exe.starts_with(b"MZ") || !head.windows(10).any(|w| w == b"Neshta 1.0") {
+        return None;
+    }
+    let tail = exe.len().checked_sub(NESHTA).filter(|&t| t >= NESHTA);
+    let Some(tail) = tail else { return Some(Err(())) };
+    let end = pe_image_end(&exe[..NESHTA_KEPT]);
+    if end <= NESHTA || end > tail {
+        return Some(Err(()));
+    }
+    let mut out = Vec::with_capacity(tail);
+    out.extend_from_slice(&exe[..NESHTA_KEPT]);
+    out.extend_from_slice(&exe[tail + NESHTA_KEPT..]);
+    out.extend_from_slice(&exe[NESHTA..tail]);
+    Some(Ok(out))
+}
+
 /// A PE32+ (64-bit) image: optional header magic 0x20b.
 fn pe64(exe: &[u8]) -> bool {
     let Some(pe) = u32_at(exe, 0x3c) else { return false };
@@ -876,5 +912,33 @@ mod tests {
         assert!(safe_parts("../evil").is_none());
         assert_eq!(safe_parts("a\\b.txt"), Some(vec!["a".to_string(), "b.txt".to_string()]));
         assert_eq!(slugify("I wanna run the Marathon v1.2"), "i-wanna-run-the-marathon-v1-2");
+    }
+
+    /// An exe of one section whose raw data ends at `end`.
+    fn pe(len: usize, end: usize) -> Vec<u8> {
+        let mut d: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+        d[..2].copy_from_slice(b"MZ");
+        d[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        d[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        d[0x54..0x56].copy_from_slice(&0xe0u16.to_le_bytes());
+        let s = 0x40 + 24 + 0xe0;
+        d[s + 16..s + 20].copy_from_slice(&(end as u32 - 0x400).to_le_bytes());
+        d[s + 20..s + 24].copy_from_slice(&0x400u32.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn neshta_damaged_exe() {
+        let original = pe(3 * NESHTA, 3 * NESHTA);
+        let mut virus = pe(NESHTA, NESHTA);
+        virus[NESHTA - 0x100..NESHTA - 0x100 + 10].copy_from_slice(b"Neshta 1.0");
+        let mut moved = original[..NESHTA].to_vec();
+        moved[..NESHTA_KEPT].iter_mut().for_each(|b| *b ^= 0x5a);
+        let infected = [&virus[..], &original[NESHTA..], &moved].concat();
+        assert_eq!(neshta(&infected), Some(Err(())));
+        let damaged = [&original[..NESHTA_KEPT], &infected[NESHTA_KEPT..]].concat();
+        assert_eq!(neshta(&damaged), Some(Ok(original.clone())));
+        assert_eq!(neshta(&original), None);
     }
 }
