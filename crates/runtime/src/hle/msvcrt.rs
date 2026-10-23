@@ -1821,6 +1821,26 @@ pub fn register_more(r: &mut Registry) {
 /// (`Registry::on_demand`), so the stub addresses of everything else stay put.
 pub fn register_late(r: &mut Registry) {
     let m = "msvcrt.dll";
+    // _strrev(s) / _wcsrev(s): reversed in place
+    r.add_on_demand(m, "_strrev", |c| {
+        let p = c.arg(0);
+        let n = (0..).take_while(|&i| c.host.read_u8(p + i).unwrap_or(0) != 0).count() as u32;
+        let mut b = vec![0u8; n as usize];
+        let _ = c.host.read(p, &mut b);
+        b.reverse();
+        let _ = c.host.write(p, &b);
+        ok(p)
+    });
+    r.add_on_demand(m, "_wcsrev", |c| {
+        let p = c.arg(0);
+        let n = (0..).take_while(|&i| c.host.read_u16(p + 2 * i).unwrap_or(0) != 0).count() as u32;
+        let mut u: Vec<u16> = (0..n).map(|i| c.host.read_u16(p + 2 * i).unwrap_or(0)).collect();
+        u.reverse();
+        for (i, v) in u.into_iter().enumerate() {
+            let _ = c.host.write_u16(p + 2 * i as u32, v);
+        }
+        ok(p)
+    });
     r.add_on_demand(m, "_wfopen", |c| {
         let (path, mode) = (c.wstr_arg(0), c.wstr_arg(1));
         let f = fopen(c, &path, &mode);
