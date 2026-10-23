@@ -1895,6 +1895,15 @@ fn find_first(c: &mut Ctx, pattern: &str) -> u32 {
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
+    // "." and ".." come first in any folder but a drive's root (a game's sound loader
+    // skipped the first entry it found and read the folder's own files through ".")
+    let d = dir.trim_end_matches(['\\', '/']);
+    let root = d.is_empty() || (d.len() == 2 && d.ends_with(':'));
+    if !root && c.p.fs.stat(&dkey).is_some_and(|m| m.is_dir) {
+        let dots = [".", ".."].into_iter().filter(|dot| glob_match(&pat.to_lowercase(), dot));
+        let dots: Vec<FindEntry> = dots.map(|dot| FindEntry { name: dot.to_string(), size: 0, is_dir: true }).collect();
+        entries.splice(0..0, dots);
+    }
     if entries.is_empty() {
         return INVALID_HANDLE_VALUE;
     }
