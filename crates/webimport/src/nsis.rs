@@ -105,7 +105,9 @@ const LEXT: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3,
 const DBASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
 const DEXT: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 
-fn codes(b: &mut Bits, out: &mut Vec<u8>, lens: &Huff, dists: &Huff) -> Result<(), String> {
+/// Deflate64 (zip method 9): length code 285 takes 16 extra bits from 3, and distance
+/// codes 30 and 31 reach 64 KB back.
+fn codes(b: &mut Bits, out: &mut Vec<u8>, lens: &Huff, dists: &Huff, d64: bool) -> Result<(), String> {
     loop {
         let sym = lens.decode(b)? as usize;
         if sym < 256 {
@@ -117,12 +119,13 @@ fn codes(b: &mut Bits, out: &mut Vec<u8>, lens: &Huff, dists: &Huff) -> Result<(
             if k >= 29 {
                 return Err("bad length code".into());
             }
-            let len = LBASE[k] as usize + b.need(LEXT[k] as u32)? as usize;
+            let len = if d64 && k == 28 { 3 + b.need(16)? as usize } else { LBASE[k] as usize + b.need(LEXT[k] as u32)? as usize };
             let d = dists.decode(b)? as usize;
-            if d >= 30 {
-                return Err("bad distance code".into());
-            }
-            let dist = DBASE[d] as usize + b.need(DEXT[d] as u32)? as usize;
+            let dist = match d {
+                0..30 => DBASE[d] as usize + b.need(DEXT[d] as u32)? as usize,
+                30 | 31 if d64 => [32769, 49153][d - 30] + b.need(14)? as usize,
+                _ => return Err("bad distance code".into()),
+            };
             if dist > out.len() {
                 return Err("distance too far back".into());
             }
@@ -136,6 +139,11 @@ fn codes(b: &mut Bits, out: &mut Vec<u8>, lens: &Huff, dists: &Huff) -> Result<(
 }
 
 fn inflate(d: &[u8]) -> Result<Vec<u8>, String> {
+    inflate_with(d, true, false)
+}
+
+/// A deflate stream as NSIS writes it (`nsis`: stored blocks without NLEN), or Deflate64.
+pub(crate) fn inflate_with(d: &[u8], nsis: bool, d64: bool) -> Result<Vec<u8>, String> {
     let mut b = Bits { d, pos: 0, buf: 0, cnt: 0 };
     let mut out = Vec::new();
     loop {
@@ -146,6 +154,9 @@ fn inflate(d: &[u8]) -> Result<Vec<u8>, String> {
                 b.buf = 0;
                 b.cnt = 0;
                 let len = b.need(16)? as usize;
+                if !nsis {
+                    b.need(16)?;
+                }
                 let src = d.get(b.pos..b.pos + len).ok_or("stored block runs past the end")?;
                 out.extend_from_slice(src);
                 b.pos += len;
@@ -156,7 +167,7 @@ fn inflate(d: &[u8]) -> Result<Vec<u8>, String> {
                 l[144..256].fill(9);
                 l[256..280].fill(7);
                 l[280..].fill(8);
-                codes(&mut b, &mut out, &Huff::new(&l), &Huff::new(&[5u8; 30]))?;
+                codes(&mut b, &mut out, &Huff::new(&l), &Huff::new(&[5u8; 32]), d64)?;
             }
             2 => {
                 let nlen = b.need(5)? as usize + 257;
@@ -184,7 +195,7 @@ fn inflate(d: &[u8]) -> Result<Vec<u8>, String> {
                     lengths[i..i + rep].fill(val);
                     i += rep;
                 }
-                codes(&mut b, &mut out, &Huff::new(&lengths[..nlen]), &Huff::new(&lengths[nlen..]))?;
+                codes(&mut b, &mut out, &Huff::new(&lengths[..nlen]), &Huff::new(&lengths[nlen..]), d64)?;
             }
             _ => return Err("bad deflate block type".into()),
         }

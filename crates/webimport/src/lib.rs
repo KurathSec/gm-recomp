@@ -138,6 +138,7 @@ pub fn read_zip(z: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String> {
                 flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).map_err(|e| format!("{name}: {e}"))?;
                 v
             }
+            9 => nsis::inflate_with(raw, false, true).map_err(|e| format!("{name}: Deflate64: {e}"))?,
             m => return Err(format!("{name}: compression method {m} is not supported")),
         };
         out.push((parts, false, data));
