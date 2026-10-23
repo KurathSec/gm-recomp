@@ -385,6 +385,10 @@ pub fn run(opts: RunOpts) -> Result<()> {
     cfg.wasm_simd(true);
     cfg.wasm_bulk_memory(true);
     cfg.wasm_multi_value(true);
+    // (guest recursion takes wasm stack: a GameMaker 8.1 game's deep script recursion,
+    // which runs in the browser, overflowed wasmtime's 512 KB)
+    cfg.async_stack_size(8 << 20);
+    cfg.max_wasm_stack(4 << 20);
     if let Ok(cache) = wasmtime::Cache::from_file(None) {
         cfg.cache(Some(cache));
     }
