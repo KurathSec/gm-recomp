@@ -227,6 +227,14 @@ export class D3DGL {
     const gl = canvas.getContext('webgl2', GL_OPTIONS);
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
+    // which GPU draws (a software renderer explains a slow game); Firefox names it
+    // in RENDERER, Chrome only through the debug extension
+    let renderer = gl.getParameter(gl.RENDERER);
+    if (/^WebKit/.test(renderer)) {
+      const info = gl.getExtension('WEBGL_debug_renderer_info');
+      if (info) renderer = gl.getParameter(info.UNMASKED_RENDERER_WEBGL);
+    }
+    print(`WebGL renderer: ${renderer}`);
     const p = gl.createProgram();
     gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VS));
     gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, FS));
