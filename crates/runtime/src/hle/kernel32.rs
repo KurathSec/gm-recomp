@@ -454,6 +454,68 @@ pub fn register(r: &mut Registry) {
     r.add(k, "SetThreadLocale", |_c| ok(1, 1));
     r.add(k, "GetUserDefaultUILanguage", |_c| ok(0, 0x0409));
     r.add(k, "GetSystemDefaultUILanguage", |_c| ok(0, 0x0409));
+    // (flags, count out, buffer, its length in chars): one language, en-US (MUI_LANGUAGE_ID
+    // 4: "0409"), as a list ending in two NULs; no buffer asks for the length
+    for name in ["GetThreadPreferredUILanguages", "GetUserPreferredUILanguages", "GetSystemPreferredUILanguages", "GetProcessPreferredUILanguages"] {
+        r.add_on_demand(k, name, |c| {
+            let (flags, count, buf, len) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+            let list: Vec<u16> = if flags & 4 != 0 { "0409" } else { "en-US" }.encode_utf16().chain([0, 0]).collect();
+            let have = c.host.read_u32(len).unwrap_or(0);
+            let _ = c.host.write_u32(count, 1);
+            let _ = c.host.write_u32(len, list.len() as u32);
+            if buf != 0 {
+                if (have as usize) < list.len() {
+                    c.set_last_error(ERROR_INSUFFICIENT_BUFFER);
+                    return ok(4, 0);
+                }
+                for (i, &u) in list.iter().enumerate() {
+                    let _ = c.host.write_u16(buf + 2 * i as u32, u);
+                }
+            }
+            ok(4, 1)
+        });
+    }
+    r.add_on_demand(k, "SetThreadPreferredUILanguages", |_c| ok(3, 1));
+    // Activation contexts (side-by-side assemblies): none apply here; one created is a
+    // handle that changes nothing, and lookups find nothing.
+    for name in ["CreateActCtxA", "CreateActCtxW"] {
+        r.add_on_demand(k, name, |c| {
+            let h = c.p.new_handle(Handle::Dummy("activation context"));
+            ok(1, h)
+        });
+    }
+    r.add_on_demand(k, "ActivateActCtx", |c| {
+        write_out(c, c.arg(1), 1);
+        ok(2, 1)
+    });
+    r.add_on_demand(k, "DeactivateActCtx", |_c| ok(2, 1));
+    r.add_on_demand(k, "ReleaseActCtx", |_c| ok(1, 0));
+    r.add_on_demand(k, "AddRefActCtx", |_c| ok(1, 0));
+    r.add_on_demand(k, "ZombifyActCtx", |_c| ok(1, 1));
+    r.add_on_demand(k, "GetCurrentActCtx", |c| {
+        write_out(c, c.arg(0), 0);
+        ok(1, 1)
+    });
+    // (flags, context, sub-instance, class, buffer, its size, size needed): all zeros
+    r.add_on_demand(k, "QueryActCtxW", |c| {
+        let (buf, size, needed) = (c.arg(4), c.arg(5), c.arg(6));
+        let want = if c.x64() { 16 } else { 8 };
+        if needed != 0 {
+            write_out(c, needed, want);
+        }
+        if buf == 0 || size < want {
+            c.set_last_error(ERROR_INSUFFICIENT_BUFFER);
+            return ok(7, 0);
+        }
+        let _ = c.host.fill(buf, size, 0);
+        ok(7, 1)
+    });
+    for name in ["FindActCtxSectionStringA", "FindActCtxSectionStringW"] {
+        r.add_on_demand(k, name, |c| {
+            c.set_last_error(14007); // ERROR_SXS_KEY_NOT_FOUND
+            ok(5, 0)
+        });
+    }
     r.add(k, "GetACP", |_c| ok(0, 1252));
     r.add(k, "GetOEMCP", |_c| ok(0, 437));
     r.add(k, "GetCPInfo", |c| {
@@ -3663,39 +3725,8 @@ pub fn register_extra(r: &mut Registry) {
         }
         Ok(Ret { edx: Some((mask >> 32) as u32), ..Ret::stdcall(4, mask as u32) })
     });
-    // VerifyVersionInfoW(info, type, mask): against GetVersionExA's XP SP3; major, minor
-    // and service pack compare as one version under the major's condition
-    r.add_on_demand(k, "VerifyVersionInfoW", |c| {
-        let (info, ty) = (c.arg(0), c.arg(1));
-        let mask = if c.x64() { c.arg64(2) } else { c.arg(2) as u64 | (c.arg(3) as u64) << 32 };
-        let rd = |c: &mut Ctx, o: u32| c.host.read_u32(info + o).unwrap_or(0);
-        let want = [rd(c, 4), rd(c, 8), rd(c, 276) & 0xFFFF, rd(c, 276) >> 16];
-        let have = [5u32, 1, 3, 0];
-        let cond_of = |bit: u32| ((mask >> (3 * bit)) & 7) as u32;
-        let test = |cond: u32, o: std::cmp::Ordering| match cond {
-            1 => o.is_eq(),
-            2 => o.is_gt(),
-            3 => o.is_ge(),
-            4 => o.is_lt(),
-            5 => o.is_le(),
-            _ => true,
-        };
-        // VER_MINORVERSION 1, VER_MAJORVERSION 2, VER_SERVICEPACKMINOR 0x10, VER_SERVICEPACKMAJOR 0x20
-        let parts: Vec<usize> = [(2u32, 0usize), (1, 1), (0x20, 2), (0x10, 3)].iter().filter(|(b, _)| ty & b != 0).map(|&(_, i)| i).collect();
-        let lead = [2u32, 1, 0x20, 0x10].into_iter().find(|b| ty & b != 0).map(|b| cond_of(b.trailing_zeros())).unwrap_or(0);
-        let ord = parts.iter().map(|&i| have[i].cmp(&want[i])).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal);
-        let mut pass = parts.is_empty() || test(lead, ord);
-        if ty & 4 != 0 {
-            pass &= test(cond_of(2), 2600.cmp(&rd(c, 12)));
-        }
-        if ty & 8 != 0 {
-            pass &= test(cond_of(3), 2u32.cmp(&rd(c, 16)));
-        }
-        if !pass {
-            c.set_last_error(1150); // ERROR_OLD_WIN_VERSION
-        }
-        ok(4, pass as u32)
-    });
+    r.add_on_demand(k, "VerifyVersionInfoW", |c| verify_version_info(c, 276));
+    r.add_on_demand(k, "VerifyVersionInfoA", |c| verify_version_info(c, 148));
     r.add_on_demand("ole32.dll", "PropVariantClear", |c| {
         let _ = c.host.write(c.arg(0), &[0u8; 16]);
         ok(1, 0)
@@ -3751,4 +3782,39 @@ fn temp_file_name(c: &mut Ctx, dir: &str, prefix: &str, unique: u32) -> (String,
         }
         n = (n % 0xFFFF) + 1;
     }
+}
+
+/// VerifyVersionInfoA/W(info, type, mask), `sp_at` the offset of wServicePackMajor in
+/// their OSVERSIONINFOEX: against GetVersionExA's XP SP3; major, minor and service pack
+/// compare as one version under the major's condition.
+fn verify_version_info(c: &mut Ctx, sp_at: u32) -> ApiResult {
+    let (info, ty) = (c.arg(0), c.arg(1));
+    let mask = if c.x64() { c.arg64(2) } else { c.arg(2) as u64 | (c.arg(3) as u64) << 32 };
+    let rd = |c: &mut Ctx, o: u32| c.host.read_u32(info + o).unwrap_or(0);
+    let want = [rd(c, 4), rd(c, 8), rd(c, sp_at) & 0xFFFF, rd(c, sp_at) >> 16];
+    let have = [5u32, 1, 3, 0];
+    let cond_of = |bit: u32| ((mask >> (3 * bit)) & 7) as u32;
+    let test = |cond: u32, o: std::cmp::Ordering| match cond {
+        1 => o.is_eq(),
+        2 => o.is_gt(),
+        3 => o.is_ge(),
+        4 => o.is_lt(),
+        5 => o.is_le(),
+        _ => true,
+    };
+    // VER_MINORVERSION 1, VER_MAJORVERSION 2, VER_SERVICEPACKMINOR 0x10, VER_SERVICEPACKMAJOR 0x20
+    let parts: Vec<usize> = [(2u32, 0usize), (1, 1), (0x20, 2), (0x10, 3)].iter().filter(|(b, _)| ty & b != 0).map(|&(_, i)| i).collect();
+    let lead = [2u32, 1, 0x20, 0x10].into_iter().find(|b| ty & b != 0).map(|b| cond_of(b.trailing_zeros())).unwrap_or(0);
+    let ord = parts.iter().map(|&i| have[i].cmp(&want[i])).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal);
+    let mut pass = parts.is_empty() || test(lead, ord);
+    if ty & 4 != 0 {
+        pass &= test(cond_of(2), 2600.cmp(&rd(c, 12)));
+    }
+    if ty & 8 != 0 {
+        pass &= test(cond_of(3), 2u32.cmp(&rd(c, 16)));
+    }
+    if !pass {
+        c.set_last_error(1150); // ERROR_OLD_WIN_VERSION
+    }
+    ok(4, pass as u32)
 }
