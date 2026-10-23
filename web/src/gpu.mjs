@@ -156,6 +156,8 @@ function mul(a, b) {
 
 /** Converts D3D texel data to RGBA8. */
 function toRGBA(fmt, src, w, h, pitch) {
+  // A8B8G8R8 (Direct3D 11's R8G8B8A8, GameMaker Studio 2's texture pages) is RGBA already
+  if (fmt === 32 && pitch === w * 4) return src.slice(0, w * h * 4);
   const out = new Uint8Array(w * h * 4);
   // A8R8G8B8 and X8R8G8B8, nearly every texture: a pixel per word, B and R swapped
   if ((fmt === 21 || fmt === 22) && src.byteOffset % 4 === 0 && pitch % 4 === 0) {
@@ -195,6 +197,10 @@ function toRGBA(fmt, src, w, h, pitch) {
           out[d] = ((v >> 8) & 15) * 17; out[d + 1] = ((v >> 4) & 15) * 17; out[d + 2] = (v & 15) * 17;
           out[d + 3] = fmt === 26 ? ((v >> 12) & 15) * 17 : 255; break;
         }
+        case 32: // A8B8G8R8 (Direct3D 11's R8G8B8A8): R G B A in memory
+          out[d] = src[s]; out[d + 1] = src[s + 1]; out[d + 2] = src[s + 2]; out[d + 3] = src[s + 3]; s += 4; break;
+        case 33: // X8B8G8R8
+          out[d] = src[s]; out[d + 1] = src[s + 1]; out[d + 2] = src[s + 2]; out[d + 3] = 255; s += 4; break;
         case 28: // A8
           out[d] = out[d + 1] = out[d + 2] = 0; out[d + 3] = src[s]; s += 1; break;
         case 50: // L8

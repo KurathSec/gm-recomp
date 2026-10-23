@@ -18,6 +18,8 @@ pub enum Engine {
         data_file: String,
         /// Shader resources (compiled at run time by d3dcompiler).
         shaders: u32,
+        /// The runner is a 64-bit exe (GameMaker Studio 2's later ones).
+        x64: bool,
     },
     Unknown,
 }
@@ -40,7 +42,7 @@ pub fn detect(exe: &[u8], game_dir: &Path) -> Engine {
     }
     for name in ["data.win", "game.win"] {
         if let Ok(d) = std::fs::read(game_dir.join(name)) {
-            if let Some(e) = parse_gms_form(&d, name) {
+            if let Some(e) = parse_gms_form(&d, name, pe64(exe)) {
                 return e;
             }
         }
@@ -49,7 +51,7 @@ pub fn detect(exe: &[u8], game_dir: &Path) -> Engine {
     let mut from = 0;
     while let Some(pos) = find(&exe[from..], b"FORM").map(|p| p + from) {
         if exe.get(pos + 8..pos + 12) == Some(b"GEN8") {
-            if let Some(e) = parse_gms_form(&exe[pos..], &format!("embedded@{pos}")) {
+            if let Some(e) = parse_gms_form(&exe[pos..], &format!("embedded@{pos}"), pe64(exe)) {
                 return e;
             }
         }
@@ -62,7 +64,13 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn parse_gms_form(d: &[u8], name: &str) -> Option<Engine> {
+/// A PE32+ (64-bit) image: optional header magic 0x20b.
+pub fn pe64(exe: &[u8]) -> bool {
+    let Some(pe) = u32_at(exe, 0x3c) else { return false };
+    exe.get(pe as usize..pe as usize + 4) == Some(b"PE\0\0") && exe.get(pe as usize + 24..pe as usize + 26) == Some(&[0x0b, 0x02][..])
+}
+
+fn parse_gms_form(d: &[u8], name: &str, x64: bool) -> Option<Engine> {
     if d.get(0..4) != Some(b"FORM") {
         return None;
     }
@@ -86,5 +94,6 @@ fn parse_gms_form(d: &[u8], name: &str) -> Option<Engine> {
         yyc: code_size.unwrap_or(0) == 0,
         data_file: name.to_owned(),
         shaders,
+        x64,
     })
 }

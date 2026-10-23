@@ -5,8 +5,10 @@
 pub mod audio;
 pub mod com;
 pub mod d3d8;
+pub mod d3d11;
 pub mod d3d9;
 pub mod d3d9_shader;
+pub mod dxbc;
 pub mod dinput;
 pub mod dmusic;
 pub mod dsound;
@@ -352,6 +354,7 @@ impl Registry {
         kernel32::register_more(&mut r);
         kernel32::register_paths(&mut r);
         kernel32::register_extra(&mut r);
+        d3d11::register(&mut r);
         for (dll, name) in [
             ("kernel32.dll", "QueryPerformanceCounter"),
             ("kernel32.dll", "QueryPerformanceFrequency"),

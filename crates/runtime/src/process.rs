@@ -353,6 +353,7 @@ pub struct Process {
     pub d3d: crate::hle::gpu::DeviceState,
     /// Direct3D 9 device state, and the state blocks' snapshots.
     pub d3d9: Box<crate::hle::d3d9::State9>,
+    pub d3d11: Box<crate::hle::d3d11::State11>,
     pub d3d9_blocks: HashMap<u32, Box<crate::hle::d3d9::State9>>,
     pub gpu: Box<dyn crate::hle::gpu::Gpu>,
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
@@ -510,6 +511,7 @@ impl Process {
             d3d_objects: HashMap::default(),
             d3d: Default::default(),
             d3d9: Default::default(),
+            d3d11: Default::default(),
             d3d9_blocks: HashMap::default(),
             gpu: Box::new(crate::hle::gpu::NullGpu),
             sound_buffers: BTreeMap::new(),

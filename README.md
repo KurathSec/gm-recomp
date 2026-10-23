@@ -40,8 +40,11 @@ Every game in the test corpus reaches a playable state in Chrome and Firefox:
 | I Wanna be the Vandal | GMS 1.4 VM | held out until the end: title, save select, new game, out of the box |
 | I wanna Bread | GM 8.1 (Release Candidate runner) | held out until the end: title, data select, the hub room, out of the box |
 
-GameMaker Studio 2 games do not run yet. Most of them use 64-bit runners, and their
-graphics go through Direct3D 11; neither is implemented.
+GameMaker Studio 2 games with a 32-bit runner start: Direct3D 11 and DXGI are emulated
+(`crates/runtime/src/hle/d3d11.rs`), with their DXBC shaders translated to GLSL
+(`hle/dxbc.rs`). Three of the archive's (I wanna cat addiction, I wanna Dodge The
+Bullets, Night Guy) show their title screens in Chrome. Most GameMaker Studio 2 games
+use a 64-bit runner, which is not supported yet (the importer marks them `"x64": true`).
 
 ## Getting started
 

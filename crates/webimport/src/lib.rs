@@ -437,7 +437,7 @@ impl Game {
         }
         let dir = entry.rsplit_once('/').map_or(String::new(), |(d, _)| format!("{d}/"));
         for name in ["data.win", "game.win"] {
-            if let Some(e) = self.find(&format!("{dir}{name}")).and_then(|(_, d)| gms_form(d, name)) {
+            if let Some(e) = self.find(&format!("{dir}{name}")).and_then(|(_, d)| gms_form(d, name, pe64(exe))) {
                 return e;
             }
         }
@@ -445,7 +445,7 @@ impl Game {
         let mut from = 0;
         while let Some(pos) = exe[from..].windows(4).position(|w| w == b"FORM").map(|p| p + from) {
             if exe.get(pos + 8..pos + 12) == Some(b"GEN8") {
-                if let Some(e) = gms_form(&exe[pos..], &format!("embedded@{pos}")) {
+                if let Some(e) = gms_form(&exe[pos..], &format!("embedded@{pos}"), pe64(exe)) {
                     return e;
                 }
             }
@@ -511,7 +511,13 @@ fn u32_at(d: &[u8], off: usize) -> Option<u32> {
     d.get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
-fn gms_form(d: &[u8], name: &str) -> Option<Value> {
+/// A PE32+ (64-bit) image: optional header magic 0x20b.
+fn pe64(exe: &[u8]) -> bool {
+    let Some(pe) = u32_at(exe, 0x3c) else { return false };
+    exe.get(pe as usize..pe as usize + 4) == Some(b"PE\0\0") && exe.get(pe as usize + 24..pe as usize + 26) == Some(&[0x0b, 0x02][..])
+}
+
+fn gms_form(d: &[u8], name: &str, x64: bool) -> Option<Value> {
     if d.get(0..4) != Some(b"FORM") {
         return None;
     }
@@ -536,6 +542,7 @@ fn gms_form(d: &[u8], name: &str) -> Option<Value> {
         "yyc": code_size.unwrap_or(0) == 0,
         "data_file": name,
         "shaders": shaders,
+        "x64": x64,
     }))
 }
 
