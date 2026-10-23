@@ -4,4 +4,4 @@
 
 pub mod discover;
 
-pub use discover::{Discovery, Function, JumpTable, RootKind, discover};
+pub use discover::{Discovery, Function, JumpTable, RootKind, Switch64, discover, switch64};

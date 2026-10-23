@@ -19,6 +19,39 @@ pub struct FuncInfo<'a> {
     /// The function table index of a function translated already: calls to it need
     /// not look it up.
     pub translated: &'a dyn Fn(u32) -> Option<u32>,
+    /// 64-bit code: the upper half of its addresses. It is decoded at `high << 32 |
+    /// address`, so RIP-relative operands and pushed return addresses are the real
+    /// 64-bit values; blocks and functions are keyed by the low half (docs/x64.md).
+    pub high: u32,
+}
+
+/// How code is decoded: 32-bit, or 64-bit with the upper half of its addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bits {
+    B32,
+    B64 { high: u32 },
+}
+
+impl Bits {
+    pub fn decoder_bits(self) -> u32 {
+        match self {
+            Bits::B32 => 32,
+            Bits::B64 { .. } => 64,
+        }
+    }
+
+    /// The instruction pointer of the code at (low) address `addr`.
+    pub fn ip(self, addr: u32) -> u64 {
+        match self {
+            Bits::B32 => addr as u64,
+            Bits::B64 { high } => (high as u64) << 32 | addr as u64,
+        }
+    }
+}
+
+/// A direct (relative) branch or call: its target is `near_branch_target`.
+pub fn is_near(i: &Instruction) -> bool {
+    matches!(i.op0_kind(), OpKind::NearBranch32 | OpKind::NearBranch64)
 }
 
 #[derive(Debug, Clone)]
@@ -108,24 +141,24 @@ const MAX_INSTRS_PER_FUNCTION: usize = 200_000;
 pub type InlineCache = std::cell::RefCell<HashMap<(u32, u8), Option<std::rc::Rc<Cfg>>>>;
 
 /// The function at `entry`, with small callees inlined when `inline`.
-pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, inline: bool, cache: &InlineCache) -> Result<Cfg, String> {
-    build_with(mem, entry, info, if inline { INLINE_DEPTH } else { 0 }, cache)
+pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, inline: bool, cache: &InlineCache, bits: Bits) -> Result<Cfg, String> {
+    build_with(mem, entry, info, if inline { INLINE_DEPTH } else { 0 }, cache, bits)
 }
 
 /// The callee at `target` as blocks to inline, if it is small: a few instructions
 /// within 4 KiB after its entry, leaving by `ret` or direct jumps to functions (no
 /// jump tables or computed jumps; calls are fine).
-fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache) -> Option<std::rc::Rc<Cfg>> {
+fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache, bits: Bits) -> Option<std::rc::Rc<Cfg>> {
     if let Some(c) = cache.borrow().get(&(target, depth)) {
         return c.clone();
     }
-    let c = inlinable_uncached(mem, target, info, depth, cache).map(std::rc::Rc::new);
+    let c = inlinable_uncached(mem, target, info, depth, cache, bits).map(std::rc::Rc::new);
     cache.borrow_mut().insert((target, depth), c.clone());
     c
 }
 
-fn inlinable_uncached(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache) -> Option<Cfg> {
-    let c = build_with(mem, target, info, depth, cache).ok()?;
+fn inlinable_uncached(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache, bits: Bits) -> Option<Cfg> {
+    let c = build_with(mem, target, info, depth, cache, bits).ok()?;
     let n: usize = c.blocks.values().map(|b| b.instrs.len()).sum();
     let simple = n <= MAX_INLINE_INSTRS
         && c.ret_targets.is_empty()
@@ -140,7 +173,7 @@ fn inlinable_uncached(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u
     simple.then_some(c)
 }
 
-fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache: &InlineCache) -> Result<Cfg, String> {
+fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache: &InlineCache, bits: Bits) -> Result<Cfg, String> {
     let inline = depth > 0;
     let mut sites = 0u32;
     let mut next_key = INLINE_KEYS;
@@ -189,7 +222,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                 term = Term::Bad(ip);
                 break;
             }
-            let mut decoder = Decoder::with_ip(32, &buf[..n], ip as u64, DecoderOptions::NONE);
+            let mut decoder = Decoder::with_ip(bits.decoder_bits(), &buf[..n], bits.ip(ip), DecoderOptions::NONE);
             let instr = decoder.decode();
             if instr.is_invalid() {
                 term = Term::Bad(ip);
@@ -237,7 +270,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                 zero_run = 0;
             }
             match instr.flow_control() {
-                FlowControl::Call if instr.op0_kind() == OpKind::NearBranch32 && pops_return_address(mem, instr.near_branch_target() as u32, next) => {
+                FlowControl::Call if is_near(&instr) && pops_return_address(mem, instr.near_branch_target() as u32, next) => {
                     // `call x` where x starts with `pop r32` (Delphi MakeObjectInstance and
                     // similar thunks): the bytes after the call are data the callee consumes.
                     term = Term::Bad(next);
@@ -245,9 +278,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                 FlowControl::Call
                     if inline
                         && sites < MAX_INLINE_SITES
-                        && instr.op0_kind() == OpKind::NearBranch32
+                        && is_near(&instr)
                         && instr.near_branch_target() as u32 != entry
-                        && let Some(callee) = inlinable(mem, instr.near_branch_target() as u32, info, depth - 1, cache)
+                        && let Some(callee) = inlinable(mem, instr.near_branch_target() as u32, info, depth - 1, cache, bits)
                         && callee.blocks.values().map(|b| b.instrs.len()).sum::<usize>() <= budget =>
                 {
                     budget -= callee.blocks.values().map(|b| b.instrs.len()).sum::<usize>();
@@ -267,7 +300,7 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                             Term::Jump(a) => Term::Jump(key(a)),
                             Term::Cond { taken, next: n } => Term::Cond { taken: key(taken), next: key(n) },
                             Term::TailCall(t) => {
-                                call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t));
+                                call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t, bits));
                                 if let Some(i) = (info.translated)(t) {
                                     known.insert(t, i);
                                 }
@@ -287,9 +320,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                     term = Term::InlineCall { entry: key(target) };
                 }
                 FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
-                    if instr.flow_control() == FlowControl::Call && instr.op0_kind() == OpKind::NearBranch32 {
+                    if instr.flow_control() == FlowControl::Call && is_near(&instr) {
                         let t = instr.near_branch_target() as u32;
-                        call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t));
+                        call_flags.entry(t).or_insert_with(|| entry_flag_reads(mem, t, bits));
                         if let Some(i) = (info.translated)(t) {
                             known.insert(t, i);
                         }
@@ -335,12 +368,12 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
 /// The flags the code at `entry` reads before writing them, following its first
 /// instructions (straight on and through direct jumps); everything not yet written
 /// when the path branches or ends there.
-pub fn entry_flag_reads(mem: &dyn GuestMem, entry: u32) -> u8 {
+pub fn entry_flag_reads(mem: &dyn GuestMem, entry: u32, bits: Bits) -> u8 {
     let (mut ip, mut written, mut reads) = (entry, 0u8, 0u8);
     let mut buf = [0u8; 16];
     for _ in 0..24 {
         let n = (0..16).rev().find(|&n| mem.read(ip, &mut buf[..n])).unwrap_or(0);
-        let instr = Decoder::with_ip(32, &buf[..n], ip as u64, DecoderOptions::NONE).decode();
+        let instr = Decoder::with_ip(bits.decoder_bits(), &buf[..n], bits.ip(ip), DecoderOptions::NONE).decode();
         if n == 0 || instr.is_invalid() {
             break;
         }
@@ -352,7 +385,7 @@ pub fn entry_flag_reads(mem: &dyn GuestMem, entry: u32) -> u8 {
         }
         match instr.flow_control() {
             FlowControl::Next => ip = instr.next_ip() as u32,
-            FlowControl::UnconditionalBranch if instr.op0_kind() == OpKind::NearBranch32 => ip = instr.near_branch_target() as u32,
+            FlowControl::UnconditionalBranch if is_near(&instr) => ip = instr.near_branch_target() as u32,
             _ => break,
         }
     }

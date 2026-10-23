@@ -1,4 +1,5 @@
-//! x86 (32-bit) to WebAssembly static recompiler.
+//! x86 to WebAssembly static recompiler: 32-bit code, and x86-64 code in modules of
+//! its own (`Options::x64`, docs/x64.md).
 
 pub mod abi;
 pub mod cfg;
@@ -6,6 +7,7 @@ pub mod fasthash;
 pub mod flags;
 pub mod layout;
 pub mod lift;
+pub mod lift64;
 pub mod sse;
 pub mod x87;
 
@@ -38,6 +40,9 @@ pub struct Options {
     pub count_blocks: bool,
     /// Do not inline small leaf callees (checking the inlining).
     pub no_inline: bool,
+    /// Translate x86-64 code: every function of the module is 64-bit (`types::FUNC64`),
+    /// decoded at `FuncInfo::high << 32 | address`.
+    pub x64: bool,
 }
 
 /// A function body larger than this is emitted again without inline x87 (the limit
@@ -81,7 +86,8 @@ impl<'m> Translator<'m> {
         if self.cfgs.contains_key(&entry) {
             return Ok(());
         }
-        let cfg = cfg::build(self.mem, entry, info, !self.opts.no_inline, &self.cache)?;
+        let bits = if self.opts.x64 { cfg::Bits::B64 { high: info.high } } else { cfg::Bits::B32 };
+        let cfg = cfg::build(self.mem, entry, info, !self.opts.no_inline, &self.cache, bits)?;
         self.cfgs.insert(entry, cfg);
         Ok(())
     }
@@ -133,7 +139,7 @@ impl<'m> Translator<'m> {
         let mut out = Vec::new();
         for b in cfg.blocks.values() {
             for i in &b.instrs {
-                if i.flow_control() == iced_x86::FlowControl::Call && i.op0_kind() == iced_x86::OpKind::NearBranch32 {
+                if i.flow_control() == iced_x86::FlowControl::Call && cfg::is_near(i) {
                     out.push(i.near_branch_target() as u32);
                 }
             }
@@ -153,8 +159,10 @@ impl<'m> Translator<'m> {
     }
 
     pub fn finish(mut self) -> Output {
-        // Imported functions: the runtime services, then every x87 fast path.
-        let n_rt = (RT_FUNCS.len() + x87::FORMS.len()) as u32;
+        // Imported functions: the runtime services, then every x87 fast path (64-bit
+        // code has no x87: none there).
+        let x64 = self.opts.x64;
+        let n_rt = (RT_FUNCS.len() + if x64 { 0 } else { x87::FORMS.len() }) as u32;
         let func_index: HashMap<u32, u32> = self.cfgs.keys().enumerate().map(|(i, &e)| (e, n_rt + i as u32)).collect();
 
         let mut types = TypeSection::new();
@@ -166,6 +174,9 @@ impl<'m> Translator<'m> {
         let (p, r) = x87::form_type();
         types.ty().function(p, r); // X87
         types.ty().function([], []); // VOID
+        if x64 {
+            types.ty().function([ValType::I64; 16], [ValType::I64; 16]); // FUNC64
+        }
 
         let mut imports = ImportSection::new();
         imports.import(
@@ -184,7 +195,8 @@ impl<'m> Translator<'m> {
             abi::TABLE_NAME,
             EntityType::Table(TableType { element_type: RefType::FUNCREF, table64: false, minimum: 0, maximum: None, shared: false }),
         );
-        for (_, name, ty) in GLOBALS {
+        let globals = if x64 { &GLOBALS[..] } else { &GLOBALS[..abi::GLOBALS32] };
+        for &(_, name, ty) in globals {
             imports.import(abi::CPU_MODULE, name, EntityType::Global(GlobalType { val_type: ty, mutable: true, shared: false }));
         }
         for (f, name) in RT_FUNCS {
@@ -196,7 +208,7 @@ impl<'m> Translator<'m> {
             };
             imports.import(abi::RT_MODULE, name, EntityType::Function(ty));
         }
-        for k in 0..x87::FORMS.len() {
+        for k in 0..if x64 { 0 } else { x87::FORMS.len() } {
             imports.import(x87::MODULE, &x87::export_name(k), EntityType::Function(types::X87));
         }
 
@@ -206,9 +218,9 @@ impl<'m> Translator<'m> {
         let mut out_funcs = Vec::new();
         for (&entry, cfg) in &self.cfgs {
             let emit = |x87_inline: bool| {
-                let mut fe = lift::FuncEmit::new(cfg, &func_index);
+                let mut fe = if x64 { lift::FuncEmit::new64(cfg, &func_index) } else { lift::FuncEmit::new(cfg, &func_index) };
                 fe.probe = self.opts.probes.contains(&entry);
-                fe.x87_inline = x87_inline;
+                fe.x87_inline = x87_inline && !x64;
                 fe.resolve_cache = self.opts.resolve_cache;
                 fe.count = self.opts.count;
                 fe.count_blocks = self.opts.count_blocks;
@@ -223,7 +235,7 @@ impl<'m> Translator<'m> {
                 fe = emit(false);
             }
             self.unimplemented.extend(fe.unimplemented.drain(..));
-            functions.function(types::FUNC);
+            functions.function(if x64 { types::FUNC64 } else { types::FUNC });
             let name = abi::export_name(entry);
             exports.export(&name, ExportKind::Func, func_index[&entry]);
             code.function(&fe.f);

@@ -102,10 +102,10 @@ enum Label {
 
 pub struct FuncEmit<'a> {
     pub f: Function,
-    cfg: &'a Cfg,
+    pub(crate) cfg: &'a Cfg,
     /// Block start address -> position in `order` (the dispatch index).
     index: HashMap<u32, u32>,
-    order: Vec<u32>,
+    pub(crate) order: Vec<u32>,
     /// Loops nested over `order` (taken by `emit`).
     items: Vec<crate::layout::Item>,
     /// Labels open around the current block's code, outermost first.
@@ -115,7 +115,7 @@ pub struct FuncEmit<'a> {
     entry_flags: u8,
     /// Direct-call targets available in this module: entry -> wasm function index.
     func_index: &'a HashMap<u32, u32>,
-    pending: Option<(FlagOp, u8)>,
+    pub(crate) pending: Option<(FlagOp, u8)>,
     /// Report entry to the runtime (debugging).
     pub probe: bool,
     /// Call the `x87` module's fast paths before `rt.fpu`.
@@ -131,13 +131,19 @@ pub struct FuncEmit<'a> {
     pub count: bool,
     pub count_blocks: bool,
     /// Flags some later instruction (or a successor) will read after the current one.
-    needed: u8,
-    ip: u32,
-    next_ip: u32,
+    pub(crate) needed: u8,
+    pub(crate) ip: u32,
+    pub(crate) next_ip: u32,
     /// Nesting depth of `if`/`block` constructs opened inside the current block's code.
-    depth: u32,
-    cur_block: usize,
+    pub(crate) depth: u32,
+    pub(crate) cur_block: usize,
     pub unimplemented: Vec<(u32, String)>,
+    /// x86-64 code (`lift64.rs`): the registers are sixteen i64 parameters, and the
+    /// locals above (`L_FLAG` on) sit `lbase` further on.
+    pub(crate) x64: bool,
+    pub(crate) lbase: u32,
+    /// The full address of the next instruction (64-bit code pushes it).
+    pub(crate) next_ip64: u64,
 }
 
 impl<'a> FuncEmit<'a> {
@@ -175,7 +181,19 @@ impl<'a> FuncEmit<'a> {
             depth: 0,
             cur_block: 0,
             unimplemented: Vec::new(),
+            x64: false,
+            lbase: 0,
+            next_ip64: 0,
         }
+    }
+
+    /// A 64-bit function (`types::FUNC64`).
+    pub fn new64(cfg: &'a Cfg, func_index: &'a HashMap<u32, u32>) -> Self {
+        let mut fe = Self::new(cfg, func_index);
+        fe.f = Function::new(crate::lift64::locals64());
+        fe.x64 = true;
+        fe.lbase = crate::lift64::LBASE64;
+        fe
     }
 
     pub(crate) fn i(&mut self, ins: W) {
@@ -189,15 +207,43 @@ impl<'a> FuncEmit<'a> {
     }
 
     pub(crate) fn get(&mut self, l: u32) {
-        self.f.instructions().local_get(l);
+        self.f.instructions().local_get(l + self.lbase);
     }
 
     pub(crate) fn set(&mut self, l: u32) {
-        self.f.instructions().local_set(l);
+        self.f.instructions().local_set(l + self.lbase);
     }
 
     pub(crate) fn tee(&mut self, l: u32) {
+        self.f.instructions().local_tee(l + self.lbase);
+    }
+
+    /// Local `l` itself (64-bit code's registers and `lift64::X_*`), not moved by `lbase`.
+    pub(crate) fn lget(&mut self, l: u32) {
+        self.f.instructions().local_get(l);
+    }
+
+    pub(crate) fn lset(&mut self, l: u32) {
+        self.f.instructions().local_set(l);
+    }
+
+    pub(crate) fn ltee(&mut self, l: u32) {
         self.f.instructions().local_tee(l);
+    }
+
+    /// The type of translated functions in this module.
+    pub(crate) fn fty(&self) -> u32 {
+        if self.x64 { types::FUNC64 } else { types::FUNC }
+    }
+
+    /// Number of register parameters.
+    fn nregs(&self) -> u32 {
+        if self.x64 { 16 } else { 8 }
+    }
+
+    /// The global of register parameter `r`.
+    fn reg_global(&self, r: u32) -> u32 {
+        if self.x64 { Global::Rax as u32 + r } else { Global::Eax as u32 + r }
     }
 
     // ---- prologue / epilogue -------------------------------------------------
@@ -214,13 +260,13 @@ impl<'a> FuncEmit<'a> {
     }
 
     fn spill_regs(&mut self) {
-        for r in 0..8 {
-            self.get(L_REG + r);
-            self.i(W::GlobalSet(Global::Eax as u32 + r));
+        for r in 0..self.nregs() {
+            self.lget(L_REG + r);
+            self.i(W::GlobalSet(self.reg_global(r)));
         }
     }
 
-    fn spill_flags(&mut self) {
+    pub(crate) fn spill_flags(&mut self) {
         self.materialize(flags::ALL);
         for fl in 0..6 {
             self.get(L_FLAG + fl);
@@ -229,9 +275,9 @@ impl<'a> FuncEmit<'a> {
     }
 
     fn reload_regs(&mut self) {
-        for r in 0..8 {
-            self.i(W::GlobalGet(Global::Eax as u32 + r));
-            self.set(L_REG + r);
+        for r in 0..self.nregs() {
+            self.i(W::GlobalGet(self.reg_global(r)));
+            self.lset(L_REG + r);
         }
     }
 
@@ -255,29 +301,29 @@ impl<'a> FuncEmit<'a> {
 
     /// Pushes the registers: a call's arguments or the function's results.
     fn push_regs(&mut self) {
-        for r in 0..8 {
-            self.get(L_REG + r);
+        for r in 0..self.nregs() {
+            self.lget(L_REG + r);
         }
     }
 
     /// Returns the registers in the locals.
-    fn ret_regs(&mut self) {
+    pub(crate) fn ret_regs(&mut self) {
         self.push_regs();
         self.i(W::Return);
     }
 
     /// Returns the registers in the globals (the context the runtime holds).
     fn ret_globals(&mut self) {
-        for r in 0..8 {
-            self.i(W::GlobalGet(Global::Eax as u32 + r));
+        for r in 0..self.nregs() {
+            self.i(W::GlobalGet(self.reg_global(r)));
         }
         self.i(W::Return);
     }
 
     /// Takes a call's results into the register locals.
     fn pop_regs(&mut self) {
-        for r in (0..8).rev() {
-            self.set(L_REG + r);
+        for r in (0..self.nregs()).rev() {
+            self.lset(L_REG + r);
         }
     }
 
@@ -346,7 +392,7 @@ impl<'a> FuncEmit<'a> {
         }
     }
 
-    fn call_rt(&mut self, f: RtFunc) {
+    pub(crate) fn call_rt(&mut self, f: RtFunc) {
         self.i(W::Call(f as u32));
     }
 
@@ -402,6 +448,9 @@ impl<'a> FuncEmit<'a> {
 
     /// Pushes the register's value zero-extended to i32.
     pub(crate) fn read_reg(&mut self, r: Register) {
+        if self.x64 {
+            return self.read_reg32_x64(r);
+        }
         let l = Self::reg_local(r);
         self.get(l);
         match r.size() {
@@ -424,6 +473,9 @@ impl<'a> FuncEmit<'a> {
 
     /// Stores local `src` into the register, merging partial widths.
     pub(crate) fn write_reg_from(&mut self, r: Register, src: u32) {
+        if self.x64 {
+            return self.write_reg32_x64(r, src);
+        }
         let l = Self::reg_local(r);
         match r.size() {
             4 => {
@@ -463,6 +515,9 @@ impl<'a> FuncEmit<'a> {
 
     /// Pushes the effective address of the memory operand.
     pub(crate) fn addr(&mut self, instr: &Instruction) {
+        if self.x64 {
+            return self.addr_x64(instr);
+        }
         let mut terms = 0;
         if instr.memory_base() != Register::None {
             let b = instr.memory_base();
@@ -525,7 +580,7 @@ impl<'a> FuncEmit<'a> {
 
     /// An operand width the integer paths do not handle (far pointers, or data that
     /// speculative discovery decoded as code): trap if it is ever executed.
-    fn bad_width(&mut self, w: u8) {
+    pub(crate) fn bad_width(&mut self, w: u8) {
         self.unimplemented.push((self.ip, format!("operand width {w}")));
         self.trap(trap::UNIMPLEMENTED, self.ip);
         self.i(W::Unreachable);
@@ -621,11 +676,14 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// Pushes 0/1 for one lazily tracked flag.
-    fn flag(&mut self, fl: u8) {
+    pub(crate) fn flag(&mut self, fl: u8) {
         let Some((op, w)) = self.pending else {
             self.get(L_FLAG + fl.trailing_zeros());
             return;
         };
+        if self.x64 {
+            return self.flag_x64(fl, op, w);
+        }
         let w32 = w as u32;
         match fl {
             flags::ZF => {
@@ -815,20 +873,25 @@ impl<'a> FuncEmit<'a> {
 
     /// Records a lazily evaluated flag result. The operands must already be in
     /// L_FA / L_FB (/ L_FC) and the masked result in L_FR.
-    fn set_pending(&mut self, op: FlagOp, w: u8) {
+    pub(crate) fn set_pending(&mut self, op: FlagOp, w: u8) {
         self.pending = Some((op, w));
     }
 
-    fn set_flag_const(&mut self, fl: u8, v: u32) {
+    pub(crate) fn set_flag_const(&mut self, fl: u8, v: u32) {
         self.materialize(flags::ALL);
         self.c(v);
         self.set(L_FLAG + fl.trailing_zeros());
     }
 
     /// Pushes 0/1 for a condition code.
-    fn cond(&mut self, cc: ConditionCode) {
+    pub(crate) fn cond(&mut self, cc: ConditionCode) {
         use ConditionCode as CC;
-        if let Some((FlagOp::Sub, w)) = self.pending {
+        if self.x64 && self.cond_x64_fast(cc) {
+            return;
+        }
+        if let Some((FlagOp::Sub, w)) = self.pending
+            && !self.x64
+        {
             // Compare fast paths straight from the operands.
             let unsigned = |me: &mut Self, op: W<'static>| { me.get(L_FA); me.get(L_FB); me.i(op); };
             let signed = |me: &mut Self, op: W<'static>| { me.get(L_FA); me.sext(w); me.get(L_FB); me.sext(w); me.i(op); };
@@ -879,7 +942,7 @@ impl<'a> FuncEmit<'a> {
     /// around this block a branch to the loop; anything else goes round the dispatcher
     /// loop. Branches straight to their target keep the engines' branch prediction
     /// apart, where the dispatcher's one indirect jump would share it.
-    fn goto_within(&mut self, target: u32, extra: u32) {
+    pub(crate) fn goto_within(&mut self, target: u32, extra: u32) {
         let idx = self.index[&target];
         self.count(crate::abi::COUNT_JUMPS);
         let found = self.labels.iter().rev().position(|l| matches!(l, Label::Block(p) | Label::Loop(p) if *p == idx));
@@ -937,13 +1000,13 @@ impl<'a> FuncEmit<'a> {
         self.set(L_R0);
     }
 
-    fn call_static(&mut self, target: u32) {
+    pub(crate) fn call_static(&mut self, target: u32) {
         self.count(crate::abi::COUNT_CALLS);
         // the callee reads flags at entry: they go over in the globals
         if self.cfg.call_flags.get(&target).copied().unwrap_or(flags::ALL) != 0 {
             self.spill_flags();
         }
-        self.push32_const(self.next_ip);
+        self.push_ret();
         if let Some(&idx) = self.func_index.get(&target) {
             self.push_regs();
             self.i(W::Call(idx));
@@ -952,21 +1015,54 @@ impl<'a> FuncEmit<'a> {
             self.static_index(target);
             self.push_regs();
             self.get(L_R0);
-            self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
+            self.i(W::CallIndirect { type_index: self.fty(), table_index: 0 });
         }
         self.after_call();
     }
 
+    /// Pushes the return address of the call being emitted (64-bit code: the full one).
+    fn push_ret(&mut self) {
+        if self.x64 {
+            self.push64_const(self.next_ip64);
+        } else {
+            self.push32_const(self.next_ip);
+        }
+    }
+
+    /// Pops a return address into L_T0 (its low 32 bits in 64-bit code).
+    fn pop_ret(&mut self) {
+        if self.x64 {
+            self.pop64_lo_to(L_T0);
+        } else {
+            self.pop32_to(L_T0);
+        }
+    }
+
+    /// esp (rsp) += n.
+    fn sp_add(&mut self, n: u32) {
+        if self.x64 {
+            self.lget(L_REG + 4);
+            self.i(W::I64Const(n as i64));
+            self.i(W::I64Add);
+            self.lset(L_REG + 4);
+        } else {
+            self.get(L_REG + 4);
+            self.c(n);
+            self.i(W::I32Add);
+            self.set(L_REG + 4);
+        }
+    }
+
     /// Calls the guest function whose address is in L_T1.
-    fn call_dynamic(&mut self) {
+    pub(crate) fn call_dynamic(&mut self) {
         self.count(crate::abi::COUNT_CALLS);
-        self.push32_const(self.next_ip);
+        self.push_ret();
         self.get(L_T1);
         self.resolve();
         self.set(L_R0);
         self.push_regs();
         self.get(L_R0);
-        self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
+        self.i(W::CallIndirect { type_index: self.fty(), table_index: 0 });
         self.after_call();
     }
 
@@ -1000,12 +1096,9 @@ impl<'a> FuncEmit<'a> {
     }
 
     fn ret(&mut self, extra: u32, live_out: u8) {
-        self.pop32_to(L_T0);
+        self.pop_ret();
         if extra != 0 {
-            self.get(L_REG + 4);
-            self.c(extra);
-            self.i(W::I32Add);
-            self.set(L_REG + 4);
+            self.sp_add(extra);
         }
         // to an address this function pushed: stay in it (returning would unwind every
         // caller to the dispatcher, which then re-enters each one at its return address)
@@ -1031,14 +1124,14 @@ impl<'a> FuncEmit<'a> {
     }
 
     /// Tail-jumps to the guest address in L_T1 (flags may be live into the target).
-    fn tail_dynamic(&mut self) {
+    pub(crate) fn tail_dynamic(&mut self) {
         self.spill_flags();
         self.get(L_T1);
         self.resolve();
         self.set(L_R0);
         self.push_regs();
         self.get(L_R0);
-        self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
+        self.i(W::ReturnCallIndirect { type_index: self.fty(), table_index: 0 });
     }
 
     fn tail_static(&mut self, target: u32) {
@@ -1050,7 +1143,7 @@ impl<'a> FuncEmit<'a> {
             self.static_index(target);
             self.push_regs();
             self.get(L_R0);
-            self.i(W::ReturnCallIndirect { type_index: types::FUNC, table_index: 0 });
+            self.i(W::ReturnCallIndirect { type_index: self.fty(), table_index: 0 });
         }
     }
 
@@ -1059,9 +1152,16 @@ impl<'a> FuncEmit<'a> {
     pub fn emit(&mut self) {
         self.load_state();
         if self.cfg.blocks.values().any(|b| matches!(b.term, Term::IndirectTail)) {
-            self.get(L_REG + 4);
-            self.load(32);
-            self.set(L_RA);
+            if self.x64 {
+                self.lget(L_REG + 4);
+                self.i(W::I32WrapI64);
+                self.i(W::I64Load(mem0()));
+                self.lset(crate::lift64::X_RA);
+            } else {
+                self.get(L_REG + 4);
+                self.load(32);
+                self.set(L_RA);
+            }
         }
         self.count(crate::abi::COUNT_ENTRIES);
         if self.count && !self.count_blocks {
@@ -1158,6 +1258,7 @@ impl<'a> FuncEmit<'a> {
         for (k, instr) in block.instrs.iter().enumerate() {
             self.ip = instr.ip() as u32;
             self.next_ip = instr.next_ip() as u32;
+            self.next_ip64 = instr.next_ip();
             self.needed = needs[k];
             let is_term = k == last && !matches!(block.term, Term::Fall(_) | Term::Bad(_));
             if is_term {
@@ -1198,6 +1299,9 @@ impl<'a> FuncEmit<'a> {
             }
             Term::Cond { taken, next } => {
                 match instr.mnemonic() {
+                    Mnemonic::Jecxz | Mnemonic::Jrcxz | Mnemonic::Loop | Mnemonic::Loope | Mnemonic::Loopne if self.x64 => {
+                        self.rcx_cond_x64(instr)
+                    }
                     Mnemonic::Jecxz => {
                         self.get(L_REG + 1);
                         self.i(W::I32Eqz);
@@ -1231,6 +1335,10 @@ impl<'a> FuncEmit<'a> {
                     self.goto(*next);
                 }
             }
+            Term::Table(targets) if self.x64 => {
+                self.materialize(live_out);
+                self.table_x64(instr, targets);
+            }
             Term::Table(targets) => {
                 // jmp [idx*4 + table]: the index register selects the case.
                 self.materialize(live_out);
@@ -1257,6 +1365,7 @@ impl<'a> FuncEmit<'a> {
                 self.tail_dynamic();
             }
             Term::TailCall(target) => self.tail_static(*target),
+            Term::IndirectTail if self.x64 => self.indirect_tail_x64(instr),
             Term::IndirectTail => {
                 // jmp r/m32
                 self.read_op(instr, 0, false);
@@ -1284,7 +1393,7 @@ impl<'a> FuncEmit<'a> {
             }
             Term::InlineCall { entry } => {
                 // the call's effect on the guest: its return address on the stack
-                self.push32_const(self.next_ip);
+                self.push_ret();
                 self.materialize(live_out);
                 if self.index[entry] != self.cur_block as u32 + 1 {
                     self.goto(*entry);
@@ -1303,7 +1412,7 @@ impl<'a> FuncEmit<'a> {
                     self.static_index(*target);
                     self.push_regs();
                     self.get(L_R0);
-                    self.i(W::CallIndirect { type_index: types::FUNC, table_index: 0 });
+                    self.i(W::CallIndirect { type_index: self.fty(), table_index: 0 });
                 }
                 self.after_call_to(*ret_to);
                 if self.index[ret_key] != self.cur_block as u32 + 1 {
@@ -1311,12 +1420,9 @@ impl<'a> FuncEmit<'a> {
                 }
             }
             Term::InlineRet { ret_to, ret_key } => {
-                self.pop32_to(L_T0);
+                self.pop_ret();
                 if instr.op_count() > 0 {
-                    self.get(L_REG + 4);
-                    self.c(instr.immediate16() as u32);
-                    self.i(W::I32Add);
-                    self.set(L_REG + 4);
+                    self.sp_add(instr.immediate16() as u32);
                 }
                 self.materialize(live_out);
                 self.get(L_T0);
@@ -1388,6 +1494,9 @@ impl<'a> FuncEmit<'a> {
 
     fn emit_instr(&mut self, instr: &Instruction) {
         use Mnemonic::*;
+        if self.x64 {
+            return self.emit_instr_x64(instr);
+        }
         match instr.mnemonic() {
             Nop | Pause | Lfence | Mfence | Sfence | Prefetcht0 | Prefetcht1 | Prefetcht2 | Prefetchnta | Endbr32 => {}
             Mov => {
@@ -1853,7 +1962,7 @@ impl<'a> FuncEmit<'a> {
         }
     }
 
-    fn eflags_to(&mut self, dst: u32) {
+    pub(crate) fn eflags_to(&mut self, dst: u32) {
         self.materialize(flags::ALL);
         self.c(0x202); // bit 1 always set, IF set
         self.get(L_FLAG); self.i(W::I32Or);
@@ -1866,7 +1975,7 @@ impl<'a> FuncEmit<'a> {
         self.set(dst);
     }
 
-    fn eflags_from(&mut self, src: u32) {
+    pub(crate) fn eflags_from(&mut self, src: u32) {
         self.materialize(flags::ALL);
         for (bit, fl) in [(0u32, 0u32), (2, 1), (4, 2), (6, 3), (7, 4), (11, 5)] {
             self.get(src);
@@ -3153,7 +3262,7 @@ fn effects_at(cfg: &Cfg, block: &Block, k: usize) -> (u8, u8) {
         return (flags::ALL, cfg.call_flags.get(&target).copied().unwrap_or(flags::ALL));
     }
     if i.flow_control() == iced_x86::FlowControl::Call {
-        if i.op0_kind() == OpKind::NearBranch32 {
+        if crate::cfg::is_near(i) {
             return (flags::ALL, cfg.call_flags.get(&(i.near_branch_target() as u32)).copied().unwrap_or(flags::ALL));
         }
     }
@@ -3204,4 +3313,12 @@ pub fn rt_index(f: RtFunc) -> u32 {
     f as u32
 }
 
-pub const _ASSERT_GLOBALS: () = assert!(abi::GLOBALS.len() == 27);
+pub const _ASSERT_GLOBALS: () = {
+    assert!(abi::GLOBALS32 == 27);
+    // each global's import index is its enum value
+    let mut i = 0;
+    while i < abi::GLOBALS.len() {
+        assert!(abi::GLOBALS[i].0 as usize == i);
+        i += 1;
+    }
+};

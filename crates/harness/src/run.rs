@@ -461,6 +461,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
     for (_, _, ty) in GLOBALS {
         let (vt, init) = match ty {
             wasm_encoder::ValType::I32 => (ValType::I32, Val::I32(0)),
+            wasm_encoder::ValType::I64 => (ValType::I64, Val::I64(0)),
             wasm_encoder::ValType::V128 => (ValType::V128, Val::V128(0u128.into())),
             _ => unreachable!(),
         };

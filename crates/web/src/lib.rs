@@ -472,6 +472,7 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     for (_, _, ty) in GLOBALS {
         let init = match ty {
             ValType::V128 => ConstExpr::v128_const(0),
+            ValType::I64 => ConstExpr::i64_const(0),
             _ => ConstExpr::i32_const(0),
         };
         globals.global(GlobalType { val_type: ty, mutable: true, shared: false }, &init);

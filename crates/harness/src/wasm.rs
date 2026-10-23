@@ -97,7 +97,7 @@ impl Runner {
         let tables = HashMap::new();
         let entries_owned: Vec<u32> = entries.to_vec();
         let is_fn = move |a: u32| entries_owned.contains(&a);
-        let info = FuncInfo { jump_tables: &tables, is_function: &is_fn, translated: &|_| None };
+        let info = FuncInfo { jump_tables: &tables, is_function: &is_fn, translated: &|_| None, high: 0 };
         tr.add_function(CODE_BASE, &info).map_err(|e| anyhow!("{e}"))?;
         for &e in entries {
             tr.add_function(e, &info).map_err(|e| anyhow!("{e}"))?;
@@ -126,6 +126,7 @@ impl Runner {
         for (_, _, ty) in GLOBALS {
             let (vt, init) = match ty {
                 wasm_encoder::ValType::I32 => (ValType::I32, Val::I32(0)),
+                wasm_encoder::ValType::I64 => (ValType::I64, Val::I64(0)),
                 wasm_encoder::ValType::V128 => (ValType::V128, Val::V128(0u128.into())),
                 _ => unreachable!(),
             };

@@ -862,13 +862,13 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
         // calls to translated functions use their table index (watched ones report)
         let watch = m.engine_ref().watch.clone();
         let known = |a: u32| if watch.contains(&a) { None } else { funcs.get(&a).copied() };
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, count_blocks, no_inline }).with_cache(cache);
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, count_blocks, no_inline, x64: false }).with_cache(cache);
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = std::collections::HashMap::new();
             let jt = md.map(|md| &md.jump_tables).unwrap_or(&empty_jt);
             let is_fn = |a: u32| funcs.contains_key(&a) || md.map(|md| md.functions.contains(&a)).unwrap_or(false);
-            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known };
+            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high: 0 };
             if let Err(e) = tr.add_function(entry, &info) {
                 errors.push(format!("translate {entry:#x}: {e}"));
                 failed.push(entry);
@@ -891,7 +891,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
             }
             let Some(md) = mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
             let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known };
+            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: 0 };
             if tr.add_function(a, &info).is_ok() {
                 queue.extend(tr.direct_targets(a));
             }
@@ -912,7 +912,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
                     continue;
                 }
                 let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known };
+                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: 0 };
                 let _ = tr.add_function(a, &info);
             }
         }

@@ -4,6 +4,13 @@
 //! imported by every code module, so functions in different modules see the same
 //! registers. Guest memory is the imported memory 0; the function table maps
 //! runtime-assigned indices to translated functions.
+//!
+//! 64-bit (x86-64) code has globals of its own, appended after the 32-bit ones so
+//! their indices stay: rax..r15 (i64), xmm8..xmm15 and the GS base. The flags, MXCSR,
+//! `ctl` and xmm0..7 are shared, and `eip` holds the low 32 bits of the continue
+//! address. Its functions take and return the sixteen registers (`types::FUNC64`).
+//! A process runs one kind of code (WoW64 is per process), so `rt.resolve` serves
+//! both: in a 64-bit process it returns 64-bit functions (docs/x64.md).
 
 use wasm_encoder::ValType;
 
@@ -76,9 +83,39 @@ pub enum Global {
     /// Nonzero: stop running translated code and return to the dispatcher (the runtime
     /// recorded why: a fault to raise, a context to resume, or a stop).
     Ctl,
+    // ---- 64-bit code (appended: the indices above stay) ----
+    Rax,
+    Rcx,
+    Rdx,
+    Rbx,
+    Rsp,
+    Rbp,
+    Rsi,
+    Rdi,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    Xmm8,
+    Xmm9,
+    Xmm10,
+    Xmm11,
+    Xmm12,
+    Xmm13,
+    Xmm14,
+    Xmm15,
+    /// Linear base of the GS segment in 64-bit code (the TEB, below 4 GB).
+    GsBase,
 }
 
-pub const GLOBALS: [(Global, &str, ValType); 27] = [
+/// The globals 32-bit modules import: those before the 64-bit ones.
+pub const GLOBALS32: usize = Global::Rax as usize;
+
+pub const GLOBALS: [(Global, &str, ValType); 52] = [
     (Global::Eax, "eax", ValType::I32),
     (Global::Ecx, "ecx", ValType::I32),
     (Global::Edx, "edx", ValType::I32),
@@ -106,7 +143,51 @@ pub const GLOBALS: [(Global, &str, ValType); 27] = [
     (Global::Xmm6, "xmm6", ValType::V128),
     (Global::Xmm7, "xmm7", ValType::V128),
     (Global::Ctl, "ctl", ValType::I32),
+    (Global::Rax, "rax", ValType::I64),
+    (Global::Rcx, "rcx", ValType::I64),
+    (Global::Rdx, "rdx", ValType::I64),
+    (Global::Rbx, "rbx", ValType::I64),
+    (Global::Rsp, "rsp", ValType::I64),
+    (Global::Rbp, "rbp", ValType::I64),
+    (Global::Rsi, "rsi", ValType::I64),
+    (Global::Rdi, "rdi", ValType::I64),
+    (Global::R8, "r8", ValType::I64),
+    (Global::R9, "r9", ValType::I64),
+    (Global::R10, "r10", ValType::I64),
+    (Global::R11, "r11", ValType::I64),
+    (Global::R12, "r12", ValType::I64),
+    (Global::R13, "r13", ValType::I64),
+    (Global::R14, "r14", ValType::I64),
+    (Global::R15, "r15", ValType::I64),
+    (Global::Xmm8, "xmm8", ValType::V128),
+    (Global::Xmm9, "xmm9", ValType::V128),
+    (Global::Xmm10, "xmm10", ValType::V128),
+    (Global::Xmm11, "xmm11", ValType::V128),
+    (Global::Xmm12, "xmm12", ValType::V128),
+    (Global::Xmm13, "xmm13", ValType::V128),
+    (Global::Xmm14, "xmm14", ValType::V128),
+    (Global::Xmm15, "xmm15", ValType::V128),
+    (Global::GsBase, "gs_base", ValType::I32),
 ];
+
+/// The global of XMM register `i` (0..16).
+pub fn xmm_global(i: u32) -> Global {
+    const XMM: [Global; 16] = [
+        Global::Xmm0, Global::Xmm1, Global::Xmm2, Global::Xmm3, Global::Xmm4, Global::Xmm5, Global::Xmm6, Global::Xmm7,
+        Global::Xmm8, Global::Xmm9, Global::Xmm10, Global::Xmm11, Global::Xmm12, Global::Xmm13, Global::Xmm14, Global::Xmm15,
+    ];
+    XMM[i as usize & 15]
+}
+
+/// The global of 64-bit general register `i` (0..16: rax, rcx, rdx, rbx, rsp, rbp,
+/// rsi, rdi, r8..r15).
+pub fn gpr64_global(i: u32) -> Global {
+    const GPR: [Global; 16] = [
+        Global::Rax, Global::Rcx, Global::Rdx, Global::Rbx, Global::Rsp, Global::Rbp, Global::Rsi, Global::Rdi,
+        Global::R8, Global::R9, Global::R10, Global::R11, Global::R12, Global::R13, Global::R14, Global::R15,
+    ];
+    GPR[i as usize & 15]
+}
 
 /// Runtime services imported by code modules, in import order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +246,9 @@ pub mod types {
     pub const X87: u32 = 4;
     /// `() -> ()`: cpuid, rdtsc.
     pub const VOID: u32 = 5;
+    /// `(rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15) -> (the same)`, all i64:
+    /// translated 64-bit functions (only 64-bit modules declare it).
+    pub const FUNC64: u32 = 6;
 }
 
 pub fn export_name(entry_va: u32) -> String {

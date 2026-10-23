@@ -8,6 +8,8 @@ pub enum RootKind {
     Entry,
     Export,
     TlsCallback,
+    /// A function the exception directory (`.pdata`) of a 64-bit image lists.
+    Pdata,
     /// Direct `call rel32` target reached from committed code.
     Call,
     /// Target of a direct jump out of an already-known function (tail call or shared epilogue).
@@ -49,6 +51,11 @@ pub struct JumpTable {
     pub site_rva: u32,
     pub table_rva: u32,
     pub entries: u32,
+    /// The cases' RVAs, for tables of 32-bit offsets (64-bit code: `mov r32, [b + x*4 +
+    /// t]; add r, b; jmp r`, the offsets from `b`). Empty for tables of addresses,
+    /// which are read from the (relocated) image.
+    #[serde(skip)]
+    pub targets: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +145,9 @@ struct Walker<'a> {
     rejected_roots: u32,
     diagnostics: Vec<String>,
     formatter: iced_x86::FastFormatter,
+    /// x86-64 code (PE32+): decoded at bitness 64 with RVAs as addresses, so
+    /// RIP-relative operands and branches give RVAs.
+    x64: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -175,7 +185,18 @@ impl<'a> Walker<'a> {
             rejected_roots: 0,
             diagnostics: Vec::new(),
             formatter: iced_x86::FastFormatter::new(),
+            x64: pe.pe64,
         }
+    }
+
+    /// The RVA of a 64-bit image's address (`image_base64`-based) inside the image.
+    fn va64_to_rva(&self, va: u64) -> Option<u32> {
+        va.checked_sub(self.pe.image_base64).filter(|&r| r < self.pe.size_of_image as u64).map(|r| r as u32)
+    }
+
+    fn read_u64(&self, rva: u32) -> Option<u64> {
+        let o = rva as usize;
+        self.image.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     }
 
     fn note(&mut self, msg: String) {
@@ -222,9 +243,11 @@ impl<'a> Walker<'a> {
     /// current speculative walk that are not committed to `state` yet.
     fn decode_block(&mut self, start: u32, overlay: &HashMap<u32, u8>, is_function_start: bool) -> Block {
         let mut b = Block::default();
-        let mut decoder = Decoder::with_ip(32, &self.image, 0, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(if self.x64 { 64 } else { 32 }, &self.image, 0, DecoderOptions::NONE);
         let mut instr = Instruction::default();
         let mut rva = start;
+        // 64-bit code: the block's last instructions, for switch tables
+        let mut recent: Vec<Instruction> = Vec::new();
         loop {
             if !self.in_exec(rva) {
                 b.failure = Some((rva, "runs off section"));
@@ -261,16 +284,28 @@ impl<'a> Walker<'a> {
                     b.failure = Some((rva, "privileged instruction"));
                     break;
                 }
+                // (Windows makes system calls in ntdll only)
+                Mnemonic::Syscall | Mnemonic::Sysretq | Mnemonic::Swapgs | Mnemonic::Iretq if self.x64 => {
+                    b.failure = Some((rva, "privileged instruction"));
+                    break;
+                }
                 _ => {}
             }
-            // Win32 user code never uses GS; an SS override is legal but never emitted by compilers.
-            if matches!(instr.segment_prefix(), Register::GS | Register::SS) {
+            // Win32 user code never uses GS (Win64 code addresses its TEB with it); an SS
+            // override is legal but never emitted by compilers.
+            if instr.segment_prefix() == Register::SS || instr.segment_prefix() == Register::GS && !self.x64 {
                 b.failure = Some((rva, "gs/ss prefix"));
                 break;
             }
             b.marks.push((rva, len));
             b.instructions += 1;
             self.collect_immediates(&instr, &mut b.immediates);
+            if self.x64 {
+                if recent.len() == SWITCH_WINDOW {
+                    recent.remove(0);
+                }
+                recent.push(instr);
+            }
             let next = rva + len;
             match instr.flow_control() {
                 FlowControl::Next => rva = next,
@@ -305,10 +340,12 @@ impl<'a> Walker<'a> {
                 }
                 FlowControl::IndirectBranch => {
                     b.indirect_jumps += 1;
-                    match self.jump_table_entries(&instr, overlay) {
-                        Some((table_rva, entries)) => {
+                    let table = if self.x64 { self.jump_table64(rva, &recent, overlay) } else { self.jump_table_entries(&instr, overlay).map(|(t, e)| (t, e, false)) };
+                    match table {
+                        Some((table_rva, entries, offsets)) => {
                             b.successors.extend(entries.iter().copied());
-                            b.tables.push(JumpTable { site_rva: rva, table_rva, entries: entries.len() as u32 });
+                            let targets = if offsets { entries.clone() } else { Vec::new() };
+                            b.tables.push(JumpTable { site_rva: rva, table_rva, entries: entries.len() as u32, targets });
                         }
                         None => {
                             let mut text = String::new();
@@ -329,6 +366,20 @@ impl<'a> Walker<'a> {
     /// `push imm32` / `mov reg, imm32` / `lea`-style displacements that land in code
     /// are callbacks, SEH handlers or vtable fills.
     fn collect_immediates(&self, instr: &Instruction, out: &mut Vec<u32>) {
+        if self.x64 {
+            // 64-bit addresses, and RIP-relative operands (`lea rcx, [rip+callback]`)
+            for i in 0..instr.op_count() {
+                let candidate = match instr.op_kind(i) {
+                    OpKind::Immediate64 | OpKind::Immediate32to64 => self.va64_to_rva(instr.immediate(i)),
+                    OpKind::Memory if instr.memory_base() == Register::RIP => Some(instr.memory_displacement64() as u32),
+                    _ => None,
+                };
+                if let Some(rva) = candidate.filter(|&r| self.in_exec(r)) {
+                    out.push(rva);
+                }
+            }
+            return;
+        }
         for i in 0..instr.op_count() {
             let candidate = match instr.op_kind(i) {
                 OpKind::Immediate32 => Some(instr.immediate32()),
@@ -365,6 +416,39 @@ impl<'a> Walker<'a> {
             entries.push(rva);
         }
         (!entries.is_empty()).then_some((table_rva, entries))
+    }
+
+    /// A 64-bit switch's table (`switch64`), the base register set by a `lea b,
+    /// [rip+...]` before the load (MSVC: the image base, the table holding RVAs; GCC: the
+    /// table itself, holding offsets from it). MSVC often loads the base before the
+    /// bounds check, a block earlier: with no `lea` in the block, a table at a nonzero
+    /// displacement is taken to be the image base's when every case lies near the jump.
+    /// Returns the table's RVA and the cases' RVAs, read until one leaves the code.
+    fn jump_table64(&self, site: u32, recent: &[Instruction], overlay: &HashMap<u32, u8>) -> Option<(u32, Vec<u32>, bool)> {
+        let sw = switch64(recent)?;
+        let known = recent[..sw.load]
+            .iter()
+            .rev()
+            .find(|i| writes(i, sw.base))
+            .filter(|i| i.mnemonic() == Mnemonic::Lea && i.memory_base() == Register::RIP)
+            .map(|i| i.memory_displacement64() as u32);
+        let disp = sw.disp as u32;
+        let base_rva = known.or((disp != 0).then_some(0))?;
+        let table_rva = base_rva.wrapping_add(disp);
+        let mut entries = Vec::new();
+        for i in 0..4096u32 {
+            let Some(off) = self.read_u32(table_rva.wrapping_add(i * 4)) else { break };
+            let rva = base_rva.wrapping_add(off);
+            if !self.in_exec(rva) || known.is_none() && rva.abs_diff(site) > 0x10_0000 {
+                break;
+            }
+            let st = overlay.get(&rva).copied().unwrap_or(self.state[rva as usize]);
+            if matches!(st, INSTR_BODY | DATA) {
+                break;
+            }
+            entries.push(rva);
+        }
+        (!entries.is_empty()).then_some((table_rva, entries, true))
     }
 
     fn commit(&mut self, b: Block, kind: RootKind, start: u32) {
@@ -497,7 +581,7 @@ impl<'a> Walker<'a> {
         let prev_state = rva.checked_sub(1).map(|p| self.state[p as usize]).unwrap_or(0);
         let prev_byte = rva.checked_sub(1).map(|p| self.image[p as usize]).unwrap_or(0xCC);
         let head = &self.image[rva as usize..(rva as usize + 3).min(self.image.len())];
-        let prologue = head == [0x55, 0x8B, 0xEC] || head == [0x8B, 0xFF, 0x55] || head.first() == Some(&0x53);
+        let prologue = if self.x64 { prologue64(&self.image[rva as usize..]) } else { head == [0x55, 0x8B, 0xEC] || head == [0x8B, 0xFF, 0x55] || head.first() == Some(&0x53) };
         let after_pad = matches!(prev_byte, 0xCC | 0xC3 | 0x90 | 0x00 | 0xC0) || prev_state == INSTR_START || prev_state == INSTR_BODY;
         (prologue as u8) * 2 + (after_pad as u8) + (rva % 16 == 0) as u8
     }
@@ -518,6 +602,20 @@ impl<'a> Walker<'a> {
     /// Dword-aligned values anywhere in the image that point at undecoded code.
     fn pointer_scan(&mut self) {
         let mut found = Vec::new();
+        if self.x64 {
+            // qword-aligned 64-bit addresses
+            for s in &self.pe.sections {
+                let lo = s.virtual_address as usize;
+                let hi = (lo + s.mapped_size() as usize).min(self.image.len());
+                for rva in (lo.next_multiple_of(8)..hi.saturating_sub(8)).step_by(8) {
+                    let va = u64::from_le_bytes(self.image[rva..rva + 8].try_into().unwrap());
+                    if let Some(target) = self.va64_to_rva(va).filter(|&t| self.in_exec(t) && self.state[t as usize] == 0) {
+                        found.push(target);
+                    }
+                }
+            }
+            return self.run_candidates(found, RootKind::PointerScan);
+        }
         for s in &self.pe.sections {
             let lo = s.virtual_address as usize;
             let hi = (lo + s.mapped_size() as usize).min(self.image.len());
@@ -561,7 +659,8 @@ impl<'a> Walker<'a> {
                     continue;
                 }
                 let b = &self.image[rva as usize..(rva + 3) as usize];
-                if (b == [0x55, 0x8B, 0xEC] || b == [0x8B, 0xFF, 0x55]) && self.confidence(rva) >= 3 {
+                let prologue = if self.x64 { prologue64(&self.image[rva as usize..]) } else { b == [0x55, 0x8B, 0xEC] || b == [0x8B, 0xFF, 0x55] };
+                if prologue && self.confidence(rva) >= 3 {
                     found.push(rva);
                 }
             }
@@ -597,6 +696,89 @@ impl<'a> Walker<'a> {
             }
         }
         (padding, gaps)
+    }
+}
+
+/// Instructions before a `jmp reg` that `switch64` looks through.
+const SWITCH_WINDOW: usize = 12;
+
+/// A 64-bit switch dispatch (`switch64`).
+#[derive(Debug, Clone, Copy)]
+pub struct Switch64 {
+    /// Position of the table load in the instructions given.
+    pub load: usize,
+    /// The register the table's entries are offsets from (and the table is addressed by).
+    pub base: Register,
+    /// The case index register.
+    pub index: Register,
+    /// It still holds the index at the jump.
+    pub index_kept: bool,
+    /// The load's displacement (from `base`).
+    pub disp: u64,
+}
+
+/// Whether the instruction writes (part of) `reg`.
+pub fn writes(i: &Instruction, reg: Register) -> bool {
+    use iced_x86::{InstructionInfoFactory, OpAccess};
+    thread_local! {
+        static INFO: std::cell::RefCell<InstructionInfoFactory> = std::cell::RefCell::new(InstructionInfoFactory::new());
+    }
+    let full = reg.full_register();
+    INFO.with(|f| {
+        f.borrow_mut().info(i).used_registers().iter().any(|u| {
+            u.register().full_register() == full && matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
+        })
+    })
+}
+
+/// The 64-bit switch dispatch that `instrs` ends with: `mov r32, [b + x*4 + d]` (or
+/// movsxd), `add` of `r` and `b` (either way round), `jmp` to the sum, other
+/// instructions in between as long as they leave what is used later (compilers
+/// schedule unrelated work there).
+pub fn switch64(instrs: &[Instruction]) -> Option<Switch64> {
+    let (jmp, body) = instrs.split_last()?;
+    let target = jmp.op0_register();
+    if jmp.mnemonic() != Mnemonic::Jmp || jmp.op0_kind() != OpKind::Register || target.size() != 8 {
+        return None;
+    }
+    let last_writer = |end: usize, reg: Register| body[..end].iter().rposition(|i| writes(i, reg));
+    let at_add = last_writer(body.len(), target)?;
+    let add = &body[at_add];
+    if add.mnemonic() != Mnemonic::Add || add.op0_kind() != OpKind::Register || add.op1_kind() != OpKind::Register || add.op0_register() != target || add.op1_register().size() != 8 {
+        return None;
+    }
+    let other = add.op1_register();
+    // the loaded value is one of the two added registers, the base the other
+    for (loaded, base) in [(target, other), (other, target)] {
+        let Some(at) = last_writer(at_add, loaded) else { continue };
+        let load = &body[at];
+        let ok = matches!(load.mnemonic(), Mnemonic::Mov | Mnemonic::Movsxd)
+            && load.op0_kind() == OpKind::Register
+            && load.op0_register().full_register() == loaded
+            && load.op1_kind() == OpKind::Memory
+            && load.memory_base() == base
+            && load.memory_index() != Register::None
+            && load.memory_index_scale() == 4
+            && load.memory_size().size() == 4;
+        if !ok || last_writer(at_add, base).is_some_and(|w| w > at) {
+            continue;
+        }
+        let index = load.memory_index();
+        let index_kept = !body[at..].iter().any(|i| writes(i, index));
+        return Some(Switch64 { load: at, base, index, index_kept, disp: load.memory_displacement64() });
+    }
+    None
+}
+
+/// Common MSVC x64 prologues: saving registers to the home area (`mov [rsp+8], rbx`
+/// and kin), `sub rsp, n`, `push rbx`..`push rdi` with REX, `mov rax, rsp`/`mov r11, rsp`.
+fn prologue64(b: &[u8]) -> bool {
+    match b {
+        [0x48 | 0x4C, 0x89, m, 0x24, ..] if m & 0xC7 == 0x44 => true,
+        [0x48, 0x83 | 0x81, 0xEC, ..] => true,
+        [0x40, 0x53..=0x57, ..] => true,
+        [0x48, 0x8B, 0xC4, ..] | [0x4C, 0x8B, 0xDC, ..] => true,
+        _ => false,
     }
 }
 
@@ -714,12 +896,26 @@ pub fn discover(pe: &Pe) -> Discovery {
             }
         }
     }
+    if pe.pe64 {
+        // RUNTIME_FUNCTION entries (begin, end, unwind info), 12 bytes each; a chained
+        // one (UNW_FLAG_CHAININFO) is a part of the function before it, not an entry
+        let dir = pe.dir(3);
+        for k in 0..dir.size / 12 {
+            let at = dir.rva + 12 * k;
+            let (Ok(begin), Ok(unwind)) = (pe.u32_at_rva(at), pe.u32_at_rva(at + 8)) else { break };
+            let chained = pe.bytes_at(unwind & !1, 1).is_ok_and(|b| (b[0] >> 3) & 4 != 0);
+            if !chained && unwind & 1 == 0 {
+                w.add_function(begin, RootKind::Pdata);
+            }
+        }
+    }
     w.drain();
     let strong_bytes = w.covered_bytes();
 
     let mut reloc_targets = Vec::new();
     for site in pe.relocations().unwrap_or_default() {
-        if let Some(rva) = w.read_u32(site).and_then(|va| w.va_in_exec(va)) {
+        let target = if pe.pe64 { w.read_u64(site).and_then(|va| w.va64_to_rva(va)).filter(|&r| w.in_exec(r)) } else { w.read_u32(site).and_then(|va| w.va_in_exec(va)) };
+        if let Some(rva) = target {
             reloc_targets.push(rva);
         }
     }
