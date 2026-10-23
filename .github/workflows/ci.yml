@@ -9,7 +9,7 @@ jobs:
     name: Unit and CPU differential tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: 32-bit gcc (the CPU reference program)
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
@@ -27,7 +27,7 @@ jobs:
     env:
       CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
