@@ -1,9 +1,12 @@
 mod casegen;
+mod casegen64;
 mod compare;
 mod flowgen;
 mod ssegen;
+mod ssegen64;
 mod x87gen;
 mod native;
+mod native64;
 mod proto;
 mod net;
 mod run;
@@ -231,6 +234,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::CpuDiff { count, seed, max_instrs, mnemonics, code_filter, work, show, list, mode, only, dump_data } => {
+            if mode.starts_with("x64") {
+                let _ = (&work, &dump_data);
+                return cpu_diff_x64(&mode, count, seed, max_instrs, mnemonics.as_deref(), code_filter.as_deref(), show, list, only);
+            }
             let mn: Vec<Mnemonic> = match mnemonics {
                 Some(s) => {
                     let all = casegen::integer_mnemonics();
@@ -404,5 +411,169 @@ fn main() -> Result<()> {
             println!("{} codes tested", per_code.len());
             Ok(())
         }
+    }
+}
+
+
+/// The 64-bit CPU differential tester (`cpu-diff --mode x64[flow|sse]`): random x86-64
+/// cases run on the host CPU (native64) and in wasm, compared bit for bit. `x64` is
+/// random integer sequences, `x64flow` branches/calls/loops/string ops, `x64sse` SSE
+/// with all sixteen xmm registers.
+fn cpu_diff_x64(
+    mode: &str,
+    count: usize,
+    seed: u64,
+    max_instrs: usize,
+    mnemonics: Option<&str>,
+    code_filter: Option<&str>,
+    show: usize,
+    list: bool,
+    only: Option<usize>,
+) -> Result<()> {
+    let sse = mode == "x64sse";
+    let mut codes = if sse {
+        ssegen64::sse_codes(&ssegen::sse_mnemonics())
+    } else {
+        let mn: Vec<Mnemonic> = match mnemonics {
+            Some(s) => {
+                let all = casegen64::integer_mnemonics();
+                s.split(',')
+                    .map(|name| {
+                        all.iter().copied().find(|m| format!("{m:?}").eq_ignore_ascii_case(name.trim())).unwrap_or_else(|| panic!("unknown or unsupported mnemonic {name}"))
+                    })
+                    .collect()
+            }
+            None => casegen64::integer_mnemonics(),
+        };
+        casegen64::supported_codes(&mn)
+    };
+    if let Some(f) = code_filter {
+        codes.retain(|c| format!("{c:?}").contains(f));
+    }
+    if list {
+        for c in &codes {
+            println!("{c:?}");
+        }
+        println!("{} codes", codes.len());
+        return Ok(());
+    }
+    anyhow::ensure!(!codes.is_empty(), "no codes selected");
+    let nat = native64::Native64::prepare()?;
+    let runner = wasm::Runner::new()?;
+    let mut g = casegen64::Gen64::new(seed);
+    let mut cases = Vec::new();
+    while cases.len() < count {
+        let c = match mode {
+            "x64sse" => ssegen64::sse_case(&mut g, &codes, max_instrs),
+            "x64flow" => casegen64::flow_case(&mut g, &codes),
+            _ => {
+                if g.rng.random_bool(0.35) {
+                    casegen64::flow_case(&mut g, &codes)
+                } else {
+                    g.case(&codes, max_instrs)
+                }
+            }
+        };
+        if let Some(c) = c {
+            cases.push(c);
+        }
+    }
+    let inputs: Vec<Box<proto::CaseIn64>> = cases.iter().map(|c| c.input.clone()).collect();
+    let t0 = std::time::Instant::now();
+    let native_out = nat.run(&inputs);
+    let t_native = t0.elapsed();
+
+    let mut per_code: BTreeMap<Code, (u32, u32)> = BTreeMap::new();
+    let mut unimpl: BTreeMap<String, u32> = BTreeMap::new();
+    let (mut shown, mut failures, mut indeterminate) = (0, 0, 0);
+    let mut fmt = FastFormatter::new();
+    let t1 = std::time::Instant::now();
+    for (k, case) in cases.iter().enumerate() {
+        if only.is_some_and(|o| o != k) {
+            continue;
+        }
+        let res = match runner.run64(&case.input, proto::STACK_BASE, &case.entries) {
+            Ok(r) => r,
+            Err(e) => {
+                failures += 1;
+                for &c in &case.codes {
+                    per_code.entry(c).or_insert((0, 0)).1 += 1;
+                }
+                if shown < show {
+                    shown += 1;
+                    println!("--- case {k} (seed {seed}) TRANSLATION/RUN ERROR: {e:#}");
+                    show_case(&mut fmt, case);
+                }
+                continue;
+            }
+        };
+        let mut diffs = compare::compare64(&native_out[k], &res.out, &case.instrs, sse);
+        if !diffs.is_empty() && compare::reads_undefined_flag(&case.instrs) {
+            indeterminate += 1;
+            diffs.clear();
+        }
+        for &c in &case.codes {
+            let e = per_code.entry(c).or_insert((0, 0));
+            if diffs.is_empty() {
+                e.0 += 1
+            } else {
+                e.1 += 1
+            }
+        }
+        if res.out.status == 0xFFFF_0001 {
+            for (_, text) in &res.unimplemented {
+                *unimpl.entry(text.clone()).or_default() += 1;
+            }
+        }
+        if !diffs.is_empty() {
+            failures += 1;
+            if shown < show {
+                shown += 1;
+                println!("--- case {k} (seed {seed}) FAILED");
+                show_case(&mut fmt, case);
+                let r = &case.input.regs;
+                println!("    in: rax={:016x} rcx={:016x} rdx={:016x} rbx={:016x} rsp=+{:x} rbp={:016x} rsi={:016x} rdi={:016x}", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+                for d in &diffs {
+                    println!("    {:<12} native {:<22} wasm {}", d.field, d.native, d.wasm);
+                }
+                if let Some(e) = &res.wasm_error {
+                    println!("    wasm error: {e}");
+                }
+            }
+        }
+    }
+    let t_wasm = t1.elapsed();
+    println!(
+        "\n{} cases: {} passed, {} failed, {} indeterminate (read an undefined flag)  (native {:.2}s, wasm {:.1}s)",
+        count,
+        count - failures,
+        failures,
+        indeterminate,
+        t_native.as_secs_f64(),
+        t_wasm.as_secs_f64()
+    );
+    let mut failing: Vec<(&Code, &(u32, u32))> = per_code.iter().filter(|(_, v)| v.1 > 0).collect();
+    failing.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
+    if !failing.is_empty() {
+        println!("codes with failures (pass/fail):");
+        for (c, (p, f)) in failing.iter().take(40) {
+            println!("  {c:?}: {p}/{f}");
+        }
+    }
+    if !unimpl.is_empty() {
+        println!("unimplemented instructions hit:");
+        for (t, n) in unimpl.iter().take(40) {
+            println!("  {n:>5}  {t}");
+        }
+    }
+    println!("{} codes tested", per_code.len());
+    Ok(())
+}
+
+fn show_case(fmt: &mut FastFormatter, case: &casegen64::Case64) {
+    for i in &case.instrs {
+        let mut s = String::new();
+        fmt.format(i, &mut s);
+        println!("    {:08x}  {s}", i.ip());
     }
 }

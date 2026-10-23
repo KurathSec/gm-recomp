@@ -1108,9 +1108,10 @@ impl<'a> FuncEmit<'a> {
                 self.lset(X_T1);
                 self.wdst(d, w, X_T1);
                 self.i(W::Else);
-                // the accumulator gets the destination, which is written back as it was
+                // the accumulator gets the destination; a register destination is left
+                // alone (writing it would zero-extend a 32-bit one), a memory one is
+                // unchanged, so neither is written
                 self.rset_from(a, X_FB);
-                self.wdst(d, w, X_FB);
                 self.depth -= 1;
                 self.i(W::End);
             }
@@ -1784,15 +1785,22 @@ impl<'a> FuncEmit<'a> {
         }
         self.sext64(w);
         self.lset(X_T1);
+        // CF = OF = the product does not fit. For the 64-bit form the high half comes
+        // first (`mul_high64` keeps X_T0/X_T1 but scribbles over X_T2..X_T6), then the
+        // low product in X_T5.
+        let flags_needed = self.needed & (flags::CF | flags::OF) != 0;
+        if w == 64 && flags_needed {
+            self.mul_high64(true);
+            self.lget(X_T2);
+            self.lset(X_FR);
+        }
         self.lget(X_T0);
         self.lget(X_T1);
         self.i(W::I64Mul);
         self.lset(X_T5);
-        // CF = OF = the product does not fit (the high half only when they are read)
         if w == 64 {
-            if self.needed & (flags::CF | flags::OF) != 0 {
-                self.mul_high64(true);
-                self.lget(X_T2);
+            if flags_needed {
+                self.lget(X_FR);
                 self.lget(X_T5);
                 self.k(63);
                 self.i(W::I64ShrS);

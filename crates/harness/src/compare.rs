@@ -243,3 +243,70 @@ fn xmm_equal_modulo_nan(a: &[u8], b: &[u8]) -> bool {
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+/// Native-vs-wasm comparison of a 64-bit case: the sixteen registers, the arithmetic
+/// flags (undefined ones masked out), memory, and (when `xmm`) the sixteen xmm registers.
+pub fn compare64(native: &crate::proto::CaseOut64, wasm: &crate::proto::CaseOut64, instrs: &[Instruction], xmm: bool) -> Vec<Diff> {
+    let mut diffs = Vec::new();
+    fn push_into(diffs: &mut Vec<Diff>, field: &str, a: String, b: String) {
+        if a != b {
+            diffs.push(Diff { field: field.to_string(), native: a, wasm: b });
+        }
+    }
+    macro_rules! push {
+        ($f:expr, $a:expr, $b:expr) => {
+            push_into(&mut diffs, $f, $a, $b)
+        };
+    }
+    push!("status", format!("{:#x}", native.status), format!("{:#x}", wasm.status));
+    if native.status == wasm.status && wasm.fault_off != u32::MAX {
+        push!("fault_off", native.fault_off.to_string(), wasm.fault_off.to_string());
+    }
+    if native.status != 0 && native.status == wasm.status {
+        return diffs; // after a fault only its location is meaningful
+    }
+    const NAMES: [&str; 16] =
+        ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+    for r in 0..16 {
+        push!(NAMES[r], format!("{:#018x}", native.regs[r]), format!("{:#018x}", wasm.regs[r]));
+    }
+    let mask = (FLAG_BITS & !undefined_flags(instrs)) as u64;
+    push!("rflags", format!("{:#06x}", native.rflags & mask), format!("{:#06x}", wasm.rflags & mask));
+    for (i, (a, b)) in native.data.iter().zip(&wasm.data).enumerate() {
+        if a != b {
+            if xmm && nan_chunk(&native.data, &wasm.data, i) {
+                continue;
+            }
+            push!(&format!("data[{i:#x}]"), format!("{a:#04x}"), format!("{b:#04x}"));
+            if diffs.len() > 64 {
+                break;
+            }
+        }
+    }
+    for (i, (a, b)) in native.stack.iter().zip(&wasm.stack).enumerate() {
+        if a != b {
+            if xmm && nan_chunk(&native.stack, &wasm.stack, i) {
+                continue;
+            }
+            push!(&format!("stack[{i:#x}]"), format!("{a:#04x}"), format!("{b:#04x}"));
+            if diffs.len() > 64 {
+                break;
+            }
+        }
+    }
+    if xmm {
+        push!(
+            "mxcsr",
+            format!("{:#x}", u32::from_le_bytes(native.fx[24..28].try_into().unwrap()) & !0x3f),
+            format!("{:#x}", u32::from_le_bytes(wasm.fx[24..28].try_into().unwrap()) & !0x3f)
+        );
+        for x in 0..16 {
+            let a = &native.fx[160 + x * 16..176 + x * 16];
+            let b = &wasm.fx[160 + x * 16..176 + x * 16];
+            if !xmm_equal_modulo_nan(a, b) {
+                push!(&format!("xmm{x}"), hex(a), hex(b));
+            }
+        }
+    }
+    diffs
+}
