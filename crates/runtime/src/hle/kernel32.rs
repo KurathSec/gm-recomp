@@ -262,6 +262,26 @@ pub fn register(r: &mut Registry) {
         ok(1, 0)
     });
     r.alias(k, "GetNativeSystemInfo", k, "GetSystemInfo");
+    // one SYSTEM_LOGICAL_PROCESSOR_INFORMATION: a processor core (mask 1), as GetSystemInfo
+    r.add_on_demand(k, "GetLogicalProcessorInformation", |c| {
+        let (buf, len) = (c.arg(0), c.arg(1));
+        let size = if c.x64() { 32 } else { 24 };
+        let have = c.host.read_u32(len).unwrap_or(0);
+        let _ = c.host.write_u32(len, size);
+        if buf == 0 || have < size {
+            c.set_last_error(ERROR_INSUFFICIENT_BUFFER);
+            return ok(2, 0);
+        }
+        let _ = c.host.fill(buf, size, 0);
+        let _ = c.host.write_u32(buf, 1); // ProcessorMask
+        // Relationship RelationProcessorCore (0), then Flags 0
+        ok(2, 1)
+    });
+    // (not under WOW64: no file system or registry redirection to turn off)
+    r.add_on_demand(k, "IsWow64Process", |c| {
+        let _ = c.host.write_u32(c.arg(1), 0);
+        ok(2, 1)
+    });
     r.add(k, "SetErrorMode", |_c| ok(1, 0));
     r.add(k, "GetErrorMode", |_c| ok(0, 0));
     r.add(k, "IsDebuggerPresent", |_c| ok(0, 0));
