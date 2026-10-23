@@ -167,7 +167,14 @@ pub struct Pe<'a> {
     pub machine: u16,
     pub characteristics: u16,
     pub timestamp: u32,
+    /// The preferred base in 32-bit address space: a PE32+ (64-bit) image's lies above
+    /// 4 GB and is given as 0 here, so its VAs below (TLS, callbacks) read as RVAs and the
+    /// loader always rebases it (see `image_base64`).
     pub image_base: u32,
+    /// PE32+: a 64-bit image (x86-64).
+    pub pe64: bool,
+    /// The preferred base as the optional header gives it.
+    pub image_base64: u64,
     pub entry_rva: u32,
     pub section_alignment: u32,
     pub file_alignment: u32,
@@ -202,21 +209,27 @@ impl<'a> Pe<'a> {
         let characteristics = rd16(coff + 18, "coff")?;
         let opt = coff + 20;
         let magic = rd16(opt, "optional header")?;
-        if magic != 0x10b {
-            return Err(Error::Unsupported(format!("optional header magic {magic:#x} (only PE32 is supported)")));
-        }
-        if machine != 0x14c {
-            return Err(Error::Unsupported(format!("machine {machine:#x} (only i386 is supported)")));
-        }
-        let ndirs = (rd32(opt + 92, "optional header")? as usize).min(16);
+        let pe64 = match (magic, machine) {
+            (0x10b, 0x14c) => false,
+            (0x20b, 0x8664) => true,
+            (0x10b | 0x20b, _) => return Err(Error::Unsupported(format!("machine {machine:#x} (only i386 and x86-64 are supported)"))),
+            _ => return Err(Error::Unsupported(format!("optional header magic {magic:#x}"))),
+        };
+        // PE32+ widens ImageBase and the four stack/heap sizes to 64 bits (and drops
+        // BaseOfData): the data directories start 16 bytes further on
+        let w = if pe64 { 16 } else { 0 };
+        let rd64 = |o: usize, what| Ok::<u64, Error>(rd32(o, what)? as u64 | (rd32(o + 4, what)? as u64) << 32);
+        let ndirs = (rd32(opt + 92 + w, "optional header")? as usize).min(16);
         let mut dirs = Vec::with_capacity(16);
         for i in 0..16 {
             dirs.push(if i < ndirs {
-                DataDir { rva: rd32(opt + 96 + i * 8, "data dirs")?, size: rd32(opt + 100 + i * 8, "data dirs")? }
+                DataDir { rva: rd32(opt + 96 + w + i * 8, "data dirs")?, size: rd32(opt + 100 + w + i * 8, "data dirs")? }
             } else {
                 DataDir::default()
             });
         }
+        let image_base64 = if pe64 { rd64(opt + 24, "optional header")? } else { rd32(opt + 28, "optional header")? as u64 };
+        let size = |i: usize| -> Result<u32> { if pe64 { Ok(rd64(opt + 72 + 8 * i, "optional header")?.min(u32::MAX as u64) as u32) } else { rd32(opt + 72 + 4 * i, "optional header") } };
         let sec_tab = opt + opt_size;
         let mut sections = Vec::with_capacity(nsec);
         for i in 0..nsec {
@@ -237,7 +250,9 @@ impl<'a> Pe<'a> {
             machine,
             characteristics,
             timestamp,
-            image_base: rd32(opt + 28, "optional header")?,
+            image_base: if pe64 { 0 } else { image_base64 as u32 },
+            pe64,
+            image_base64,
             entry_rva: rd32(opt + 16, "optional header")?,
             section_alignment: rd32(opt + 32, "optional header")?,
             file_alignment: rd32(opt + 36, "optional header")?,
@@ -245,10 +260,10 @@ impl<'a> Pe<'a> {
             size_of_headers: rd32(opt + 60, "optional header")?,
             subsystem: rd16(opt + 68, "optional header")?,
             dll_characteristics: rd16(opt + 70, "optional header")?,
-            stack_reserve: rd32(opt + 72, "optional header")?,
-            stack_commit: rd32(opt + 76, "optional header")?,
-            heap_reserve: rd32(opt + 80, "optional header")?,
-            heap_commit: rd32(opt + 84, "optional header")?,
+            stack_reserve: size(0)?,
+            stack_commit: size(1)?,
+            heap_reserve: size(2)?,
+            heap_commit: size(3)?,
             sections,
             dirs,
         })
@@ -312,12 +327,20 @@ impl<'a> Pe<'a> {
     /// Reads a thunk table (ILT/INT) and pairs every entry with its IAT slot.
     fn read_thunks(&self, lookup_rva: u32, iat_rva: u32, rva_based_names: bool) -> Result<Vec<Import>> {
         let mut out = Vec::new();
+        // PE32+ thunks are 8 bytes, the ordinal flag in bit 63 (names are RVAs below 4 GB)
+        let size = self.thunk_size();
         for i in 0.. {
-            let thunk = self.u32_at_rva(lookup_rva + i * 4)?;
-            if thunk == 0 {
+            let (thunk, ordinal) = if self.pe64 {
+                let hi = self.u32_at_rva(lookup_rva + i * 8 + 4)?;
+                (self.u32_at_rva(lookup_rva + i * 8)?, hi & 0x8000_0000 != 0)
+            } else {
+                let t = self.u32_at_rva(lookup_rva + i * 4)?;
+                (t, t & 0x8000_0000 != 0)
+            };
+            if thunk == 0 && !ordinal {
                 break;
             }
-            let name = if thunk & 0x8000_0000 != 0 {
+            let name = if ordinal {
                 ImportName::Ordinal(thunk as u16)
             } else {
                 let mut hn = thunk;
@@ -326,9 +349,14 @@ impl<'a> Pe<'a> {
                 }
                 ImportName::Name { hint: self.u16_at_rva(hn)?, name: self.cstr_at_rva(hn + 2)? }
             };
-            out.push(Import { name, iat_rva: iat_rva + i * 4 });
+            out.push(Import { name, iat_rva: iat_rva + i * size });
         }
         Ok(out)
+    }
+
+    /// Bytes per import thunk and IAT slot: 8 in a PE32+ image.
+    pub fn thunk_size(&self) -> u32 {
+        if self.pe64 { 8 } else { 4 }
     }
 
     pub fn imports(&self) -> Result<Vec<ImportDll>> {
@@ -411,7 +439,8 @@ impl<'a> Pe<'a> {
         Ok(out)
     }
 
-    /// RVAs of every IMAGE_REL_BASED_HIGHLOW fixup (the only kind valid in PE32 images).
+    /// RVAs of every IMAGE_REL_BASED_HIGHLOW fixup (PE32) or IMAGE_REL_BASED_DIR64 fixup
+    /// (PE32+): 32- or 64-bit absolute addresses, as `pe64` says.
     pub fn relocations(&self) -> Result<Vec<u32>> {
         let dir = self.dir(DIR_BASERELOC);
         let mut out = Vec::new();
@@ -429,7 +458,8 @@ impl<'a> Pe<'a> {
                 let e = self.u16_at_rva(dir.rva + pos + 8 + i * 2)?;
                 match e >> 12 {
                     0 => {}
-                    3 => out.push(page + (e & 0xfff) as u32),
+                    3 if !self.pe64 => out.push(page + (e & 0xfff) as u32),
+                    10 if self.pe64 => out.push(page + (e & 0xfff) as u32),
                     k => return Err(Error::Unsupported(format!("relocation type {k}"))),
                 }
             }
@@ -501,22 +531,41 @@ impl<'a> Pe<'a> {
         if dir.rva == 0 {
             return Ok(None);
         }
+        // PE32+: four 64-bit VAs, given here as RVAs (see `image_base`)
+        let ptr = |i: u32| -> Result<u32> {
+            if self.pe64 {
+                let va = self.u32_at_rva(dir.rva + 8 * i)? as u64 | (self.u32_at_rva(dir.rva + 8 * i + 4)? as u64) << 32;
+                Ok(if va == 0 { 0 } else { va.wrapping_sub(self.image_base64) as u32 })
+            } else {
+                self.u32_at_rva(dir.rva + 4 * i)
+            }
+        };
         let mut t = Tls {
-            start_va: self.u32_at_rva(dir.rva)?,
-            end_va: self.u32_at_rva(dir.rva + 4)?,
-            index_va: self.u32_at_rva(dir.rva + 8)?,
-            callbacks_va: self.u32_at_rva(dir.rva + 12)?,
-            zero_fill: self.u32_at_rva(dir.rva + 16)?,
+            start_va: ptr(0)?,
+            end_va: ptr(1)?,
+            index_va: ptr(2)?,
+            callbacks_va: ptr(3)?,
+            zero_fill: self.u32_at_rva(dir.rva + if self.pe64 { 32 } else { 16 })?,
             callbacks: Vec::new(),
         };
         if let Some(mut rva) = self.va_to_rva(t.callbacks_va).filter(|_| t.callbacks_va != 0) {
             // The array may live in zero-fill memory that only the loader populates.
+            let size = self.thunk_size();
             while let Ok(cb) = self.u32_at_rva(rva) {
-                if cb == 0 {
-                    break;
-                }
+                let cb = if self.pe64 {
+                    let hi = self.u32_at_rva(rva + 4).unwrap_or(0);
+                    if cb == 0 && hi == 0 {
+                        break;
+                    }
+                    (cb as u64 | (hi as u64) << 32).wrapping_sub(self.image_base64) as u32
+                } else {
+                    if cb == 0 {
+                        break;
+                    }
+                    cb
+                };
                 t.callbacks.push(cb);
-                rva += 4;
+                rva += size;
             }
         }
         Ok(Some(t))
