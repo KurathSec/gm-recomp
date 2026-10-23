@@ -1729,8 +1729,12 @@ fn locale_info(lctype: u32) -> &'static str {
         0x1003 => "h:mm:ss tt", // LOCALE_STIMEFORMAT
         0x100B => "1252", // LOCALE_IDEFAULTANSICODEPAGE
         0xB => "437",     // LOCALE_IDEFAULTCODEPAGE
-        0x2A => "1",
-        0x2B..=0x36 => "",
+        // LOCALE_SDAYNAME1..7 (Monday first), SABBREVDAYNAME1..7, SMONTHNAME1..12,
+        // SABBREVMONTHNAME1..12
+        0x2A..=0x30 => ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][(lctype - 0x2A) as usize],
+        0x31..=0x37 => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][(lctype - 0x31) as usize],
+        0x38..=0x43 => ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][(lctype - 0x38) as usize],
+        0x44..=0x4F => ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(lctype - 0x44) as usize],
         0x1004 => "1",    // LOCALE_IFIRSTDAYOFWEEK? (6=Sunday?) keep
         0x1005 => "0",
         0x1009 => "1",    // LOCALE_ICALENDARTYPE
