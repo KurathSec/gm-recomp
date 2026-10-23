@@ -292,6 +292,31 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       const channel = new MessageChannel();
       let wakeUp = null;
       channel.port1.onmessage = () => wakeUp?.();
+      // Chrome hands a worker canvas's frame to the compositor only while the worker's
+      // event loop handles a BeginFrame; blocked in the waits, it handled them late and
+      // Chrome dropped some (a steady 50 fps reached the screen with 40-60 ms gaps, ~3 a
+      // second). There the guest resumes at the worker's next animation frame, when the
+      // frame has gone out. Firefox commits at the end of the task (and gating cost it
+      // late frames). A hidden page gets no animation frames: after a timeout the guest
+      // resumes at once until one comes again.
+      const chromium = typeof requestAnimationFrame === 'function' && !!self.navigator?.userAgentData;
+      let gated = chromium;
+      const resume = () => {
+        if (!gated) return channel.port2.postMessage(0);
+        let done = false;
+        const go = () => {
+          if (done) return;
+          done = true;
+          channel.port2.postMessage(0);
+        };
+        requestAnimationFrame(go);
+        setTimeout(() => {
+          if (done) return;
+          gated = false;
+          requestAnimationFrame(() => (gated = true));
+          go();
+        }, 100);
+      };
       gpuImports.gpu_present = new WebAssembly.Suspending((clockMs, x, y, w, h, dw, dh) => {
         if (clockMs > shownClock) {
           steps.push(Math.min(100, clockMs - shownClock));
@@ -305,7 +330,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
           () =>
             new Promise((res) => {
               wakeUp = res;
-              channel.port2.postMessage(0);
+              resume();
             }),
         ).then(() => {
           resumed = performance.now();

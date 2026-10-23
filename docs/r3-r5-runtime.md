@@ -80,6 +80,13 @@ BSF/BSR (our CPUID has neither BMI1 nor LZCNT).
   `?pacing=jit` (hold each frame until its time, resume the guest just in time) and
   `?pacing=asap` remain for comparison. Marathon in Chrome: 50.0 fps, frame interval
   20.0 ms (longest 21–27 ms), no late frames; waits end 0.4 ms late on average.
+  The default is now `?pacing=sync`: waits block the worker (`Atomics.wait` ends on
+  time) and the worker yields once per frame, at Present. In Chromium the guest
+  resumes after that yield only at the worker's next animation frame. Chrome passes
+  a worker canvas's frame to the compositor while it handles a BeginFrame on the
+  worker's event loop. With the worker blocked, about 10% of frames never reached the
+  screen even at a steady 50 fps (in a trace, `OffscreenCanvas::PushFrame` events were
+  40–60 ms apart). Gated, NANG and Neon pushed 150 of 150 frames in 3 s.
 - Stats (the Stats button, or `?stats`): frame rate, real frame interval, guest time
   per frame, late frames, timer lateness, and input latency from the key event to the
   Present of the frame that read it (the display adds up to one refresh).
