@@ -88,36 +88,66 @@ fn code_ranges(cfg: &Cfg) -> Vec<(u32, u32)> {
 }
 
 /// A module of stand-ins for 32-bit functions whose translations were dropped (their
-/// code changed): each looks its address up again (`rt.resolve`, which translates it
-/// anew) and calls that, so the table slot of the old translation, which callers keep,
-/// leads to the new one.
-pub fn redirects(entries: &[u32]) -> Output {
-    use wasm_encoder::{Function, Instruction as W};
+/// code changed): each looks its address up again (the resolve cache, else `rt.resolve`,
+/// which translates it anew) and calls that, so the table slot of the old translation,
+/// which callers keep, leads to the new one.
+pub fn redirects(entries: &[u32], shared_memory: bool) -> Output {
+    use wasm_encoder::{Function, Instruction as W, MemArg};
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32; 8], [ValType::I32; 8]); // FUNC
     types.ty().function([ValType::I32], [ValType::I32]); // RESOLVE
     let mut imports = ImportSection::new();
     imports.import(
         abi::CPU_MODULE,
+        abi::MEMORY_NAME,
+        EntityType::Memory(MemoryType { minimum: 0, maximum: if shared_memory { Some(65536) } else { None }, memory64: false, shared: shared_memory, page_size_log2: None }),
+    );
+    imports.import(
+        abi::CPU_MODULE,
         abi::TABLE_NAME,
         EntityType::Table(TableType { element_type: RefType::FUNCREF, table64: false, minimum: 0, maximum: None, shared: false }),
     );
+    // eax..edi, the registers `rt.resolve` may look at
+    for &(_, name, ty) in &GLOBALS[..8] {
+        imports.import(abi::CPU_MODULE, name, EntityType::Global(GlobalType { val_type: ty, mutable: true, shared: false }));
+    }
     let resolve = RT_FUNCS.iter().find(|(f, _)| matches!(f, abi::RtFunc::Resolve)).map(|(_, n)| *n).expect("resolve");
     imports.import(abi::RT_MODULE, resolve, EntityType::Function(1));
     let mut functions = FunctionSection::new();
     let mut exports = ExportSection::new();
     let mut code = CodeSection::new();
     let mut out_funcs = Vec::new();
+    let at = |off: u32| MemArg { offset: off as u64, align: 2, memory_index: 0 };
     for (i, &entry) in entries.iter().enumerate() {
         functions.function(0);
         let name = abi::export_name(entry);
         exports.export(&name, ExportKind::Func, 1 + i as u32);
-        let mut f = Function::new([]);
+        let mut f = Function::new([(1, ValType::I32)]);
+        let slot = abi::resolve_slot(entry) as i32;
+        f.instruction(&W::I32Const(slot));
+        f.instruction(&W::I32Load(at(abi::RESOLVE_CACHE)));
+        f.instruction(&W::I32Const(entry as i32));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&W::I32Const(slot));
+        f.instruction(&W::I32Load(at(abi::RESOLVE_CACHE + 4)));
+        f.instruction(&W::Else);
         for r in 0..8 {
             f.instruction(&W::LocalGet(r));
+            f.instruction(&W::GlobalSet(r));
         }
         f.instruction(&W::I32Const(entry as i32));
         f.instruction(&W::Call(0));
+        for r in 0..8 {
+            f.instruction(&W::GlobalGet(r));
+            f.instruction(&W::LocalSet(r));
+        }
+        f.instruction(&W::End);
+        f.instruction(&W::LocalSet(8));
+        for r in 0..8 {
+            f.instruction(&W::LocalGet(r));
+        }
+        f.instruction(&W::LocalGet(8));
         f.instruction(&W::CallIndirect { type_index: 0, table_index: 0 });
         f.instruction(&W::End);
         code.function(&f);

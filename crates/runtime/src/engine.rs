@@ -86,6 +86,10 @@ pub struct Engine {
     /// The code each translated function came from (`recomp::Output::ranges`), to find
     /// the ones a write into code makes stale.
     pub code_ranges: HashMap<u32, Vec<(u32, u32)>, AddrHash>,
+    /// The batch (module) each function was translated in, and each batch's functions:
+    /// functions of one module call each other directly, so a stale one takes its module.
+    pub batch_of: HashMap<u32, u32, AddrHash>,
+    pub batch_entries: HashMap<u32, Vec<u32>, AddrHash>,
     /// Table index of a function that does nothing (returned after an API call).
     pub nop_index: u32,
     /// The same for 64-bit code (`nop_module64`).
@@ -194,6 +198,8 @@ impl Engine {
             p: Some(Box::new(p)),
             funcs: HashMap::default(),
             code_ranges: HashMap::default(),
+            batch_of: HashMap::default(),
+            batch_entries: HashMap::default(),
             nop_index: 0,
             nop_index64: 0,
             x64: false,
@@ -1267,6 +1273,11 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
     for (entry, r) in out.ranges {
         e.code_ranges.insert(entry, r);
     }
+    let list: Vec<u32> = out.functions.iter().map(|(a, _)| *a).collect();
+    for &a in &list {
+        e.batch_of.insert(a, tag);
+    }
+    e.batch_entries.insert(tag, list);
     if volatile_batch {
         let list: Vec<u32> = out.functions.iter().map(|(a, _)| *a).collect();
         for &a in &list {
@@ -1708,11 +1719,23 @@ fn note_code_written<M: Machine>(m: &mut M) {
     let hit = |a: u32, code: Option<&Vec<(u32, u32)>>| {
         ranges.iter().any(|&(s, end)| (a >= s && a < end) || code.is_some_and(|c| c.iter().any(|&(cs, ce)| cs < end && s < ce)))
     };
-    let dropped: Vec<(u32, u32)> = e.funcs.iter().filter(|&(&a, _)| hit(a, e.code_ranges.get(&a))).map(|(&a, &i)| (a, i)).collect();
-    for (a, _) in &dropped {
+    let stale: Vec<u32> = e.funcs.keys().copied().filter(|&a| hit(a, e.code_ranges.get(&a))).collect();
+    // (with the rest of their modules: those call them directly)
+    let mut gone: HashSet<u32> = HashSet::default();
+    for a in stale {
+        match e.batch_of.get(&a).and_then(|t| e.batch_entries.remove(t)) {
+            Some(list) => gone.extend(list),
+            None => {
+                gone.insert(a);
+            }
+        }
+    }
+    let dropped: Vec<(u32, u32)> = gone.iter().filter_map(|a| e.funcs.get(a).map(|&i| (*a, i))).collect();
+    for a in &gone {
         e.funcs.remove(a);
         e.tag_of.remove(a);
         e.code_ranges.remove(a);
+        e.batch_of.remove(a);
     }
     e.inline_cache = None;
     for &(a, _) in &dropped {
@@ -1723,7 +1746,7 @@ fn note_code_written<M: Machine>(m: &mut M) {
         return;
     }
     let entries: Vec<u32> = dropped.iter().map(|&(a, _)| a).collect();
-    let out = recomp::redirects(&entries);
+    let out = recomp::redirects(&entries, m.engine_ref().shared_memory);
     let names: Vec<String> = out.functions.iter().map(|(_, n)| n.clone()).collect();
     match m.instantiate(&out.wasm, &names) {
         Ok(thunks) => {
