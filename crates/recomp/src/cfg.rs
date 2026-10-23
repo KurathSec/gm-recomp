@@ -28,6 +28,9 @@ pub struct FuncInfo<'a> {
     pub volatile: &'a dyn Fn(u32) -> bool,
     /// The batch being translated (1..2^23), for `abi::trap::STALE`.
     pub tag: u32,
+    /// At most this many instructions (0: `MAX_INSTRS_PER_FUNCTION`): code translated
+    /// ahead of being called (callees, neighbours) may be data discovery took for code.
+    pub max_instrs: usize,
 }
 
 /// How code is decoded: 32-bit, or 64-bit with the upper half of its addresses.
@@ -252,8 +255,9 @@ fn build_with(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, depth: u8, cache:
                     fop.insert(ip, (((buf[k] & 7) as u16) << 8) | buf[k + 1] as u16);
                 }
             }
-            if total > MAX_INSTRS_PER_FUNCTION {
-                return Err(format!("function at {entry:#x} exceeds {MAX_INSTRS_PER_FUNCTION} instructions"));
+            let max = if info.max_instrs == 0 { MAX_INSTRS_PER_FUNCTION } else { info.max_instrs };
+            if total > max {
+                return Err(format!("function at {entry:#x} exceeds {max} instructions"));
             }
             let next = instr.next_ip() as u32;
             if instr.code() == iced_x86::Code::Pushd_imm32 {

@@ -1089,6 +1089,11 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
     }
 }
 
+/// Instructions at most in a function translated ahead of being called (a callee or a
+/// neighbour): one that discovery found in data can be endless; a real one this long
+/// is translated when it is called.
+const AHEAD_MAX_INSTRS: usize = 20_000;
+
 /// Functions a module holds at most when it is translated for a call: the called
 /// function, those it calls directly, then its neighbours in the image (code used
 /// together tends to lie together). Browsers bound the number of modules (Firefox
@@ -1116,6 +1121,10 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
     let mut failed = Vec::new();
     let mut errors = Vec::new();
     note_code_written(m);
+    // (GMR_BATCH_LOG=pre: each batch before it is translated, to find one that fails hard)
+    if std::env::var("GMR_BATCH_LOG").is_ok_and(|v| v == "pre") {
+        m.print(&format!("translating {:x?}", entries));
+    }
     let cache = m.engine().inline_cache.take().unwrap_or_default();
     let tag = {
         let e = m.engine();
@@ -1152,7 +1161,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
             let is_fn = |a: u32| funcs.contains_key(&a) || md.map(|md| md.functions.contains(&a)).unwrap_or(false);
             // (code outside the images, which the runtime allocated, lies below 4 GB)
             let high = md.map_or(0, |md| md.base_high);
-            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high, volatile: &volatile, tag };
+            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high, volatile: &volatile, tag, max_instrs: 0 };
             volatile_batch |= volatile(entry);
             if let Err(e) = tr.add_function(entry, &info) {
                 errors.push(format!("translate {entry:#x}: {e}"));
@@ -1176,7 +1185,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
             }
             let Some(md) = mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
             let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high, volatile: &volatile, tag };
+            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high, volatile: &volatile, tag, max_instrs: AHEAD_MAX_INSTRS };
             if tr.add_function(a, &info).is_ok() {
                 queue.extend(tr.direct_targets(a));
             }
@@ -1198,7 +1207,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
                     continue;
                 }
                 let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high, volatile: &volatile, tag };
+                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high, volatile: &volatile, tag, max_instrs: AHEAD_MAX_INSTRS };
                 let _ = tr.add_function(a, &info);
             }
         }

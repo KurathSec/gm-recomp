@@ -15,6 +15,9 @@ pub struct LoadedModule {
     pub is_dll: bool,
     /// Export name -> VA. Ordinal-only exports use "#<ordinal>".
     pub exports: HashMap<String, u32>,
+    /// Forwarded exports: name (or "#<ordinal>") -> (DLL, function or "#<ordinal>"), as
+    /// Wine's vcruntime140.dll forwards memcpy to ucrtbase.dll.
+    pub forwards: HashMap<String, (String, String)>,
     /// VA ranges that hold code (for discovery/translation).
     pub code_ranges: Vec<(u32, u32)>,
     /// File bytes (kept for discovery).
@@ -114,8 +117,17 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
         }
     }
     let mut exports = HashMap::default();
+    let mut forwards = HashMap::default();
     for e in pe.exports().map_err(|e| e.to_string())? {
-        if e.forwarder.is_some() {
+        if let Some(f) = &e.forwarder {
+            // "DLL.Function" or "DLL.#ordinal"
+            if let Some((dll, func)) = f.rsplit_once('.') {
+                let to = (format!("{dll}.dll"), func.to_string());
+                if let Some(n) = &e.name {
+                    forwards.insert(n.clone(), to.clone());
+                }
+                forwards.insert(format!("#{}", e.ordinal), to);
+            }
             continue;
         }
         let va = base + e.rva;
@@ -143,6 +155,7 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
         entry: base + pe.entry_rva,
         is_dll: pe.is_dll(),
         exports,
+        forwards,
         code_ranges,
         file: bytes,
         tls_callbacks,

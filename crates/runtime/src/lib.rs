@@ -30,6 +30,13 @@ pub fn api_set(dll: &str) -> Option<&'static str> {
 
 impl ImportResolver for StubResolver<'_> {
     fn resolve(&mut self, dll: &str, name: &str) -> u32 {
+        self.resolve_forwarded(dll, name, 0)
+    }
+}
+
+impl StubResolver<'_> {
+    /// `resolve`, following a loaded module's forwarded exports a few deep.
+    fn resolve_forwarded(&mut self, dll: &str, name: &str, depth: u32) -> u32 {
         let dll = api_set(dll).unwrap_or(dll);
         let n = dll.to_lowercase();
         let stem = n.trim_end_matches(".exe").trim_end_matches(".dll");
@@ -37,6 +44,9 @@ impl ImportResolver for StubResolver<'_> {
         if let Some(m) = found {
             if let Some(&va) = m.exports.get(name) {
                 return va;
+            }
+            if let Some((to_dll, to_name)) = m.forwards.get(name).cloned().filter(|_| depth < 4) {
+                return self.resolve_forwarded(&to_dll, &to_name, depth + 1);
             }
         }
         if let Some(a) = self.registry.data_export(dll, name) {

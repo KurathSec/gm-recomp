@@ -1609,7 +1609,14 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
 
 fn proc_address(c: &mut Ctx, base: u32, name: &str) -> u32 {
     if let Some(m) = c.p.module_by_base(base) {
-        return m.exports.get(name).copied().unwrap_or(0);
+        if let Some(&va) = m.exports.get(name) {
+            return va;
+        }
+        // a forwarded export: where it goes (another module's, or an emulated DLL's)
+        let Some((dll, func)) = m.forwards.get(name).cloned() else { return 0 };
+        let p = &mut *c.p;
+        let mut resolver = crate::StubResolver { registry: &mut p.registry, modules: &p.modules };
+        return crate::loader::ImportResolver::resolve(&mut resolver, &dll, &func);
     }
     let dll = match c.p.fake_module_name(base) {
         Some(d) => d.to_string(),
