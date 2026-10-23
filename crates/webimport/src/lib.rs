@@ -236,8 +236,9 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
     let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None };
-    game.iexpress = unwrap_iexpress(&mut game.files)?;
+    // (the game's folder first: an IExpress package in a folder unwraps from there)
     game.reroot();
+    game.iexpress = unwrap_iexpress(&mut game.files)?;
     game.files.sort_by(|a, b| a.0.cmp(&b.0));
     let (entry, _) = game.entry();
     if game.find(&entry).is_some_and(|(_, d)| d.windows(12).any(|w| w == b"NullsoftInst")) {
@@ -400,6 +401,12 @@ pub fn dx8_build(exes: &[&str]) -> Option<String> {
     }).map(|a| a.to_string())
 }
 
+/// A path in a folder named as an old version ("(Old version)", "old"): another copy is
+/// the one to play.
+fn old_copy(path: &str) -> bool {
+    path.to_lowercase().split(|ch: char| !ch.is_alphanumeric()).any(|w| w == "old" || w == "older" || w == "previous")
+}
+
 /// An exe that may be the game (not an uninstaller or a runtime's installer).
 fn game_exe(path: &str) -> bool {
     let l = path.to_lowercase();
@@ -410,17 +417,17 @@ fn game_exe(path: &str) -> bool {
 impl Game {
     /// A game whose exe is not at the top (a folder in the shared folder, a readme beside
     /// the game's folder): the folder of the exe to run becomes the top, and what lies
-    /// outside it is left out. The exe is one GameMaker made if any, else the shallowest,
-    /// then the largest.
+    /// outside it is left out. The exe is one GameMaker made if any, not in an old
+    /// version's folder, the shallowest, then the largest.
     fn reroot(&mut self) {
-        if self.iexpress.is_some() || self.files.iter().any(|(p, _)| !p.contains('/') && game_exe(p)) {
+        if self.files.iter().any(|(p, _)| !p.contains('/') && game_exe(p)) {
             return;
         }
         let best = self
             .files
             .iter()
             .filter(|(p, _)| game_exe(p))
-            .max_by_key(|(p, d)| (self.engine(p)["kind"] != "unknown", std::cmp::Reverse(p.matches('/').count()), d.len()))
+            .max_by_key(|(p, d)| (self.engine(p)["kind"] != "unknown", !old_copy(p), std::cmp::Reverse(p.matches('/').count()), d.len()))
             .map(|(p, _)| p.clone());
         let Some((dir, _)) = best.as_deref().and_then(|b| b.rsplit_once('/')) else { return };
         let prefix = format!("{dir}/");
@@ -513,6 +520,7 @@ impl Game {
             let mut wanted: Vec<String> = pe.imports().unwrap_or_default().iter().map(|i| i.dll.to_lowercase()).collect();
             wanted.extend(dll_names_in(d).into_iter().filter(|n| redistributable(n)));
             for name in wanted {
+                let name = runtime::api_set(&name).map_or(name, str::to_owned);
                 let stem = name.trim_end_matches(".dll");
                 if CORE_DLLS.contains(&stem) || HLE_DLLS.contains(&stem) || have.contains(&name) || out.contains(&name) {
                     continue;

@@ -1514,7 +1514,7 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
     // DLLs it imports that are files (the game's or the system directory's) load first.
     if let Ok(pe) = pe::Pe::parse(&bytes) {
         for d in pe.imports().unwrap_or_default() {
-            let stem = dll_stem(&d.dll);
+            let stem = dll_stem(crate::api_set(&d.dll).unwrap_or(&d.dll));
             if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.module_by_name(&d.dll).is_some() {
                 continue;
             }

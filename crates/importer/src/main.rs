@@ -81,6 +81,7 @@ fn supply_system_dlls(files_dir: &Path, system: &Path, shaders: bool) -> Result<
         let mut wanted: Vec<String> = pe.imports().unwrap_or_default().iter().map(|d| d.dll.to_lowercase()).collect();
         wanted.extend(dll_names_in(&bytes).into_iter().filter(|n| redistributable(n)));
         for name in wanted {
+            let name = runtime::api_set(&name).map_or(name, str::to_owned);
             let stem = name.trim_end_matches(".dll").to_string();
             if emulated(&stem) || shipped.contains(&name) || supplied.contains(&name) {
                 continue;
@@ -234,6 +235,45 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<FileEntry>) -> Result<()> {
     Ok(())
 }
 
+/// A path in a folder named as an old version ("(Old version)", "old"): another copy is
+/// the one to play.
+fn old_copy(path: &str) -> bool {
+    path.to_lowercase().split(|ch: char| !ch.is_alphanumeric()).any(|w| w == "old" || w == "older" || w == "previous")
+}
+
+/// An exe that may be the game (not an uninstaller or a runtime's installer), as
+/// webimport's `game_exe`.
+fn game_exe(path: &str) -> bool {
+    let l = path.to_lowercase();
+    let file = l.rsplit('/').next().unwrap_or(&l);
+    l.ends_with(".exe") && !["unins", "vcredist", "vc_redist", "dxsetup", "dxwebsetup", "oalinst", "dotnet", "directx"].iter().any(|p| file.starts_with(p))
+}
+
+/// Without an exe at the top of `files_dir`, the folder of the game's exe (a GameMaker one
+/// if any, the shallowest, then the largest) becomes the top and the rest goes, as
+/// webimport's `Game::reroot`.
+fn reroot(files_dir: &Path, tmp: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    walk(files_dir, files_dir, &mut files)?;
+    if files.iter().any(|f| !f.path.contains('/') && game_exe(&f.path)) {
+        return Ok(());
+    }
+    let best = files
+        .iter()
+        .filter(|f| game_exe(&f.path))
+        .max_by_key(|f| {
+            let path = files_dir.join(&f.path);
+            let dir = path.parent().unwrap_or(files_dir);
+            let gm = fs::read(&path).map(|b| !matches!(engine::detect(&b, dir), engine::Engine::Unknown)).unwrap_or(false);
+            (gm, !old_copy(&f.path), std::cmp::Reverse(f.path.matches('/').count()), f.size)
+        });
+    let Some((dir, _)) = best.and_then(|f| f.path.rsplit_once('/')) else { return Ok(()) };
+    fs::rename(files_dir, tmp)?;
+    fs::rename(tmp.join(dir), files_dir)?;
+    fs::remove_dir_all(tmp)?;
+    Ok(())
+}
+
 /// Of a game shipped as a Direct3D 8 and a Direct3D 9 build (GameMaker 8.2's gm82dx9), the
 /// Direct3D 8 one, as webimport's `dx8_build`.
 fn dx8_build(exes: &[&str]) -> Option<String> {
@@ -273,6 +313,7 @@ fn import_one(input: &Path, out: &Path, sys: &inventory::SystemExports, force: b
     }
     let files_dir = staging.join("files");
     let staged = extract::stage(input, &files_dir)?;
+    reroot(&files_dir, &staging.join("reroot"))?;
     let iexpress = extract::unwrap_iexpress(&files_dir, &staging.join("scratch"))?;
     if let Some(installer) = extract::unwrap_nsis(&files_dir, &staging.join("scratch"))? {
         println!("installed the NSIS package {installer}");

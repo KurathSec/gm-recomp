@@ -22,8 +22,15 @@ pub struct StubResolver<'a> {
     pub modules: &'a [LoadedModule],
 }
 
+/// The DLL an API set name stands for (Windows maps them in its loader; Wine 11 has no
+/// files for them): the Universal C Runtime's, `api-ms-win-crt-*`, are ucrtbase.dll.
+pub fn api_set(dll: &str) -> Option<&'static str> {
+    dll.to_lowercase().starts_with("api-ms-win-crt-").then_some("ucrtbase.dll")
+}
+
 impl ImportResolver for StubResolver<'_> {
     fn resolve(&mut self, dll: &str, name: &str) -> u32 {
+        let dll = api_set(dll).unwrap_or(dll);
         let n = dll.to_lowercase();
         let stem = n.trim_end_matches(".exe").trim_end_matches(".dll");
         let found = self.modules.iter().find(|m| m.name.trim_end_matches(".exe").trim_end_matches(".dll") == stem);

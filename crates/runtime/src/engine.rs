@@ -750,7 +750,9 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
     if trace {
         let name = name_of(m);
         let args = format_args(m, &regs, if nargs > 0 { nargs.min(8) } else { 4 });
-        let line = format!("{:w$}{name}({args}) from {ra:#x}", "", w = (depth * 2) as usize);
+        // (a secondary thread's calls say which thread)
+        let thread = m.engine_ref().p.as_ref().filter(|p| p.current != 0).map(|p| format!(" [thread {:#x}]", p.threads[p.current].id)).unwrap_or_default();
+        let line = format!("{:w$}{name}({args}) from {ra:#x}{thread}", "", w = (depth * 2) as usize);
         m.print(&line);
     }
     let Some(f) = func else {
@@ -1905,8 +1907,9 @@ fn collect_order(name: &str, x64: bool, read: &dyn Fn(&str) -> Option<Vec<u8>>, 
         return Ok(());
     }
     for d in pe.imports().map_err(|e| e.to_string())? {
-        if read(&d.dll).is_some() {
-            collect_order(&d.dll, x64, read, seen, order)?;
+        let dll = crate::api_set(&d.dll).unwrap_or(&d.dll);
+        if read(dll).is_some() {
+            collect_order(dll, x64, read, seen, order)?;
         }
     }
     order.push(name.to_string());
