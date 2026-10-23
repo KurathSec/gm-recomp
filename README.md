@@ -1,26 +1,66 @@
-# gmrecomp
+# gm-recomp
 
-Runs Windows GameMaker games (GameMaker 8.0/8.1, GameMaker: Studio 1.4 VM and YYC) in
-desktop browsers by recompiling their original executables. The x86 code of the
-runner, the game (YYC) and every DLL the game ships is translated to WebAssembly; the
-Windows APIs it calls (kernel32, user32, gdi32, Direct3D 8/9, DirectSound,
-DirectMusic, MCI, XInput, ...) are implemented in Rust. Nothing is re-implemented
-from GameMaker itself, so games behave as they do on Windows, x87 rounding included.
+Windows GameMaker games running in desktop browsers, from their original executables.
 
-## Requirements
+gm-recomp statically recompiles a game's x86 code to WebAssembly: the GameMaker runner,
+the game's own code when it was compiled with YYC, and every DLL the game ships. The
+Windows APIs that code calls (kernel32, user32, gdi32, Direct3D 8/9, DirectSound,
+DirectMusic, MCI, DirectInput, XInput, Winsock, ...) are implemented in Rust. Nothing of
+GameMaker itself is reimplemented, so a game behaves as it does on Windows, x87 rounding
+included.
 
-- Rust (stable for the native tools; nightly for the browser build:
-  `rustup toolchain install nightly`, `rustup target add wasm32-unknown-unknown --toolchain nightly`)
-- Node.js 22+ (dev server, tests), a Chromium-based browser or Firefox
-- `7z` (importing IExpress/CAB and RAR archives), `objcopy` (optional, strips the
-  system DLLs it supplies), `gcc` with 32-bit support (the CPU differential tests
-  run a small native reference program)
-- Wine's 32-bit PE DLLs (`/usr/lib64/wine-wow64/wine/i386-windows`, used by the
-  importer for the few runtime DLLs games need but do not ship)
-- Optional: a General MIDI SoundFont as `web/soundfont.sf2` (e.g. a link to
-  `/usr/share/soundfonts/default.sf2`), for games with MIDI music
+Supported engines: GameMaker 8.0 and 8.1, and GameMaker: Studio 1.4 (VM and YYC).
 
-## Using it
+- **Faithful.** It runs the original runner code. The x87 FPU is modelled bit-exactly in
+  every precision and rounding mode.
+- **Deterministic.** The clock is virtual and threads are scheduled cooperatively. The
+  same input gives the same state hash in the native harness, Node, Chrome and Firefox.
+- **Plays like the original.** Games run at their own speed (usually 50 fps) with
+  keyboard, mouse and game controllers. Saves are kept in the browser and can be exported.
+- **No per-game code.** Games are imported from their archive (zip, 7z, RAR,
+  IExpress packages), natively or in the page.
+- **Mods.** A debug switch, and reimplementations of Fangame.ModLoader's mods, can be
+  turned on per game.
+
+No game files are included: you import your own copies.
+
+## Status
+
+Every game in the test corpus reaches a playable state in Chrome and Firefox:
+
+| Game | Engine | Verified so far |
+|---|---|---|
+| Not Another Needle Game | GM 8.1 | mouse menus; New Game starts the game; music (supersound.dll on DirectSound) |
+| i wanna uhuhu spike | GM 8.0 | the kid runs and jumps in the hub; first stage; MP3 music (MCI), sound effects (DirectMusic) |
+| I wanna run the Marathon | GMS 1.4 VM | file select, hub, the marathon starts; title music from the GMS audio thread; Box2D golf (via a test copy) |
+| Crimson Needle 3 | GMS 1.4 VM | title, save select, new game (walk right into the opening); music |
+| indigo needle | GMS 1.4 VM + GMFile.dll | title room, the player moves (the extension runs on Wine's msvcp100) |
+| untitled needle game | GMS 1.4 YYC | intro and tutorial: run, jump; shaders compiled by Wine's d3dcompiler |
+| RNG Dungeon | GMS 1.4 YYC | intro, file select, a save chosen; all 22 shaders translate to GLSL |
+| I Wanna be the Vandal | GMS 1.4 VM | held out until the end: title, save select, new game, out of the box |
+| I wanna Bread | GM 8.1 (Release Candidate runner) | held out until the end: title, data select, the hub room, out of the box |
+
+GameMaker Studio 2 games do not run yet. Most of them use 64-bit runners, and their
+graphics go through Direct3D 11; neither is implemented.
+
+## Getting started
+
+### Requirements
+
+- Rust: stable for the native tools; nightly for the browser builds
+  (`rustup toolchain install nightly`, `rustup target add wasm32-unknown-unknown --toolchain nightly`)
+- Node.js 22+ (dev server, tests), and a Chromium-based browser or Firefox
+- `7z`, for importing IExpress/CAB and RAR archives
+- Wine's 32-bit PE DLLs (`/usr/lib64/wine-wow64/wine/i386-windows`). The importer adds
+  the few runtime DLLs that games need but do not ship.
+- Optional:
+  - `objcopy`, which strips the system DLLs the importer supplies
+  - `gcc` with 32-bit support, for the CPU differential tests (they run a small native
+    reference program)
+  - a General MIDI SoundFont as `web/soundfont.sf2`, for games with MIDI music (for
+    example a link to `/usr/share/soundfonts/default.sf2`)
+
+### Build and run
 
 ```sh
 # import games (folders, .zip, .rar, .exe) into web/public/games/<slug>/
@@ -28,58 +68,72 @@ cargo run --release -p importer -- import path/to/game.zip --out web/public/game
 
 # build the browser runtime (without DWARF: 3.4 MB instead of 21; the name section,
 # which profiles and stack traces use, stays)
-CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target wasm32-unknown-unknown -p web --target-dir target/wasm
+CARGO_PROFILE_RELEASE_DEBUG=0 cargo +nightly build --release --target wasm32-unknown-unknown -p web --target-dir target/wasm
 
-# serve it (cross-origin isolation headers included) and open http://localhost:8766/
+# serve it (with the cross-origin isolation headers it needs) and open http://localhost:8766/
 node web/dev/server.mjs
 ```
 
-The page lists the imported games; a game plays at its own speed with keyboard,
-mouse and game controllers, sound starts with the first click or key press, and
-saves are kept in the browser (export/import from the game page).
+The page lists the imported games. Sound starts with the first click or key press.
 
-Games can also be imported in the browser, from the archive they are stored as:
-"Import a game…" on the page, or `?zip=<url>` (for example a link to the archive in
-object storage), which imports and starts it. A zip, 7z or RAR works, with an
-IExpress package inside unwrapped (NSIS installers still need the native importer). The game is kept in the browser and plays with `?game=<slug>&local`.
-This needs two extra builds:
+### Importing in the browser
+
+Games can also be imported from the page:
+- "Import a game…" on the page, or
+- `?zip=<url>` (for example a link to the archive in object storage), which imports the
+  game and starts it.
+
+A zip, 7z or RAR works, and an IExpress package inside it is unwrapped. NSIS
+installers still need the native importer. The imported game is kept in the browser
+and plays with `?game=<slug>&local`. This needs two more builds:
 
 ```sh
 # the importer for the page (served at /import/)
-CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target wasm32-unknown-unknown -p webimport --target-dir target/wasm-import
+CARGO_PROFILE_RELEASE_DEBUG=0 cargo +nightly build --release --target wasm32-unknown-unknown -p webimport --target-dir target/wasm-import
 # the system DLLs it may add (served at /system32/; from Wine's PE builds)
 web/tools/system32.sh
 ```
 
-Each game's card (and the bar while it plays) has a **Mods** button: changes made to
-the game's files before it starts, only those its engine allows. *Debug mode* turns on
-the game's debug switch (GameMaker: Studio, VM or YYC; patcher.rs's patch).
-Fangame.ModLoader's mods are reimplemented for GameMaker 8 and GameMaker: Studio 1.4 VM
-games (not YYC, not GameMaker Studio 2 yet): GodMode, CrimsonKid, DotKid, DbgHelper
-(gm8x_fix's patches; the sleep margin for GameMaker: Studio), AllowFullscreen and
-PlayOnline (GameMaker 8 only). A GameMaker: Studio data.win is changed in place where
-sizes allow and grows at its end otherwise (`crates/gmmod/src/gms.rs` says how). The
-mods' code is `crates/gmmod`; their own files come from a Fangame.ModLoader folder:
+## Mods
+
+Each game's card has a **Mods** button, and so does the bar while a game plays. It
+lists changes made to the game's files before the game starts, only those the game's
+engine allows.
+
+- **Debug mode** turns on the game's debug switch, as patcher.rs does. It works for
+  GameMaker: Studio, VM or YYC.
+- Fangame.ModLoader's mods are reimplemented for GameMaker 8 and GameMaker: Studio 1.4
+  VM games:
+  - GodMode, CrimsonKid and DotKid;
+  - DbgHelper: gm8x_fix's patches on GameMaker 8, the sleep margin on GameMaker: Studio;
+  - AllowFullscreen and PlayOnline, on GameMaker 8 only.
+
+A GameMaker: Studio data.win is changed in place where sizes allow, and grows at its
+end otherwise; `crates/gmmod/src/gms.rs` explains how. The mods' own files (sprites,
+scripts) come from a Fangame.ModLoader folder:
 
 ```sh
 # the mods for the page (served at /gmmod/)
-CARGO_PROFILE_RELEASE_DEBUG=0 rustup run nightly cargo build --release --target wasm32-unknown-unknown -p gmmod --target-dir target/wasm-mods
+CARGO_PROFILE_RELEASE_DEBUG=0 cargo +nightly build --release --target wasm32-unknown-unknown -p gmmod --target-dir target/wasm-mods
 # their files (served at /mods/)
 web/tools/mods.sh path/to/Fangame.ModLoader
 ```
 
-A game's network connections (Winsock) go through a WebSocket relay you run, since
-a browser cannot open TCP or UDP itself; PlayOnline's settings name it (`ws://…`):
+A browser cannot open TCP or UDP connections itself, so a game's network connections
+(Winsock) go through a WebSocket relay that you run. PlayOnline's settings name that
+relay (`ws://…`):
 
 ```sh
 node web/tools/relay.mjs --port 8790 --allow iwannastartaparty.com
 ```
 
-The browser also remembers which code each game needed and translates it right
-after the first frame of the next session (`?noprofile` turns that off), so later
-sessions do not stall the first time they reach a room or effect. A game's first
-session starts from what other games built with the same runner needed, or from the
-site's profiles in `web/public/profiles` until there are any. To remake those:
+## Translation profiles
+
+The browser remembers which code each game needed. In the next session it translates
+that code right after the first frame, so the game does not stall the first time it
+reaches a room or effect; `?noprofile` turns this off. A game's first session starts
+from what other games built with the same runner needed. If there are none yet, it uses
+the site's profiles in `web/public/profiles`. To remake those:
 
 ```sh
 # per run (any games, recorded sessions with --replay), then merged
@@ -97,51 +151,71 @@ browser worker: runtime.wasm (Rust: engine, HLE APIs, x87 model) + cpu glue + x8
    │ virtual clock, deterministic threads   │ sound mix ──► SharedArrayBuffer ring ──► AudioWorklet
 ```
 
-- `crates/recomp`: the x86 → wasm translator (lazy flags, register locals, blocks
-  laid out so loops are wasm loops and other jumps forward branches, small callees
-  inlined, SSE on wasm SIMD, common x87 instructions inline with an exact 80-bit
-  model behind them).
-- `crates/fpu`: the x87 model (rustc_apfloat; bit-exact in every precision and
-  rounding mode).
-- `crates/runtime`: PE loader, process state, the HLE layer (`hle/`), the engine
-  (dispatcher, SEH, API calls, threads).
-- `crates/web`: the browser build of the runtime; `web/`: page, worker, WebGL2
-  renderer, audio worklet.
-- `crates/harness`: runs the same runtime natively on wasmtime (games headless, state
-  hashes, WAV output, traces) and the CPU differential tests against the host CPU.
-- `crates/importer`: unpacks games, detects the engine, inventories modules and APIs;
-  `crates/webimport`: the same unpacking and detection for the page.
+The translator (`crates/recomp`):
+- computes flags lazily and keeps registers in wasm locals;
+- lays out blocks so that loops are wasm loops and other jumps are forward branches;
+- inlines small callees;
+- runs SSE on wasm SIMD;
+- runs common x87 instructions inline, with the exact 80-bit model behind them.
 
-Runs are deterministic: the clock is virtual, threads are scheduled cooperatively,
-and the same input gives the same state hash in the harness, Node, Chrome and Firefox.
+Code that static discovery missed is translated when it first runs.
 
-## Status
+## Repository layout
 
-| Game | Engine | Verified so far |
-|---|---|---|
-| Not Another Needle Game | GM 8.1 | mouse menus; New Game starts the game; music (supersound.dll on DirectSound) |
-| i wanna uhuhu spike | GM 8.0 | the kid runs and jumps in the hub; first stage; MP3 music (MCI), sound effects (DirectMusic) |
-| I wanna run the Marathon | GMS 1.4 VM | file select, hub, the marathon starts; title music from the GMS audio thread; Box2D golf (via a test copy) |
-| Crimson Needle 3 | GMS 1.4 VM | title, save select, new game (walk right into the opening); music |
-| indigo needle | GMS 1.4 VM + GMFile.dll | title room, the player moves (extension runs on Wine's msvcp100) |
-| untitled needle game | GMS 1.4 YYC | intro and tutorial: run, jump; shaders compiled by Wine's d3dcompiler |
-| RNG Dungeon | GMS 1.4 YYC | intro, file select, a save chosen; all 22 shaders translate to GLSL |
-| I Wanna be the Vandal | GMS 1.4 VM | held out until the end: title, save select, new game, out of the box |
-| I wanna Bread | GM 8.1 (Release Candidate runner) | held out until the end: title, data select, the hub room, out of the box |
+| Path | What it is |
+|---|---|
+| `crates/pe` | PE image parsing |
+| `crates/x86` | x86 decoding and static code discovery |
+| `crates/recomp` | the x86 → wasm translator |
+| `crates/fpu` | the x87 model (rustc_apfloat; bit-exact in every precision and rounding mode) |
+| `crates/runtime` | PE loader, process state, the HLE layer (`hle/`), the engine (dispatcher, SEH, API calls, threads) |
+| `crates/web` | the browser build of the runtime |
+| `crates/harness` | the same runtime run natively on wasmtime (games headless, state hashes, WAV output, traces) and the CPU differential tests |
+| `crates/importer` | unpacks games, detects the engine, inventories modules and APIs |
+| `crates/webimport` | the importer's unpacking and detection, for the page |
+| `crates/gmmod` | the mods |
+| `web/` | page, worker, WebGL2 renderer, audio worklet, dev server and tools |
+| `tests/` | the CPU reference program, a Direct3D 9 shader test game, data.win tools |
+| `docs/` | design notes per milestone |
 
-See `docs/` for each milestone's notes (`r1-cpu.md` CPU and tests, `r2-harness.md`
-the native harness, `r3-r5-runtime.md` the browser runtime, audio, threads,
-Direct3D 9 and shaders).
-
-## Tests
-
-`tests/d3d9/make-test-game.sh` builds a Direct3D 9 shader test that runs like a game
-(`game=zz-test-d3d9-shaders`); `tests/gms/` has tools for GMS `data.win` files (rooms,
-a rough GML bytecode lister, test copies with patched bytecode).
+## Testing
 
 ```sh
-cargo test --release                                   # unit tests
+cargo test --release                                                     # unit tests
 cargo run --release -p harness -- cpu-diff --mode x87fast --count 5000   # CPU vs. host
 cargo run --release -p harness -- run web/public/games/<slug> --frames 300
 web/tools/run-browser.sh chrome 'game=<slug>&frames=300&epoch=1767225600&nopace=1'
 ```
+
+There are also test tools:
+- `tests/d3d9/make-test-game.sh` builds a Direct3D 9 shader test that runs like a game
+  (`game=zz-test-d3d9-shaders`).
+- `tests/gms/` has tools for GMS `data.win` files: a room lister, a rough GML bytecode
+  lister, and test copies with patched bytecode.
+
+## Documentation
+
+`docs/README.md` indexes the design notes. Each milestone has its own: the corpus and
+browser feasibility, the CPU and its tests, the native harness, then the browser
+runtime with audio, threads, Direct3D 9, shaders and performance.
+
+## Acknowledgements
+
+- [iced-x86](https://github.com/icedland/iced) decodes x86. [rustc_apfloat](https://github.com/rust-lang/rustc_apfloat)
+  is the core of the x87 model. [wasm-encoder](https://github.com/bytecodealliance/wasm-tools) builds
+  the modules, which [wasmtime](https://wasmtime.dev/) runs natively.
+- [Symphonia](https://github.com/pdeljanov/Symphonia) decodes MP3, and
+  [RustySynth](https://github.com/sinshu/rustysynth) plays MIDI.
+- [Wine](https://www.winehq.org/)'s PE DLLs stand in for Windows runtime libraries that
+  games need but do not ship. They are loaded at run time and are not part of this
+  repository.
+- [UndertaleModTool](https://github.com/UnderminersTeam/UndertaleModTool) documents the
+  GameMaker: Studio data format and bytecode.
+- [gm8x_fix](https://github.com/skyfloogle/gm8x_fix) (MIT): DbgHelper's GameMaker 8
+  patches are its patch table, converted.
+- Fangame.ModLoader and patcher.rs are the mods reimplemented here.
+
+## License
+
+MIT; see [LICENSE](LICENSE). GameMaker is a trademark of YoYo Games; this project is not
+affiliated with it.
