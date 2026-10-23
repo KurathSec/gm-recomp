@@ -320,6 +320,9 @@ pub struct Process {
     pub idle_streak: u32,
     /// Winsock sockets and the names behind their stand-in addresses
     pub sockets: crate::hle::winsock::Sockets,
+    /// SetDllDirectory's folder: LoadLibrary looks there after the game's folder
+    /// (gm82core points it at the extensions' DLLs it extracted).
+    pub dll_dir: Option<String>,
     pub exit_code: Option<u32>,
     pub tls_used: Vec<bool>,
     pub atoms: HashMap<String, u16>,
@@ -477,6 +480,7 @@ impl Process {
             clock_us: 0,
             idle_streak: 0,
             sockets: Default::default(),
+            dll_dir: None,
             exit_code: None,
             tls_used: vec![false; 1088],
             atoms: HashMap::default(),

@@ -389,6 +389,16 @@ fn unwrap_iexpress(files: &mut Vec<(String, Vec<u8>)>) -> Result<Option<(String,
     Ok(None)
 }
 
+/// Of a game shipped as a Direct3D 8 and a Direct3D 9 build (GameMaker 8.2's gm82dx9 patches
+/// the runner to Direct3D 9 at run time; the runtime keeps no translations of patched code),
+/// the Direct3D 8 one: the exe named like another but with "dx8" for "dx9".
+pub fn dx8_build(exes: &[&str]) -> Option<String> {
+    exes.iter().find(|a| {
+        let l = a.to_lowercase();
+        l.contains("dx8") && exes.iter().any(|b| b.to_lowercase() == l.replace("dx8", "dx9"))
+    }).map(|a| a.to_string())
+}
+
 impl Game {
     fn find(&self, name: &str) -> Option<&(String, Vec<u8>)> {
         self.files.iter().find(|(p, _)| p.eq_ignore_ascii_case(name))
@@ -407,6 +417,9 @@ impl Game {
             if let Some((p, _)) = self.find(run) {
                 return (p.clone(), candidates);
             }
+        }
+        if let Some(p) = dx8_build(&top.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>()) {
+            return (p, candidates);
         }
         let largest = top.iter().max_by_key(|(_, d)| d.len()).map(|(p, _)| p.clone()).unwrap_or_default();
         (largest, candidates)

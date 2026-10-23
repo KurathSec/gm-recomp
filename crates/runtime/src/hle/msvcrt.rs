@@ -1810,6 +1810,12 @@ pub fn register_more(r: &mut Registry) {
 /// (`Registry::on_demand`), so the stub addresses of everything else stay put.
 pub fn register_late(r: &mut Registry) {
     let m = "msvcrt.dll";
+    r.add_on_demand(m, "_wfopen", |c| {
+        let (path, mode) = (c.wstr_arg(0), c.wstr_arg(1));
+        let f = fopen(c, &path, &mode);
+        c.trace(format!("({path:?}, {mode:?}) = {f:#x}"));
+        ok(f)
+    });
     r.add_on_demand(m, "_memicmp", |c| {
         let n = c.arg(2) as usize;
         let mut a = vec![0u8; n];

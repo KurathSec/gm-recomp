@@ -230,6 +230,15 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<FileEntry>) -> Result<()> {
     Ok(())
 }
 
+/// Of a game shipped as a Direct3D 8 and a Direct3D 9 build (GameMaker 8.2's gm82dx9), the
+/// Direct3D 8 one, as webimport's `dx8_build`.
+fn dx8_build(exes: &[&str]) -> Option<String> {
+    exes.iter().find(|a| {
+        let l = a.to_lowercase();
+        l.contains("dx8") && exes.iter().any(|b| b.to_lowercase() == l.replace("dx8", "dx9"))
+    }).map(|a| a.to_string())
+}
+
 fn choose_entry(files: &[FileEntry], iexpress: &Option<extract::IExpress>, hint: &Option<String>) -> (String, Vec<String>) {
     let top_exes: Vec<&FileEntry> = files
         .iter()
@@ -244,6 +253,9 @@ fn choose_entry(files: &[FileEntry], iexpress: &Option<extract::IExpress>, hint:
         }
     }
     if let Some(p) = hint.as_deref().and_then(find) {
+        return (p, candidates);
+    }
+    if let Some(p) = dx8_build(&top_exes.iter().map(|f| f.path.as_str()).collect::<Vec<_>>()) {
         return (p, candidates);
     }
     let largest = top_exes.iter().max_by_key(|f| f.size).map(|f| f.path.clone()).unwrap_or_default();

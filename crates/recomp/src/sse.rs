@@ -702,6 +702,31 @@ impl<'a> FuncEmit<'a> {
                 self.i(W::F32x4ReplaceLane(0));
                 self.xset(d);
             }
+            // Approximate reciprocals (FMOD's mixer): the exact value. Processors return
+            // ~12-bit approximations that differ between makers.
+            Rcpss | Rsqrtss => {
+                let d = instr.op0_register();
+                self.xget(d);
+                self.i(W::F32Const(1.0f32.into()));
+                self.src_f32(instr, 1);
+                if m == Rsqrtss {
+                    self.i(W::F32Sqrt);
+                }
+                self.i(W::F32Div);
+                self.i(W::F32x4ReplaceLane(0));
+                self.xset(d);
+            }
+            Rcpps | Rsqrtps => {
+                let d = instr.op0_register();
+                self.i(W::F32Const(1.0f32.into()));
+                self.i(W::F32x4Splat);
+                self.vsrc(instr, 1);
+                if m == Rsqrtps {
+                    self.i(W::F32x4Sqrt);
+                }
+                self.i(W::F32x4Div);
+                self.xset(d);
+            }
             Minsd => self.scalar_minmax_f64(instr, true),
             Maxsd => self.scalar_minmax_f64(instr, false),
             Minss | Maxss => {

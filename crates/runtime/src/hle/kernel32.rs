@@ -1331,6 +1331,9 @@ pub const SYSTEM_DIR: &str = "C\\Windows\\system32";
 pub const CORE_DLLS: &[&str] = &["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid", "opengl32"];
 /// Further HLE DLLs, used when the game does not ship its own copy.
 pub const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
+/// DLLs emulated only when the game has no file for them (the importers do not count
+/// them as emulated, so a game that imports one statically still gets the real DLL).
+const FALLBACK_DLLS: &[&str] = &["msacm32"];
 
 fn dll_stem(name: &str) -> String {
     let lower = name.to_lowercase();
@@ -1383,6 +1386,13 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
             return load_image(c, &base_name, &guest_path, bytes, true);
         }
     }
+    // Then SetDllDirectory's folder.
+    if let Some(dir) = c.p.dll_dir.clone().filter(|_| !with_ext.contains(['\\', '/'])) {
+        let path = format!("{}\\{base_name}", dir.trim_end_matches('\\'));
+        if let Some(bytes) = c.p.fs.read_all(&c.p.vpath(&path)) {
+            return load_image(c, &base_name, &path, bytes, true);
+        }
+    }
     // Then the system directory (runtime DLLs the importer supplied).
     let sys = format!("{SYSTEM_DIR}\\{base_name}");
     if !with_ext.contains(['\\', '/']) && c.p.fs.is_file(&sys) {
@@ -1390,7 +1400,7 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
             return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true);
         }
     }
-    if HLE_DLLS.contains(&stem.as_str()) {
+    if HLE_DLLS.contains(&stem.as_str()) || FALLBACK_DLLS.contains(&stem.as_str()) {
         return Ok(c.p.fake_module(&stem));
     }
     c.p.log(format!("LoadLibrary({name:?}): not found"));
@@ -1409,7 +1419,8 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
                 continue;
             }
             let file = format!("{stem}.dll");
-            if c.p.fs.is_file(&c.p.vpath(&file)) || c.p.fs.is_file(&format!("{SYSTEM_DIR}\\{file}")) {
+            let in_dll_dir = c.p.dll_dir.as_ref().is_some_and(|d| c.p.fs.is_file(&c.p.vpath(&format!("{}\\{file}", d.trim_end_matches('\\')))));
+            if c.p.fs.is_file(&c.p.vpath(&file)) || in_dll_dir || c.p.fs.is_file(&format!("{SYSTEM_DIR}\\{file}")) {
                 load_library(c, &file)?;
             }
         }
@@ -3216,6 +3227,164 @@ pub fn register_extra(r: &mut Registry) {
         c.p.timers_due.retain(|&(t, _)| t != h);
         ok(1, 1)
     });
+    // GameMaker 8.2's extensions (gm82core, gm82net, gm82dx9): on demand, so the ids of
+    // what other games import stay where they were.
+    r.add_on_demand(k, "CreateSemaphoreW", |c| {
+        let h = c.p.new_handle(Handle::Semaphore);
+        ok(4, h)
+    });
+    r.add_on_demand(k, "SetDllDirectoryW", |c| {
+        let dir = c.wstr_arg(0);
+        c.p.dll_dir = (!dir.is_empty()).then_some(dir);
+        ok(1, 1)
+    });
+    r.add_on_demand(k, "SetDllDirectoryA", |c| {
+        let dir = c.str_arg(0);
+        c.p.dll_dir = (!dir.is_empty()).then_some(dir);
+        ok(1, 1)
+    });
+    // The process writing its own memory (gm82core and gm82dx9 patch the runner):
+    // this process is the only one there is.
+    r.add_on_demand(k, "WriteProcessMemory", |c| {
+        let (to, from, n, written) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4));
+        let mut b = vec![0u8; n as usize];
+        let _ = c.host.read(from, &mut b);
+        let _ = c.host.write(to, &b);
+        let hex: String = b.iter().take(16).map(|x| format!("{x:02x}")).collect();
+        c.p.log(format!("WriteProcessMemory({to:#x}, {n}) = {hex}"));
+        write_out(c, written, n);
+        ok(5, 1)
+    });
+    r.add_on_demand(k, "ReadProcessMemory", |c| {
+        let (from, to, n, read) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4));
+        let mut b = vec![0u8; n as usize];
+        let _ = c.host.read(from, &mut b);
+        let _ = c.host.write(to, &b);
+        write_out(c, read, n);
+        ok(5, 1)
+    });
+    r.add_on_demand("ntdll.dll", "RtlGetNtVersionNumbers", |c| {
+        // as GetVersionExA: XP SP3 (the build's top nibble marks a free build)
+        write_out(c, c.arg(0), 5);
+        write_out(c, c.arg(1), 1);
+        write_out(c, c.arg(2), 0xF000_0000 | 2600);
+        ok(3, 0)
+    });
+    // Window subclassing (SetWindowSubclass, GetWindowSubclass, RemoveWindowSubclass,
+    // DefSubclassProc): taken, not applied yet.
+    let cc = "comctl32.dll";
+    r.add_on_demand(cc, "#410", |c| {
+        c.p.log(format!("SetWindowSubclass({:#x}, {:#x}, {}): not applied", c.arg(0), c.arg(1), c.arg(2)));
+        ok(4, 1)
+    });
+    r.add_on_demand(cc, "#411", |_c| ok(4, 0));
+    r.add_on_demand(cc, "#412", |_c| ok(3, 1));
+    r.add_on_demand(cc, "#413", |_c| ok(4, 0));
+    // What SDL2 (gm82joy's joysticks) asks for at startup.
+    let u = "user32.dll";
+    for name in ["RegisterDeviceNotificationW", "RegisterDeviceNotificationA"] {
+        r.add_on_demand(u, name, |c| {
+            let h = c.p.new_handle(Handle::Event { manual: true, signaled: false });
+            ok(3, h)
+        });
+    }
+    r.add_on_demand(u, "UnregisterDeviceNotification", |_c| ok(1, 1));
+    r.add_on_demand(u, "TrackMouseEvent", |_c| ok(1, 1));
+    r.add_on_demand(u, "GetClipboardSequenceNumber", |_c| ok(0, 1));
+    r.add_on_demand(k, "SetThreadExecutionState", |_c| ok(1, 0x8000_0000));
+    r.add_on_demand(k, "AttachConsole", |c| {
+        c.set_last_error(6); // ERROR_INVALID_HANDLE: no console
+        ok(1, 0)
+    });
+    r.add_on_demand(k, "CancelIo", |_c| ok(1, 1));
+    r.add_on_demand(k, "CreateToolhelp32Snapshot", |c| {
+        c.set_last_error(50);
+        ok(2, 0xFFFF_FFFF)
+    });
+    r.add_on_demand(k, "Process32First", |_c| ok(2, 0));
+    r.add_on_demand(k, "Process32Next", |_c| ok(2, 0));
+    r.add_on_demand(k, "Process32FirstW", |_c| ok(2, 0));
+    r.add_on_demand(k, "Process32NextW", |_c| ok(2, 0));
+    // VerSetConditionMask(mask, type, condition): the condition's 3 bits at the type's slot
+    r.add_on_demand(k, "VerSetConditionMask", |c| {
+        let mut mask = c.arg(0) as u64 | (c.arg(1) as u64) << 32;
+        let (ty, cond) = (c.arg(2), (c.arg(3) & 7) as u64);
+        for bit in 0..8 {
+            if ty & (1 << bit) != 0 {
+                mask |= cond << (3 * bit);
+            }
+        }
+        Ok(Ret { edx: Some((mask >> 32) as u32), ..Ret::stdcall(4, mask as u32) })
+    });
+    // VerifyVersionInfoW(info, type, mask): against GetVersionExA's XP SP3; major, minor
+    // and service pack compare as one version under the major's condition
+    r.add_on_demand(k, "VerifyVersionInfoW", |c| {
+        let (info, ty) = (c.arg(0), c.arg(1));
+        let mask = c.arg(2) as u64 | (c.arg(3) as u64) << 32;
+        let rd = |c: &mut Ctx, o: u32| c.host.read_u32(info + o).unwrap_or(0);
+        let want = [rd(c, 4), rd(c, 8), rd(c, 276) & 0xFFFF, rd(c, 276) >> 16];
+        let have = [5u32, 1, 3, 0];
+        let cond_of = |bit: u32| ((mask >> (3 * bit)) & 7) as u32;
+        let test = |cond: u32, o: std::cmp::Ordering| match cond {
+            1 => o.is_eq(),
+            2 => o.is_gt(),
+            3 => o.is_ge(),
+            4 => o.is_lt(),
+            5 => o.is_le(),
+            _ => true,
+        };
+        // VER_MINORVERSION 1, VER_MAJORVERSION 2, VER_SERVICEPACKMINOR 0x10, VER_SERVICEPACKMAJOR 0x20
+        let parts: Vec<usize> = [(2u32, 0usize), (1, 1), (0x20, 2), (0x10, 3)].iter().filter(|(b, _)| ty & b != 0).map(|&(_, i)| i).collect();
+        let lead = [2u32, 1, 0x20, 0x10].into_iter().find(|b| ty & b != 0).map(|b| cond_of(b.trailing_zeros())).unwrap_or(0);
+        let ord = parts.iter().map(|&i| have[i].cmp(&want[i])).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal);
+        let mut pass = parts.is_empty() || test(lead, ord);
+        if ty & 4 != 0 {
+            pass &= test(cond_of(2), 2600.cmp(&rd(c, 12)));
+        }
+        if ty & 8 != 0 {
+            pass &= test(cond_of(3), 2u32.cmp(&rd(c, 16)));
+        }
+        if !pass {
+            c.set_last_error(1150); // ERROR_OLD_WIN_VERSION
+        }
+        ok(4, pass as u32)
+    });
+    r.add_on_demand("ole32.dll", "PropVariantClear", |c| {
+        let _ = c.host.write(c.arg(0), &[0u8; 16]);
+        ok(1, 0)
+    });
+    r.add_on_demand("winmm.dll", "waveOutGetErrorTextW", |c| {
+        if c.arg(2) > 0 {
+            let _ = c.host.write(c.arg(1), &[0, 0]);
+        }
+        ok(3, 0)
+    });
+    r.add_on_demand("imm32.dll", "ImmGetCandidateListW", |_c| ok(4, 0));
+    r.add_on_demand("imm32.dll", "ImmSetCompositionStringW", |_c| ok(6, 0));
+    // The Audio Compression Manager (FMOD Ex resolves it when it unpacks): no codecs,
+    // so FMOD decodes with its own.
+    let acm = "msacm32.dll";
+    const ACMERR_NOTPOSSIBLE: u32 = 512;
+    const MMSYSERR_NOTSUPPORTED: u32 = 8;
+    r.add_on_demand(acm, "acmStreamOpen", |c| {
+        write_out(c, c.arg(0), 0);
+        ok(8, ACMERR_NOTPOSSIBLE)
+    });
+    r.add_on_demand(acm, "acmStreamClose", |_c| ok(2, 0));
+    r.add_on_demand(acm, "acmStreamSize", |_c| ok(4, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmStreamConvert", |_c| ok(3, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmStreamPrepareHeader", |_c| ok(3, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmStreamUnprepareHeader", |_c| ok(3, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmStreamReset", |_c| ok(2, 0));
+    r.add_on_demand(acm, "acmFormatSuggest", |_c| ok(5, ACMERR_NOTPOSSIBLE));
+    r.add_on_demand(acm, "acmMetrics", |_c| ok(3, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmDriverOpen", |_c| ok(3, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmDriverClose", |_c| ok(2, 0));
+    r.add_on_demand(acm, "acmDriverEnum", |_c| ok(3, 0));
+    r.add_on_demand(acm, "acmDriverDetailsA", |_c| ok(3, MMSYSERR_NOTSUPPORTED));
+    r.add_on_demand(acm, "acmFormatTagDetailsA", |_c| ok(3, ACMERR_NOTPOSSIBLE));
+    r.add_on_demand(acm, "acmFormatDetailsA", |_c| ok(3, ACMERR_NOTPOSSIBLE));
+    r.add_on_demand(acm, "acmFormatEnumA", |_c| ok(5, 0));
 }
 
 /// GetTempFileName: `dir\pre<hex>.tmp`; with unique = 0, a new number whose file is created.

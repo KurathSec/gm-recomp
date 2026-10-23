@@ -44,9 +44,11 @@ pub(crate) const L_XQ: u32 = 34;
 pub(crate) const L_XA: u32 = 35;
 pub(crate) const L_XB: u32 = 36;
 pub(crate) const L_XR: u32 = 37;
+/// The return address the function was entered with (functions with `jmp r/m32`).
+pub(crate) const L_RA: u32 = 38;
 /// Locals after the parameters: the eight registers are the function's parameters
 /// (locals 0..7) and its results (`types::FUNC`).
-pub const LOCALS: [(u32, ValType); 8] = [
+pub const LOCALS: [(u32, ValType); 9] = [
     (17, ValType::I32),
     (2, ValType::I64),
     (1, ValType::F64),
@@ -55,6 +57,7 @@ pub const LOCALS: [(u32, ValType); 8] = [
     (1, ValType::I64),
     (3, ValType::I32),
     (3, ValType::F64),
+    (1, ValType::I32),
 ];
 /// `L_XQ` bit: the precision flag is set and rounding is to nearest (with C1 dead,
 /// the x87 helpers' quick lane).
@@ -1055,6 +1058,11 @@ impl<'a> FuncEmit<'a> {
 
     pub fn emit(&mut self) {
         self.load_state();
+        if self.cfg.blocks.values().any(|b| matches!(b.term, Term::IndirectTail)) {
+            self.get(L_REG + 4);
+            self.load(32);
+            self.set(L_RA);
+        }
         self.count(crate::abi::COUNT_ENTRIES);
         if self.count && !self.count_blocks {
             self.count_at(self.cfg.entry);
@@ -1253,6 +1261,21 @@ impl<'a> FuncEmit<'a> {
                 // jmp r/m32
                 self.read_op(instr, 0, false);
                 self.set(L_T1);
+                // To the address the function was entered to return to: its return.
+                // Delphi's string concatenation (_UStrCatN) ends `pop eax; lea esp,
+                // [esp+edx*4]; jmp eax` to drop the caller's arguments; as a tail call
+                // the continuation became a new function inside this one's frame, and a
+                // loop around such calls nested a wasm frame per iteration until the
+                // stack ran out.
+                self.get(L_T1);
+                self.get(L_RA);
+                self.i(W::I32Eq);
+                self.i(W::If(BlockType::Empty));
+                self.get(L_T1);
+                self.i(W::GlobalSet(Global::Eip as u32));
+                self.spill_flags();
+                self.ret_regs();
+                self.i(W::End);
                 self.tail_dynamic();
             }
             Term::Ret => {
