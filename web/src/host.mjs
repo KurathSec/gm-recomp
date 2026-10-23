@@ -2,6 +2,7 @@
 // module and translated modules, and hands it the game files. Runs unchanged in a
 // browser worker and in Node.
 
+import { asset } from './asset.mjs';
 import { D3DGL } from './gpu.mjs';
 
 const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call', 'gcopy', 'rget', 'rset'];
@@ -44,7 +45,7 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
  *   without `profile`: what other games with the same modules needed (a runner's code is the same
  *   in every game built with it)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = '/soundfont.sf2', onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;

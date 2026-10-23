@@ -75,6 +75,10 @@ node web/dev/server.mjs
 ```
 
 The page lists the imported games. Sound starts with the first click or key press.
+While a game plays:
+- **F4** switches the browser to full screen. A game's own full-screen switch would only resize its window here.
+- **Keys** remaps keys outside the game, for that game or for every game.
+- When the game ends (Esc in most fangames), the page goes back to the list.
 
 ### Importing in the browser
 
@@ -127,6 +131,33 @@ relay (`ws://…`):
 node web/tools/relay.mjs --port 8790 --allow iwannastartaparty.com
 ```
 
+## Embedding the player
+
+A site can run games on its own pages. `web/src/player.mjs` exports `playGame(...)`, which:
+- starts a game in a canvas;
+- feeds it the page's keyboard, mouse and controllers;
+- plays its sound;
+- reports what happens through callbacks: the game's resolution, its log, saves stored, the game ending.
+
+The page around it decides the rest: layout, buttons, where saves go. Other modules help:
+- `keymap.mjs`: key remapping and its editor.
+- `import.mjs`: importing an archive.
+- `saves.mjs`: saves in IndexedDB, and exporting them.
+- `mods.mjs`: mod choices.
+
+The modules find their files by relative paths. `web/tools/bundle.sh <dir>` collects everything into one directory, which can be served under any path:
+- the modules;
+- the three browser builds;
+- the site profiles;
+- the system DLLs;
+- the mods' files.
+
+The page that loads it must be cross-origin isolated (`Cross-Origin-Opener-Policy: same-origin`, and `Cross-Origin-Embedder-Policy: require-corp` or `credentialless`). [fangame-archive](https://github.com/KurathSec/fangame-archive)'s `/play/` page is an example. It downloads a game from the catalog, imports it once, and keeps its saves in the player's account.
+
+```sh
+web/tools/bundle.sh dist/player && tar -czf gm-recomp-player.tar.gz -C dist/player .
+```
+
 ## Translation profiles
 
 The browser remembers which code each game needed. In the next session it translates
@@ -174,7 +205,7 @@ Code that static discovery missed is translated when it first runs.
 | `crates/importer` | unpacks games, detects the engine, inventories modules and APIs |
 | `crates/webimport` | the importer's unpacking and detection, for the page |
 | `crates/gmmod` | the mods |
-| `web/` | page, worker, WebGL2 renderer, audio worklet, dev server and tools |
+| `web/` | page, worker, WebGL2 renderer, audio worklet, the embeddable player (`src/player.mjs`), dev server and tools |
 | `tests/` | the CPU reference program, a Direct3D 9 shader test game, data.win tools |
 | `docs/` | design notes per milestone |
 

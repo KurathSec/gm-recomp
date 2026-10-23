@@ -1,13 +1,15 @@
 // Importing a game in the browser from its archive (zip, 7z or RAR, as games are stored):
 // webimport.wasm (crates/webimport) unpacks it, unwraps an IExpress package, picks the
-// entry exe and lists the system DLLs to add; those come from /system32/ (see
+// entry exe and lists the system DLLs to add; those come from system32/ (see
 // tools/system32.sh). Imported games live in IndexedDB (saves.mjs `storeGame`) and
 // play from there (?game=<slug>&local).
+
+import { asset } from './asset.mjs';
 
 let modulePromise;
 
 function instantiate() {
-  modulePromise ??= WebAssembly.compileStreaming(fetch('/import/webimport.wasm'));
+  modulePromise ??= WebAssembly.compileStreaming(fetch(asset('import/webimport.wasm')));
   return modulePromise.then((mod) => {
     // (wasm-bindgen placeholders a dependency brings along; nothing calls them)
     const imports = {};
@@ -50,7 +52,7 @@ export async function importArchive(bytes, name, progress = () => {}) {
     if (!want.length) break;
     for (const dll of want) {
       tried.add(dll);
-      const r = await fetch(`/system32/${encodeURIComponent(dll)}`);
+      const r = await fetch(asset(`system32/${encodeURIComponent(dll)}`));
       if (!r.ok) continue;
       progress(`adding ${dll}`);
       const [pp, pl] = put(new TextEncoder().encode(`C/Windows/system32/${dll}`));

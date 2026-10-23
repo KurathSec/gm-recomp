@@ -96,6 +96,24 @@
       #mods .buttons { display: flex; gap: 8px; justify-content: flex-end; }
       #mods .buttons .primary { border-color: var(--accent); color: var(--accent); }
       .badge.mods { color: var(--accent); border-color: currentColor; }
+
+      /* keys */
+      #keys { width: min(480px, calc(100vw - 32px)); padding: 0; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+      #keys::backdrop { background: rgba(0, 0, 0, 0.55); }
+      #keys form { display: flex; flex-direction: column; gap: 12px; padding: 18px; margin: 0; }
+      #keys h2 { margin: 0; font-size: 17px; }
+      #keys .km-about { margin: 0; color: var(--muted); font-size: 13px; }
+      #keys .km-table { display: flex; flex-direction: column; gap: 4px; max-height: 55vh; overflow: auto; }
+      #keys .km-row { display: grid; grid-template-columns: 110px 1fr; gap: 8px; align-items: center; font-size: 13px; }
+      #keys .km-head { color: var(--muted); font-size: 12px; }
+      #keys .km-game { font-weight: 600; }
+      #keys .km-keys { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+      #keys .km-none { color: var(--muted); }
+      #keys .km-key, #keys .km-add { padding: 2px 8px; font-size: 12px; }
+      #keys .km-listen { border-color: var(--accent); color: var(--accent); }
+      #keys .km-scope { display: flex; gap: 16px; font-size: 13px; }
+      #keys .km-buttons { display: flex; gap: 8px; justify-content: flex-end; }
+      #keys .km-buttons .primary { border-color: var(--accent); color: var(--accent); }
     </style>
   </head>
   <body>
@@ -120,9 +138,10 @@
         <label class="button" title="Load saves exported earlier (restarts the game)">Import saves<input id="import" type="file" accept=".json,application/json" hidden /></label>
         <button id="wipe">Delete saves</button>
         <button id="modsbtn" title="Change the game before it starts (restarts it)" hidden>Mods</button>
+        <button id="keysbtn" title="Keys you press reach the game as other keys">Keys</button>
         <button id="statsbtn" title="Frame rate, frame time and input latency">Stats</button>
         <button id="logbtn">Log</button>
-        <button id="fs">Fullscreen</button>
+        <button id="fs" title="F4">Fullscreen</button>
       </div>
       <div id="stage">
         <canvas id="screen" width="640" height="480"></canvas>
@@ -134,10 +153,12 @@
     </div>
 
     <dialog id="mods"><form method="dialog"></form></dialog>
+    <dialog id="keys"></dialog>
 
     <script type="module">
       import { deleteGame, deleteSaves, exportSaves, listGames, loadGame, loadSaves, openSaves, parseSaves, storeGame, storeSaves } from './src/saves.mjs';
-      import { KEYS } from './src/keys.mjs';
+      import { editKeymap, loadKeymap } from './src/keymap.mjs';
+      import { playGame } from './src/player.mjs';
       import { loadChoices, modsFor, saveChoices, selectedMods } from './src/mods.mjs';
 
       /** The mods dialog for a game; `saved()` runs after its choices were stored. */
@@ -460,7 +481,11 @@
           e.target.textContent = `Scale: ${integer ? 'integer' : 'fit'}`;
           fit();
         };
-        document.getElementById('fs').onclick = () => document.getElementById('player').requestFullscreen?.();
+        const toggleFullscreen = () => {
+          if (document.fullscreenElement) document.exitFullscreen?.();
+          else document.getElementById('player').requestFullscreen?.();
+        };
+        document.getElementById('fs').onclick = toggleFullscreen;
         document.addEventListener('fullscreenchange', () => {
           document.body.classList.toggle('fullscreen', !!document.fullscreenElement);
           requestAnimationFrame(fit);
@@ -511,84 +536,6 @@
           location.reload();
         };
 
-        // Sound starts with the first user gesture (browser autoplay rules); audio=1
-        // starts it without one (tests, with autoplay allowed).
-        let audio = null;
-        let audioStarted = false;
-        let audioNode = null;
-        const startAudio = async () => {
-          if (audioStarted || !audio) return;
-          audioStarted = true;
-          try {
-            const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 0.005 }); // as low as the system allows
-            await ctx.audioWorklet.addModule('src/audio-worklet.js');
-            // the queue starts at what the system's audio period needs (see the worklet)
-            const latency = Math.max(0.015, (ctx.baseLatency || 0) + 0.01);
-            const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames, latency } });
-            node.connect(ctx.destination);
-            audioNode = node;
-            // Skip what piled up before the user enabled sound.
-            const idx = new Int32Array(audio.sab, 0, 2);
-            Atomics.store(idx, 1, Atomics.load(idx, 0));
-            hint.hidden = true;
-          } catch (e) {
-            audioStarted = false;
-            send('/log', `audio failed: ${e}`);
-          }
-        };
-        for (const t of ['pointerdown', 'keydown']) window.addEventListener(t, startAudio);
-        const audioStats = () => !audioNode ? Promise.resolve(audioStarted ? 'audio: not running' : null) : new Promise((res) => {
-          audioNode.port.onmessage = ({ data: a }) => {
-            const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
-            const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
-            res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms, base latency ${((audioNode.context.baseLatency ?? 0) * 1000).toFixed(1)} ms, target ${(a.target * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
-          };
-          audioNode.port.postMessage(0);
-        });
-
-        const w = new Worker('src/worker.mjs', { type: 'module' });
-        w.onmessage = ({ data }) => {
-          if (data.type === 'log') {
-            logEl.textContent += data.line + '\n';
-            send('/log', data.line);
-            monitorSend(`log ${data.line}`);
-            if (data.line.startsWith('downloaded')) statusEl.textContent = 'Starting…';
-          } else if (data.type === 'audio') {
-            audio = data;
-            if (q.has('audio')) startAudio();
-            else if (!audioStarted) hint.hidden = false;
-          } else if (data.type === 'size') {
-            [gameW, gameH] = [data.w, data.h];
-            statusEl.hidden = true;
-            fit();
-          } else if (data.type === 'monitor') {
-            monitorSend(data.line);
-          } else if (data.type === 'stats') {
-            const f = (v) => v.toFixed(1);
-            statsEl.textContent =
-              `${f(data.fps)} fps   frame ${f(data.interval)} ms (max ${f(data.intervalMax)})\n` +
-              `guest ${f(data.busy)} ms per frame (max ${f(data.busyMax)})   late ${data.late}   wake +${f(data.wake)} ms (max ${f(data.wakeMax)})\n` +
-              (data.inputs ? `input → frame ${f(data.input)} ms (max ${f(data.inputMax)}, ${data.inputs})` : 'input → frame —');
-            if (report && q.has('stats')) send('/log', 'stats: ' + statsEl.textContent.replace(/\n/g, ' | '));
-            monitorSend('stats ' + statsEl.textContent.replace(/\n/g, ' | '));
-          } else if (data.type === 'capture') {
-            if (report) fetch(`/capture/${data.frame}`, { method: 'POST', body: data.png }).catch(() => {});
-          } else if (data.type === 'done') {
-            statusEl.hidden = false;
-            statusEl.textContent = data.status === 0 ? 'The game has ended.' : `The game stopped (status ${data.status}). See the log for details.`;
-            monitorSend(`done status ${data.status}`);
-            monitorFlush();
-            audioStats().then((a) => {
-              if (a) send('/log', a);
-              send('/done', `status ${data.status}`);
-            });
-          }
-        };
-        w.onerror = (e) => {
-          statusEl.hidden = false;
-          statusEl.textContent = `worker error: ${e.message}`;
-          send('/done', `worker error: ${e.message}`);
-        };
         statusEl.textContent = 'Downloading…';
         // &mods=a,b: exactly these mods this time (with their stored settings)
         let modChoices = q.has('nomods') ? {} : loadChoices(game);
@@ -596,9 +543,7 @@
           const on = q.get('mods').split(',').filter(Boolean);
           modChoices = Object.fromEntries(on.map((id) => [id, { on: true, config: modChoices[id]?.config ?? {} }]));
         }
-        const offscreen = screen.transferControlToOffscreen();
         const pacing = ['asap', 'jit', 'clock'].includes(q.get('pacing')) ? q.get('pacing') : 'sync';
-        const ahead = !q.has('noahead');
         // a recorded session to replay: its date, saves and input
         let replay = null;
         let runEpoch = epoch;
@@ -615,83 +560,76 @@
           }
         }
         monitorSend(`start game=${game} epoch=${runEpoch} ua=${navigator.userAgent.replaceAll(' ', '_')}`);
-        const slowMs = q.has('slow') ? Number(q.get('slow')) : undefined;
-        // Keys go to the worker through a shared ring (written here as they happen, read
-        // at the guest's message polls): [write, read], then 256 × [vk, scan, down] and
-        // 256 event times.
-        const inputRing = new SharedArrayBuffer(8 + 256 * 12 + 256 * 8);
-        const ringIdx = new Int32Array(inputRing, 0, 2);
-        const ringEv = new Int32Array(inputRing, 8, 256 * 3);
-        const ringWhen = new Float64Array(inputRing, 8 + 256 * 12, 256);
-        const sendKey = (code, down, numlock, when) => {
-          const k = KEYS[code];
-          if (!k) return;
-          const wr = Atomics.load(ringIdx, 0);
-          if (((wr - Atomics.load(ringIdx, 1)) | 0) >= 256) return; // the guest is not reading
-          const i = wr & 255;
-          // the NumLock state decides what the keypad sends (see the runtime's numpad_key)
-          ringEv.set([k[0], k[1] | (numlock ? 0x200 : 0), down ? 1 : 0], i * 3);
-          ringWhen[i] = when ?? performance.timeOrigin + performance.now();
-          Atomics.store(ringIdx, 0, (wr + 1) | 0);
+        // A test run (frames, report, replay) stays on the page when the game ends; a
+        // played one goes back to where it was started from.
+        const testRun = frames > 0 || report || !!replay;
+        const back = () => {
+          if (document.referrer && new URL(document.referrer).origin === location.origin && history.length > 1) history.back();
+          else location.href = './';
         };
-        w.postMessage({ game, frames, epoch: runEpoch, canvas: offscreen, capture, pace, pacing, ahead, script, persist: persist && !replay, monitor, replay, slowMs, inputRing, useProfile: !q.has('noprofile'), local, modChoices }, [offscreen]);
-
-        // Input goes to the worker as it happens; the runtime applies it at the guest's
-        // next message poll.
-        const gameKeys = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|Digit|Escape|Numpad|Page|Home|End|Insert|Delete)/;
-        const held = new Map(); // code -> NumLock state it went down with
-        for (const type of ['keydown', 'keyup']) {
-          window.addEventListener(type, (e) => {
-            if (e.target instanceof HTMLInputElement) return;
-            if (gameKeys.test(e.code) && !e.metaKey && e.code !== 'F11') e.preventDefault();
-            if (e.repeat) return;
-            const numlock = e.getModifierState ? e.getModifierState('NumLock') : true;
-            if (type === 'keydown') held.set(e.code, numlock);
-            else held.delete(e.code);
-            sendKey(e.code, type === 'keydown', numlock, performance.timeOrigin + e.timeStamp);
-          });
-        }
-        // Keys held while the page loses focus never see their keyup: release them then.
-        const releaseHeld = () => {
-          for (const [code, numlock] of held) sendKey(code, false, numlock);
-          held.clear();
+        const player = playGame({
+          game,
+          local,
+          canvas: screen,
+          frames,
+          epoch: runEpoch,
+          capture,
+          pace,
+          pacing,
+          ahead: !q.has('noahead'),
+          script,
+          persist: persist && !replay,
+          monitor,
+          replay,
+          slowMs: q.has('slow') ? Number(q.get('slow')) : undefined,
+          useProfile: !q.has('noprofile'),
+          modChoices,
+          audio: q.has('audio'),
+          // &keymap=KeyA:ShiftLeft,...: this map instead of the stored one (tests)
+          keymap: q.has('keymap') ? Object.fromEntries(q.get('keymap').split(',').filter(Boolean).map((p) => p.split(':'))) : loadKeymap(game).map,
+          // F4: the browser's full screen (a game's own full-screen switch only resizes its window here)
+          pageKeys: { F4: toggleFullscreen },
+          onLog(line) {
+            logEl.textContent += line + '\n';
+            send('/log', line);
+            monitorSend(`log ${line}`);
+            if (line.startsWith('downloaded') || line.startsWith('loaded')) statusEl.textContent = 'Starting…';
+          },
+          onSoundPending: (waiting) => (hint.hidden = !waiting),
+          onSize(w, h) {
+            [gameW, gameH] = [w, h];
+            statusEl.hidden = true;
+            fit();
+          },
+          onMonitor: monitorSend,
+          onStats(data) {
+            const f = (v) => v.toFixed(1);
+            statsEl.textContent =
+              `${f(data.fps)} fps   frame ${f(data.interval)} ms (max ${f(data.intervalMax)})\n` +
+              `guest ${f(data.busy)} ms per frame (max ${f(data.busyMax)})   late ${data.late}   wake +${f(data.wake)} ms (max ${f(data.wakeMax)})\n` +
+              (data.inputs ? `input → frame ${f(data.input)} ms (max ${f(data.inputMax)}, ${data.inputs})` : 'input → frame —');
+            if (report && q.has('stats')) send('/log', 'stats: ' + statsEl.textContent.replace(/\n/g, ' | '));
+            monitorSend('stats ' + statsEl.textContent.replace(/\n/g, ' | '));
+          },
+          onCapture(frame, png) {
+            if (report) fetch(`/capture/${frame}`, { method: 'POST', body: png }).catch(() => {});
+          },
+          onDone(status) {
+            statusEl.hidden = false;
+            statusEl.textContent = status === 0 ? 'The game has ended.' : typeof status === 'string' ? status : `The game stopped (status ${status}). See the log for details.`;
+            monitorSend(`done status ${status}`);
+            monitorFlush();
+            player.soundStats().then((a) => {
+              if (a) send('/log', a);
+              send('/done', typeof status === 'string' ? status : `status ${status}`);
+            });
+            if (status === 0 && !testRun) back();
+          },
+        });
+        document.getElementById('keysbtn').onclick = async () => {
+          const r = await editKeymap(document.getElementById('keys'), game);
+          if (r) player.setKeymap(r.map);
         };
-        window.addEventListener('blur', releaseHeld);
-        document.addEventListener('visibilitychange', () => document.hidden && releaseHeld());
-        const mouse = (e) => {
-          const r = screen.getBoundingClientRect();
-          const buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
-          const t = e.type === 'mousemove' ? undefined : performance.timeOrigin + e.timeStamp;
-          w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons, t });
-        };
-        for (const t of ['mousemove', 'mousedown', 'mouseup']) screen.addEventListener(t, mouse);
-
-        // Game controllers (the standard layout matches an Xbox controller): XInput state,
-        // sent when it changes.
-        const PAD_BUTTONS = { 0: 0x1000, 1: 0x2000, 2: 0x4000, 3: 0x8000, 4: 0x0100, 5: 0x0200, 8: 0x0020, 9: 0x0010, 10: 0x0040, 11: 0x0080, 12: 0x1, 13: 0x2, 14: 0x4, 15: 0x8 };
-        const padLast = ['', '', '', ''];
-        const axis = (v) => Math.max(-32768, Math.min(32767, Math.round((v ?? 0) * 32767)));
-        const pollPads = () => {
-          const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-          for (let i = 0; i < 4; i++) {
-            const g = pads[i];
-            let state;
-            if (g && g.connected) {
-              let buttons = 0;
-              for (const [k, bit] of Object.entries(PAD_BUTTONS)) if (g.buttons[k]?.pressed) buttons |= bit;
-              const trig = (k) => Math.round(255 * (g.buttons[k]?.value ?? 0));
-              state = { connected: true, buttons, lt: trig(6), rt: trig(7), lx: axis(g.axes[0]), ly: axis(-(g.axes[1] ?? 0)), rx: axis(g.axes[2]), ry: axis(-(g.axes[3] ?? 0)) };
-            } else state = { connected: false, buttons: 0, lt: 0, rt: 0, lx: 0, ly: 0, rx: 0, ry: 0 };
-            const key = JSON.stringify(state);
-            if (key !== padLast[i]) {
-              padLast[i] = key;
-              w.postMessage({ type: 'pad', index: i, ...state });
-            }
-          }
-          requestAnimationFrame(pollPads);
-        };
-        requestAnimationFrame(pollPads);
-        screen.addEventListener('contextmenu', (e) => e.preventDefault());
         // &keytest=ms:code:1|0,...: real key events at those times (tests of the input path)
         for (const k of (q.get('keytest') ?? '').split(',').filter(Boolean)) {
           const [ms, code, down] = k.split(':');

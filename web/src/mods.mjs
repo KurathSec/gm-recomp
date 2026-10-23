@@ -1,7 +1,9 @@
 // Mods: changes to a game's files made in the browser before it starts (crates/gmmod,
-// served at /gmmod/gmmod.wasm), with each mod's own files from /mods/<id>/ (copied from a
+// gmmod/gmmod.wasm next to the page), with each mod's own files from mods/<id>/ (copied from a
 // Fangame.ModLoader folder by tools/mods.sh). The page shows the mods a game's engine
 // allows (`applies`, from the manifest's engine) and keeps each game's choices.
+
+import { asset } from './asset.mjs';
 
 // Fangame.ModLoader edits GameMaker 8 games and GameMaker: Studio games that keep their
 // bytecode (not YYC); these mods do GameMaker 8 and GameMaker: Studio 1.4 (crates/gmmod
@@ -134,7 +136,7 @@ const same = (a, b) => a.replaceAll('\\', '/').toLowerCase() === b.replaceAll('\
  */
 export async function applyMods(files, manifest, mods, print) {
   if (!mods.length) return files;
-  compiled ??= WebAssembly.compileStreaming(fetch('/gmmod/gmmod.wasm'));
+  compiled ??= WebAssembly.compileStreaming(fetch(asset('gmmod/gmmod.wasm')));
   const module = await compiled;
   const imports = {};
   for (const imp of WebAssembly.Module.imports(module)) (imports[imp.module] ??= {})[imp.name] = () => 0;
@@ -162,7 +164,7 @@ export async function applyMods(files, manifest, mods, print) {
   for (const m of mods) {
     const def = MODS.find((d) => d.id === m.id);
     for (const name of def?.files ?? []) {
-      const r = await fetch(`/mods/${m.id}/${name.split('/').map(encodeURIComponent).join('/')}`);
+      const r = await fetch(asset(`mods/${m.id}/${name.split('/').map(encodeURIComponent).join('/')}`));
       if (!r.ok) throw new Error(`mod ${m.id}: ${name} is missing (HTTP ${r.status}; see web/tools/mods.sh)`);
       call(x.add_asset, m.id, name, new Uint8Array(await r.arrayBuffer()));
     }

@@ -201,7 +201,8 @@ pub fn read_rar(data: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String
     Ok(out)
 }
 
-/// Unpacks an archive (zip, 7z or RAR, by content: renamed ones are common) into a game:
+/// Unpacks an archive (zip, 7z or RAR, by content: renamed ones are common; or a bare exe)
+/// into a game:
 /// files with a single shared top folder stripped (its name is the title then), an
 /// IExpress package unwrapped.
 pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
@@ -209,6 +210,13 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
         read_7z(archive)?
     } else if archive.starts_with(b"Rar!") {
         read_rar(archive)?
+    } else if archive.starts_with(b"MZ") {
+        // a self-extracting zip, else a game released as its exe alone (GameMaker 8 keeps
+        // the game data inside)
+        read_zip(archive).unwrap_or_else(|_| {
+            let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+            vec![(vec![file.to_owned()], false, archive.to_vec())]
+        })
     } else {
         read_zip(archive)?
     };
