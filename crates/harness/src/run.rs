@@ -200,6 +200,12 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn set_global(&mut self, g: G, v: u32) {
         let _ = self.cpu.globals[g as usize].set(&mut *self.cx, Val::I32(v as i32));
     }
+    fn global64(&mut self, g: G) -> u64 {
+        self.cpu.globals[g as usize].get(&mut *self.cx).i64().unwrap_or(0) as u64
+    }
+    fn set_global64(&mut self, g: G, v: u64) {
+        let _ = self.cpu.globals[g as usize].set(&mut *self.cx, Val::I64(v as i64));
+    }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         // GMR_SOUNDFONT, else the system's General MIDI SoundFont; offered once
         let mut cx = self.cx.as_context_mut();
@@ -245,25 +251,27 @@ impl<C: Cx> Machine for Wt<'_, C> {
         }
     }
     fn xmm(&mut self, i: u32) -> u128 {
-        self.cpu.globals[G::Xmm0 as usize + i as usize].get(&mut *self.cx).v128().map(|v| v.as_u128()).unwrap_or(0)
+        self.cpu.globals[abi::xmm_global(i) as usize].get(&mut *self.cx).v128().map(|v| v.as_u128()).unwrap_or(0)
     }
     fn set_xmm(&mut self, i: u32, v: u128) {
-        let _ = self.cpu.globals[G::Xmm0 as usize + i as usize].set(&mut *self.cx, Val::V128(v.into()));
+        let _ = self.cpu.globals[abi::xmm_global(i) as usize].set(&mut *self.cx, Val::V128(v.into()));
     }
     fn call_index(&mut self, idx: u32) -> Result<(), String> {
         let f = match self.cpu.table.get(&mut *self.cx, idx as u64) {
             Some(Ref::Func(Some(f))) => f,
             _ => return Err(format!("table slot {idx} is empty")),
         };
-        // translated functions take the registers and return them
-        let mut args = [Val::I32(0); 8];
-        for (r, a) in args.iter_mut().enumerate() {
-            *a = self.cpu.globals[r].get(&mut *self.cx);
+        // translated functions take the registers and return them (rax..r15 in a
+        // 64-bit process)
+        let (first, n) = if self.engine_ref().x64 { (G::Rax as usize, 16) } else { (0, 8) };
+        let mut args = [Val::I32(0); 16];
+        for (r, a) in args[..n].iter_mut().enumerate() {
+            *a = self.cpu.globals[first + r].get(&mut *self.cx);
         }
-        let mut res = [Val::I32(0); 8];
-        f.call(&mut *self.cx, &args, &mut res).map_err(|e| format!("{e:?}"))?;
-        for (r, v) in res.into_iter().enumerate() {
-            self.cpu.globals[r].set(&mut *self.cx, v).map_err(|e| format!("{e:?}"))?;
+        let mut res = [Val::I32(0); 16];
+        f.call(&mut *self.cx, &args[..n], &mut res[..n]).map_err(|e| format!("{e:?}"))?;
+        for (r, v) in res[..n].iter().enumerate() {
+            self.cpu.globals[first + r].set(&mut *self.cx, *v).map_err(|e| format!("{e:?}"))?;
         }
         Ok(())
     }
@@ -507,6 +515,8 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let mut m = Wt { cx: &mut store, cpu };
     let nop = m.instantiate(&engine::nop_module(), &["nop".to_string()]).map_err(|e| anyhow!("{e}"))?;
     m.engine().nop_index = nop[0];
+    let nop = m.instantiate(&engine::nop_module64(), &["nop64".to_string()]).map_err(|e| anyhow!("{e}"))?;
+    m.engine().nop_index64 = nop[0];
     let started = engine::start(&mut m, &exe).map_err(|e| anyhow!("{e}"))?;
     if opts.aot {
         let t = Instant::now();

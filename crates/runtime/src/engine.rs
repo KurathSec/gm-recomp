@@ -51,6 +51,10 @@ pub struct ModInfo {
     /// Per function in `sorted`: bytes that open an x87 instruction (D8-DF) up to the
     /// next function, for ahead translation's cost estimate (`cost_bytes`).
     pub x87: Vec<u32>,
+    /// A 64-bit (PE32+) image: its code is x86-64 (docs/x64.md).
+    pub x64: bool,
+    /// The upper half of its 64-bit addresses (`LoadedModule::base_high`).
+    pub base_high: u32,
 }
 
 /// An x87 instruction translates to several times the wasm (and compile time) of an
@@ -78,6 +82,12 @@ pub struct Engine {
     pub funcs: HashMap<u32, u32, AddrHash>,
     /// Table index of a function that does nothing (returned after an API call).
     pub nop_index: u32,
+    /// The same for 64-bit code (`nop_module64`).
+    pub nop_index64: u32,
+    /// The process runs x86-64 code: its modules are 64-bit (set as they register,
+    /// `sync_modules`). Translation is 64-bit, `resolve` hands out 64-bit functions and
+    /// `Machine::call_index` calls them with the 64-bit registers (docs/x64.md).
+    pub x64: bool,
     pub mods: Vec<ModInfo>,
     pub exit: Option<u32>,
     pub ctl: Option<Ctl>,
@@ -170,6 +180,8 @@ impl Engine {
             p: Some(Box::new(p)),
             funcs: HashMap::default(),
             nop_index: 0,
+            nop_index64: 0,
+            x64: false,
             mods: Vec::new(),
             exit: None,
             ctl: None,
@@ -226,6 +238,9 @@ pub trait Machine: Guest {
     fn engine_ref(&self) -> &Engine;
     fn global(&mut self, g: Global) -> u32;
     fn set_global(&mut self, g: Global, v: u32);
+    /// The i64 globals of 64-bit code (`Global::Rax`..`Global::R15`).
+    fn global64(&mut self, g: Global) -> u64;
+    fn set_global64(&mut self, g: Global, v: u64);
     /// The general registers, eip and the FS base (a host may move them at once).
     fn regs(&mut self) -> Regs {
         Regs {
@@ -253,11 +268,13 @@ pub trait Machine: Guest {
         self.set_global(Global::Eip, r.eip);
         self.set_global(Global::FsBase, r.fs_base);
     }
-    /// XMM register `i` (thread switches save and restore them).
+    /// XMM register `i`, 0..16 (thread switches save and restore them).
     fn xmm(&mut self, i: u32) -> u128;
     fn set_xmm(&mut self, i: u32, v: u128);
-    /// Runs the translated function in table slot `idx`. Err only when the host
-    /// interrupted it (watchdog, wasm trap).
+    /// Runs the translated function in table slot `idx` with the registers in the
+    /// globals, and puts those it returns there: the 32-bit ones, or in a 64-bit
+    /// process (`Engine::x64`) rax..r15. Err only when the host interrupted it
+    /// (watchdog, wasm trap).
     fn call_index(&mut self, idx: u32) -> Result<(), String>;
     /// Compiles and instantiates a translated module; returns the table index of each
     /// named export, in order.
@@ -652,7 +669,7 @@ pub fn raise_fault<M: Machine>(m: &mut M, code: u32, ip: u32) -> Result<(), Stri
 /// HLE stub runs its API and yields the no-op function.
 pub fn rt_resolve<M: Machine>(m: &mut M, addr: u32) -> u32 {
     if !m.engine_ref().watch.is_empty() && m.engine_ref().watch.contains(&addr) {
-        let (esp, ra) = (m.global(Global::Esp), 0);
+        let (esp, ra) = (stack_pointer(m), 0);
         let ra = m.read_u32(esp).unwrap_or(ra);
         let frame = m.engine_ref().p.as_ref().map(|p| p.frames_presented);
         m.print(&format!("watch: {addr:#x} called (return {ra:#x}, frame {frame:?})"));
@@ -661,9 +678,19 @@ pub fn rt_resolve<M: Machine>(m: &mut M, addr: u32) -> u32 {
         Ok(i) => i,
         Err(e) => {
             stop(m, e);
-            m.engine_ref().nop_index
+            nop_of(m.engine_ref())
         }
     }
+}
+
+/// The no-op function for the process's code (`nop_module`, `nop_module64`).
+fn nop_of(e: &Engine) -> u32 {
+    if e.x64 { e.nop_index64 } else { e.nop_index }
+}
+
+/// The guest's stack pointer (rsp's low half in a 64-bit process: stacks lie below 4 GB).
+pub fn stack_pointer<M: Machine + ?Sized>(m: &mut M) -> u32 {
+    if m.engine_ref().x64 { m.global64(Global::Rsp) as u32 } else { m.global(Global::Esp) }
 }
 
 pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
@@ -775,12 +802,16 @@ impl<M: Machine + ?Sized> recomp::Memory for CodeMem<'_, M> {
 
 /// Registers newly loaded modules (discovery runs once per image).
 pub fn sync_modules<M: Machine>(m: &mut M) {
-    let new: Vec<(String, u32, u32, Vec<u8>)> = {
+    let new: Vec<(String, u32, u32, Vec<u8>, bool, u32)> = {
         let e = m.engine_ref();
         let Some(p) = e.p.as_ref() else { return };
-        p.modules.iter().filter(|md| !e.mods.iter().any(|k| k.base == md.base)).map(|md| (md.name.clone(), md.base, md.size, md.file.clone())).collect()
+        p.modules
+            .iter()
+            .filter(|md| !e.mods.iter().any(|k| k.base == md.base))
+            .map(|md| (md.name.clone(), md.base, md.size, md.file.clone(), md.pe64, md.base_high))
+            .collect()
     };
-    for (name, base, size, file) in new {
+    for (name, base, size, file, x64, base_high) in new {
         let t = m.now_us();
         let mut functions = HashSet::default();
         let mut jump_tables = HashMap::default();
@@ -798,7 +829,12 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
                     functions.insert(base + f.rva);
                 }
                 for jt in &d.jump_tables {
-                    let targets = (0..jt.entries).map(|i| m.read_u32(base + jt.table_rva + 4 * i).unwrap_or(0)).collect();
+                    // (64-bit code's tables hold offsets: discovery gives their cases)
+                    let targets = if jt.targets.is_empty() {
+                        (0..jt.entries).map(|i| m.read_u32(base + jt.table_rva + 4 * i).unwrap_or(0)).collect()
+                    } else {
+                        jt.targets.iter().map(|&rva| base + rva).collect()
+                    };
                     jump_tables.insert(base + jt.site_rva, targets);
                 }
                 let dt = (m.now_us() - t) as f64 / 1e6;
@@ -821,7 +857,9 @@ pub fn sync_modules<M: Machine>(m: &mut M) {
                 .collect(),
             Err(_) => Vec::new(),
         };
-        m.engine().mods.push(ModInfo { name, base, size, functions, sorted, jump_tables, code_id, x87 });
+        let e = m.engine();
+        e.x64 |= x64;
+        e.mods.push(ModInfo { name, base, size, functions, sorted, jump_tables, code_id, x87, x64, base_high });
     }
 }
 
@@ -862,13 +900,16 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
         // calls to translated functions use their table index (watched ones report)
         let watch = m.engine_ref().watch.clone();
         let known = |a: u32| if watch.contains(&a) { None } else { funcs.get(&a).copied() };
-        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, count_blocks, no_inline, x64: false }).with_cache(cache);
+        let x64 = m.engine_ref().x64;
+        let mut tr = recomp::Translator::new(&mem, recomp::Options { shared_memory: shared, probes, no_x87_inline, resolve_cache: true, count, count_blocks, no_inline, x64 }).with_cache(cache);
         for &entry in entries {
             let md = mods.iter().find(|md| entry >= md.base && entry < md.base + md.size);
             let empty_jt = std::collections::HashMap::new();
             let jt = md.map(|md| &md.jump_tables).unwrap_or(&empty_jt);
             let is_fn = |a: u32| funcs.contains_key(&a) || md.map(|md| md.functions.contains(&a)).unwrap_or(false);
-            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high: 0 };
+            // (code outside the images, which the runtime allocated, lies below 4 GB)
+            let high = md.map_or(0, |md| md.base_high);
+            let info = FuncInfo { jump_tables: jt, is_function: &is_fn, translated: &known, high };
             if let Err(e) = tr.add_function(entry, &info) {
                 errors.push(format!("translate {entry:#x}: {e}"));
                 failed.push(entry);
@@ -891,7 +932,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
             }
             let Some(md) = mods.iter().find(|md| a >= md.base && a < md.base + md.size) else { continue };
             let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: 0 };
+            let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high };
             if tr.add_function(a, &info).is_ok() {
                 queue.extend(tr.direct_targets(a));
             }
@@ -912,7 +953,7 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
                     continue;
                 }
                 let is_fn = |x: u32| funcs.contains_key(&x) || md.functions.contains(&x);
-                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: 0 };
+                let info = FuncInfo { jump_tables: &md.jump_tables, is_function: &is_fn, translated: &known, high: md.base_high };
                 let _ = tr.add_function(a, &info);
             }
         }
@@ -1178,7 +1219,7 @@ pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
     // (API stubs first: most calls that get here are API calls)
     if let Some(id) = Process::stub_id(addr) {
         call_api(m, id);
-        return Ok(m.engine_ref().nop_index);
+        return Ok(nop_of(m.engine_ref()));
     }
     if let Some(&i) = m.engine_ref().funcs.get(&addr) {
         m.engine().resolves += 1;
@@ -1311,16 +1352,25 @@ pub fn profile_push<M: Machine>(m: &mut M, addr: u32, hash: u32, frame: u32) {
 /// Return addresses on the guest stack (values just after a call instruction in a
 /// loaded module) that have no translation yet, nearest first.
 fn stack_continuations<M: Machine>(m: &mut M, addr: u32, max: usize) -> Vec<u32> {
-    let esp = m.global(Global::Esp);
+    let esp = stack_pointer(m);
+    // 64-bit code pushes 8-byte return addresses, with its module's upper half
+    let x64 = m.engine_ref().x64;
+    let slot = if x64 { 8 } else { 4 };
     let mut out = Vec::new();
     for k in 0..256 {
         if out.len() >= max {
             break;
         }
         // (the stack's top ends the scan)
-        let Ok(v) = m.read_u32(esp.wrapping_add(4 * k)) else { break };
+        let Ok(v) = m.read_u32(esp.wrapping_add(slot * k)) else { break };
+        let high = if x64 { m.read_u32(esp.wrapping_add(slot * k + 4)).unwrap_or(u32::MAX) } else { 0 };
         let e = m.engine_ref();
-        if v == addr || out.contains(&v) || e.funcs.contains_key(&v) || e.bad_functions.contains(&v) || !e.mods.iter().any(|md| v >= md.base + 7 && v < md.base + md.size) {
+        if v == addr
+            || out.contains(&v)
+            || e.funcs.contains_key(&v)
+            || e.bad_functions.contains(&v)
+            || !e.mods.iter().any(|md| v >= md.base + 7 && v < md.base + md.size && (!x64 || md.base_high == high))
+        {
             continue;
         }
         let mut b = [0u8; 7];
@@ -1358,7 +1408,16 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
     loop {
         {
             let cap = m.engine_ref().recent_cap;
-            let rec = if cap > 0 { Some([eip, m.global(Global::Esp), m.global(Global::Eax), m.global(Global::Ebx)]) } else { None };
+            let rec = if cap > 0 {
+                let (sp, a, b) = if m.engine_ref().x64 {
+                    (m.global64(Global::Rsp) as u32, m.global64(Global::Rax) as u32, m.global64(Global::Rbx) as u32)
+                } else {
+                    (m.global(Global::Esp), m.global(Global::Eax), m.global(Global::Ebx))
+                };
+                Some([eip, sp, a, b])
+            } else {
+                None
+            };
             let e = m.engine();
             e.dispatches += 1;
             if let Some(r) = rec {
@@ -1374,7 +1433,7 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
         // handlers jump into the `except` block on the handler frame's stack): unwind
         // the host frames that made the call and continue in the outer dispatcher.
         if let Some(top) = frame_top {
-            if m.global(Global::Esp) > top && m.global(Global::Ctl) == 0 {
+            if stack_pointer(m) > top && m.global(Global::Ctl) == 0 {
                 return Err(UNWIND.into());
             }
         }
@@ -1390,7 +1449,7 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
                 Some(Ctl::Resume) | Some(Ctl::Yield) | None => {}
             }
             if let Some(top) = frame_top {
-                if m.global(Global::Esp) > top {
+                if stack_pointer(m) > top {
                     return Err(UNWIND.into());
                 }
             }
@@ -1656,6 +1715,31 @@ pub fn nop_module() -> Vec<u8> {
     let mut code = CodeSection::new();
     let mut f = Function::new([]);
     for r in 0..8 {
+        f.instruction(&wasm_encoder::Instruction::LocalGet(r));
+    }
+    f.instruction(&wasm_encoder::Instruction::End);
+    code.function(&f);
+    let mut md = Module::new();
+    md.section(&types);
+    md.section(&funcs);
+    md.section(&exports);
+    md.section(&code);
+    md.finish()
+}
+
+/// The 64-bit `nop_module`: `nop64` returns the sixteen registers it gets
+/// (`recomp::abi::types::FUNC64`), the function `resolve` returns in a 64-bit process.
+pub fn nop_module64() -> Vec<u8> {
+    use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection, ValType};
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I64; 16], [ValType::I64; 16]);
+    let mut funcs = FunctionSection::new();
+    funcs.function(0);
+    let mut exports = ExportSection::new();
+    exports.export("nop64", ExportKind::Func, 0);
+    let mut code = CodeSection::new();
+    let mut f = Function::new([]);
+    for r in 0..16 {
         f.instruction(&wasm_encoder::Instruction::LocalGet(r));
     }
     f.instruction(&wasm_encoder::Instruction::End);

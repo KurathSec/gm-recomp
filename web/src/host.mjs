@@ -5,7 +5,8 @@
 import { asset } from './asset.mjs';
 import { D3DGL } from './gpu.mjs';
 
-const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call', 'gcopy', 'rget', 'rset'];
+// (crates/web/src/lib.rs GLUE_FUNCS; nop64 is 64-bit code's no-op function)
+const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call', 'gcopy', 'rget', 'rset', 'get64', 'set64', 'call64', 'nop64'];
 const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 
 /**

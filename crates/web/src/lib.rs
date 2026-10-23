@@ -197,14 +197,21 @@ struct Glue {
     /// The registers of `Regs` (in its order) to / from runtime memory.
     rget: extern "C" fn(*mut u32),
     rset: extern "C" fn(*const u32),
+    /// The i64 globals (64-bit code's registers).
+    get64: extern "C" fn(u32) -> u64,
+    set64: extern "C" fn(u32, u64),
+    /// `call` for a 64-bit function: rax..r15 from and to the globals.
+    call64: extern "C" fn(u32),
 }
 
 /// The CPU globals of `Regs`, in its field order.
 const REG_GLOBALS: [Global; 10] =
     [Global::Eax, Global::Ecx, Global::Edx, Global::Ebx, Global::Esp, Global::Ebp, Global::Esi, Global::Edi, Global::Eip, Global::FsBase];
 
-/// Export order of the glue accessors; JS places them in the table in this order.
-const GLUE_FUNCS: [&str; 13] = ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call", "gcopy", "rget", "rset"];
+/// Export order of the glue accessors; JS places them in the table in this order. The
+/// last, `nop64`, is the no-op function of 64-bit code (`Engine::nop_index64`).
+const GLUE_FUNCS: [&str; 17] =
+    ["g2r", "r2g", "fill", "get", "set", "size", "grow", "vget", "vset", "call", "gcopy", "rget", "rset", "get64", "set64", "call64", "nop64"];
 
 struct State {
     engine: Option<Engine>,
@@ -224,9 +231,11 @@ struct State {
     drained: (u64, u64),
     waited: bool,
     polls: u32,
+    /// The table slot of the glue's `nop64`.
+    nop64: u32,
 }
 
-static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0 };
+static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0, nop64: 0 };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -314,6 +323,12 @@ impl Machine for Web {
     fn set_global(&mut self, g: Global, v: u32) {
         (glue().set)(g as u32, v)
     }
+    fn global64(&mut self, g: Global) -> u64 {
+        (glue().get64)(g as u32)
+    }
+    fn set_global64(&mut self, g: Global, v: u64) {
+        (glue().set64)(g as u32, v)
+    }
     fn regs(&mut self) -> runtime::hle::Regs {
         let mut r = [0u32; 10];
         (glue().rget)(r.as_mut_ptr());
@@ -334,8 +349,12 @@ impl Machine for Web {
     }
     fn call_index(&mut self, idx: u32) -> Result<(), String> {
         // Translated functions take and return the registers: the glue's `call` passes
-        // them from and to the globals.
-        (glue().call)(idx);
+        // them from and to the globals (`call64` the 64-bit ones).
+        if self.engine_ref().x64 {
+            (glue().call64)(idx);
+        } else {
+            (glue().call)(idx);
+        }
         Ok(())
     }
     fn instantiate(&mut self, wasm: &[u8], exports: &[String]) -> Result<Vec<u32>, String> {
@@ -459,6 +478,9 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     types.ty().function([ValType::I32; 2], []); // 4: vget / vset
     types.ty().function([ValType::I32; 8], [ValType::I32; 8]); // 5: a translated function
     types.ty().function([ValType::I32], []); // 6: call
+    types.ty().function([ValType::I32], [ValType::I64]); // 7: get64
+    types.ty().function([ValType::I32, ValType::I64], []); // 8: set64
+    types.ty().function([ValType::I64; 16], [ValType::I64; 16]); // 9: a translated 64-bit function
     let mut imports = ImportSection::new();
     imports.import("rt", "memory", EntityType::Memory(MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None }));
     imports.import(
@@ -542,23 +564,23 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     let mut f = Function::new([]);
     f.instruction(&I::LocalGet(0)).instruction(&I::MemoryGrow(1)).instruction(&I::End);
     code.function(&f);
-    // vget(i, ptr) / vset(i, ptr): XMM register i to / from runtime memory
-    let xmm0 = abi::Global::Xmm0 as u32;
+    // vget(i, ptr) / vset(i, ptr): XMM register i (0..16) to / from runtime memory
     let mem0 = wasm_encoder::MemArg { offset: 0, align: 0, memory_index: 0 };
     for store in [true, false] {
         funcs.function(4);
         let mut f = Function::new([]);
         f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
-        for _ in 0..8 {
+        for _ in 0..16 {
             f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
         }
-        f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..8).collect::<Vec<_>>().into(), 8));
-        for k in 0..8 {
+        f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..16).collect::<Vec<_>>().into(), 16));
+        for k in 0..16 {
+            let x = abi::xmm_global(k) as u32;
             f.instruction(&I::End);
             if store {
-                f.instruction(&I::LocalGet(1)).instruction(&I::GlobalGet(xmm0 + k)).instruction(&I::V128Store(mem0));
+                f.instruction(&I::LocalGet(1)).instruction(&I::GlobalGet(x)).instruction(&I::V128Store(mem0));
             } else {
-                f.instruction(&I::LocalGet(1)).instruction(&I::V128Load(mem0)).instruction(&I::GlobalSet(xmm0 + k));
+                f.instruction(&I::LocalGet(1)).instruction(&I::V128Load(mem0)).instruction(&I::GlobalSet(x));
             }
             f.instruction(&I::Return);
         }
@@ -597,6 +619,65 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     let mut f = Function::new([]);
     for (k, g) in REG_GLOBALS.iter().enumerate() {
         f.instruction(&I::LocalGet(0)).instruction(&I::I32Load(wasm_encoder::MemArg { offset: 4 * k as u64, ..mem0 })).instruction(&I::GlobalSet(*g as u32));
+    }
+    f.instruction(&I::End);
+    code.function(&f);
+
+    // get64(i) / set64(i, v): the i64 globals, ladders as `get` / `set`
+    let i64_globals: Vec<u32> = GLOBALS.iter().enumerate().filter(|(_, g)| g.2 == ValType::I64).map(|(i, _)| i as u32).collect();
+    funcs.function(7);
+    let mut f = Function::new([]);
+    f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    for _ in 0..n {
+        f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    }
+    f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..n).collect::<Vec<_>>().into(), n));
+    for i in 0..n {
+        f.instruction(&I::End);
+        if i64_globals.contains(&i) {
+            f.instruction(&I::GlobalGet(i));
+        } else {
+            f.instruction(&I::I64Const(0));
+        }
+        f.instruction(&I::Return);
+    }
+    f.instruction(&I::End);
+    f.instruction(&I::I64Const(0)).instruction(&I::End);
+    code.function(&f);
+    funcs.function(8);
+    let mut f = Function::new([]);
+    f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    for _ in 0..n {
+        f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    }
+    f.instruction(&I::LocalGet(0)).instruction(&I::BrTable((0..n).collect::<Vec<_>>().into(), n));
+    for i in 0..n {
+        f.instruction(&I::End);
+        if i64_globals.contains(&i) {
+            f.instruction(&I::LocalGet(1)).instruction(&I::GlobalSet(i));
+        }
+        f.instruction(&I::Return);
+    }
+    f.instruction(&I::End).instruction(&I::End);
+    code.function(&f);
+    // call64(idx): rax..r15 from the globals, through the function, back
+    let rax = abi::Global::Rax as u32;
+    funcs.function(6);
+    let mut f = Function::new([]);
+    for r in 0..16 {
+        f.instruction(&I::GlobalGet(rax + r));
+    }
+    f.instruction(&I::LocalGet(0)).instruction(&I::CallIndirect { type_index: 9, table_index: 0 });
+    for r in (0..16).rev() {
+        f.instruction(&I::GlobalSet(rax + r));
+    }
+    f.instruction(&I::End);
+    code.function(&f);
+    // nop64: returns the registers it gets
+    funcs.function(9);
+    let mut f = Function::new([]);
+    for r in 0..16 {
+        f.instruction(&I::LocalGet(r));
     }
     f.instruction(&I::End);
     code.function(&f);
@@ -653,7 +734,7 @@ pub extern "C" fn glue_ptr() -> *const u8 {
     unsafe { GLUE_BYTES.as_ptr() }
 }
 
-/// The glue accessors are at table slots `base..base + 7` in `GLUE_FUNCS` order.
+/// The glue accessors are at table slots from `base` on, in `GLUE_FUNCS` order.
 #[unsafe(no_mangle)]
 pub extern "C" fn glue_install(base: u32) {
     let f = |i: u32| (base + i) as usize;
@@ -672,7 +753,11 @@ pub extern "C" fn glue_install(base: u32) {
             gcopy: std::mem::transmute(f(10)),
             rget: std::mem::transmute(f(11)),
             rset: std::mem::transmute(f(12)),
+            get64: std::mem::transmute(f(13)),
+            set64: std::mem::transmute(f(14)),
+            call64: std::mem::transmute(f(15)),
         });
+        state().nop64 = base + 16;
     }
 }
 
@@ -707,6 +792,7 @@ pub unsafe extern "C" fn init(exe: *const u8, exe_len: usize, frames: u32, trace
     let mut e = Engine::new(p);
     e.trace = trace != 0;
     e.nop_index = nop_index;
+    e.nop_index64 = state().nop64;
     state().engine = Some(e);
     let mut m = Web;
     match engine::start(&mut m, &exe) {
