@@ -14,6 +14,7 @@ use crate::process::{Handle, Process, Thread, ThreadCtx, ThreadState, THREAD_EXI
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+const WAIT_IO_COMPLETION: u32 = 0xC0;
 const STILL_ACTIVE: u32 = 0x103;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const CREATE_SUSPENDED: u32 = 4;
@@ -56,7 +57,10 @@ pub fn signaled(p: &mut Process, h: u32, consume: bool) -> bool {
 pub fn ready(p: &mut Process, i: usize, wake: bool) -> bool {
     let now = p.clock_us;
     let state = p.threads[i].state.clone();
+    let apc = p.threads[i].alertable && !p.threads[i].apcs.is_empty();
     let result = match state {
+        // a queued APC ends an alertable wait (it runs as the thread waits again)
+        ThreadState::Waiting { .. } | ThreadState::Sleeping(_) if apc => Some(Some(WAIT_IO_COMPLETION)),
         ThreadState::Ready => Some(None),
         ThreadState::Sleeping(t) if t <= now => Some(None),
         ThreadState::Waiting { handles, all, until } => {
@@ -100,6 +104,7 @@ pub fn ready(p: &mut Process, i: usize, wake: bool) -> bool {
         Some(eax) => {
             if wake {
                 let t = &mut p.threads[i];
+                t.alertable = false;
                 if let ThreadState::CritSec(cs) = t.state {
                     let id = t.id;
                     p.cs_pending.push((cs, id));
@@ -202,6 +207,34 @@ fn sleep(c: &mut Ctx, ms: u32) {
         let at = c.p.clock_us + ms as u64 * 1000;
         block(c, if ms == 0 { ThreadState::Ready } else { ThreadState::Sleeping(at) });
     }
+}
+
+/// Runs the APCs queued to the running thread (QueueUserAPC); whether there were any.
+fn run_apcs(c: &mut Ctx) -> Result<bool, super::ApiError> {
+    let mut any = false;
+    while !c.p.current_thread_mut().apcs.is_empty() {
+        let (f, data) = c.p.current_thread_mut().apcs.remove(0);
+        c.call_guest64(f, &[data])?;
+        any = true;
+    }
+    Ok(any)
+}
+
+/// A wait or sleep that can be alertable: the APCs queued to the thread run first and
+/// end it with WAIT_IO_COMPLETION, and one queued while a secondary thread is blocked in
+/// it wakes the thread with that result (the APC runs as it waits again: BASS's thread
+/// waits alertably in a loop).
+pub fn alertable_wait(c: &mut Ctx, alertable: bool, wait: impl FnOnce(&mut Ctx) -> u32) -> Result<u32, super::ApiError> {
+    if alertable && run_apcs(c)? {
+        return Ok(WAIT_IO_COMPLETION);
+    }
+    c.p.current_thread_mut().alertable = alertable;
+    let r = wait(c);
+    let t = c.p.current_thread_mut();
+    if t.state == ThreadState::Running {
+        t.alertable = false;
+    }
+    Ok(r)
 }
 
 fn wait(c: &mut Ctx, handles: Vec<u32>, all: bool, ms: u32) -> u32 {
@@ -486,6 +519,8 @@ fn create_thread(c: &mut Ctx, start: u32, param: u64, stack_size: u32, suspended
         ctx: Some(Box::new(ctx)),
         resume_eax: None,
         spin_polls: 0,
+        apcs: Vec::new(),
+        alertable: false,
     });
     c.p.log(format!("CreateThread(start={start:#x}, param={param:#x}) = thread {id:#x}"));
     Ok((h, id))
@@ -608,8 +643,11 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "SleepEx", |c| {
         let ms = c.arg(0);
-        sleep(c, ms);
-        ok(2, 0)
+        let r = alertable_wait(c, c.arg(1) != 0, |c| {
+            sleep(c, ms);
+            0
+        })?;
+        ok(2, r)
     });
     r.add(k, "SwitchToThread", |c| {
         sleep(c, 0);
@@ -622,17 +660,20 @@ pub fn register(r: &mut Registry) {
     });
     r.add("ntdll.dll", "NtDelayExecution", |c| {
         let ms = nt_timeout_ms(c, c.arg(1));
-        sleep(c, if ms == INFINITE { 0 } else { ms });
-        ok(2, 0)
+        let r = alertable_wait(c, c.arg(0) != 0, |c| {
+            sleep(c, if ms == INFINITE { 0 } else { ms });
+            0
+        })?;
+        ok(2, r) // STATUS_USER_APC is WAIT_IO_COMPLETION's value
     });
     r.add("ntdll.dll", "NtWaitForSingleObject", |c| {
         let (h, ms) = (c.arg(0), nt_timeout_ms(c, c.arg(2)));
-        let r = wait(c, vec![h], false, ms);
+        let r = alertable_wait(c, c.arg(1) != 0, |c| wait(c, vec![h], false, ms))?;
         ok(3, r) // STATUS_WAIT_0 / STATUS_TIMEOUT have the Win32 values
     });
     r.add(k, "WaitForSingleObjectEx", |c| {
         let (h, ms) = (c.arg(0), c.arg(1));
-        let r = wait(c, vec![h], false, ms);
+        let r = alertable_wait(c, c.arg(2) != 0, |c| wait(c, vec![h], false, ms))?;
         ok(3, r)
     });
     r.add(k, "WaitForMultipleObjects", |c| {
@@ -644,8 +685,18 @@ pub fn register(r: &mut Registry) {
     r.add(k, "WaitForMultipleObjectsEx", |c| {
         let (n, p, all, ms) = (c.arg(0), c.arg(1), c.arg(2) != 0, c.arg(3));
         let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + c.ptr_size() * i).unwrap_or(0)).collect();
-        let r = wait(c, handles, all, ms);
+        let r = alertable_wait(c, c.arg(4) != 0, |c| wait(c, handles, all, ms))?;
         ok(5, r)
+    });
+    // An APC for a thread: it runs at the thread's next alertable wait.
+    r.add_on_demand(k, "QueueUserAPC", |c| {
+        let (f, h, data) = (c.arg(0), c.arg(1), c.arg64(2));
+        let Some(i) = thread_index(c.p, h) else { return ok(3, 0) };
+        if matches!(c.p.threads[i].state, ThreadState::Exited(_)) {
+            return ok(3, 0);
+        }
+        c.p.threads[i].apcs.push((f, data));
+        ok(3, 1)
     });
     r.add(k, "EnterCriticalSection", |c| {
         let cs = c.arg(0);

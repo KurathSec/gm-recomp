@@ -213,6 +213,10 @@ pub struct Thread {
     pub resume_eax: Option<u32>,
     /// Clock reads since the thread last blocked (`Ctx::poll_clock`).
     pub spin_polls: u32,
+    /// QueueUserAPC calls waiting for the thread's next alertable wait: (function, data).
+    pub apcs: Vec<(u32, u64)>,
+    /// Blocked in an alertable wait, which a queued APC ends.
+    pub alertable: bool,
 }
 
 /// What a guest thread is doing. Threads run one at a time: secondary threads are
@@ -768,7 +772,7 @@ impl Process {
         let heap = self.create_heap(mem, 0x0100_0000)?;
         self.process_heap = heap;
         p(mem, 0x18, heap)?;
-        self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None, spin_polls: 0 });
+        self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None, spin_polls: 0, apcs: Vec::new(), alertable: false });
         self.main_thread = 0x1238;
         Ok((TEB_BASE, stack_top))
     }
@@ -814,7 +818,7 @@ impl Process {
         let heap = self.create_heap(mem, 0x0100_0000)?;
         self.process_heap = heap;
         w(mem, PEB_BASE + 0x30, heap as u64)?;
-        self.threads.push(Thread { id: 0x1238, teb, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None, spin_polls: 0 });
+        self.threads.push(Thread { id: 0x1238, teb, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None, spin_polls: 0, apcs: Vec::new(), alertable: false });
         self.main_thread = 0x1238;
         Ok((teb, stack_top))
     }

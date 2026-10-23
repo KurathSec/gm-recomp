@@ -2527,11 +2527,11 @@ pub fn register_more(r: &mut Registry) {
     r.add(u, "CloseGestureInfoHandle", |_c| ok(1, 0));
     r.add(u, "SetGestureConfig", |_c| ok(5, 0));
     r.add(u, "GetGestureConfig", |_c| ok(6, 0));
-    // (nCount, pHandles, dwMilliseconds, dwWakeMask, dwFlags: MWMO_WAITALL 1)
+    // (nCount, pHandles, dwMilliseconds, dwWakeMask, dwFlags: MWMO_WAITALL 1, MWMO_ALERTABLE 2)
     r.add(u, "MsgWaitForMultipleObjectsEx", |c| {
         let (n, p, ms, mask, flags) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4));
         let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + c.ptr_size() * i).unwrap_or(0)).collect();
-        let r = super::threads::msg_wait(c, handles, flags & 1 != 0, ms, mask);
+        let r = super::threads::alertable_wait(c, flags & 2 != 0, |c| super::threads::msg_wait(c, handles, flags & 1 != 0, ms, mask))?;
         ok(5, r)
     });
     // (nCount, pHandles, fWaitAll, dwMilliseconds, dwWakeMask)
