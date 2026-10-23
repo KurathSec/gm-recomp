@@ -649,13 +649,18 @@ impl Registry {
     }
 
     /// `intern` for an import or GetProcAddress: kernelbase.dll holds what kernel32.dll
-    /// and advapi32.dll forward to, so it is theirs when they have it.
+    /// and advapi32.dll forward to, so it is theirs when they have it; crtdll.dll, the
+    /// C runtime before msvcrt.dll, shares its functions.
     pub fn intern_import(&mut self, dll: &str, name: &str) -> ApiId {
         let stem = dll.to_lowercase();
-        if stem.trim_end_matches(".dll") == "kernelbase" {
-            if let Some(d) = ["kernel32.dll", "advapi32.dll", "user32.dll"].into_iter().find(|d| self.knows(d, name)) {
-                return self.intern(d, name);
-            }
+        let stem = stem.trim_end_matches(".dll");
+        let to: &[&str] = match stem {
+            "kernelbase" => &["kernel32.dll", "advapi32.dll", "user32.dll"],
+            "crtdll" => &["msvcrt.dll"],
+            _ => &[],
+        };
+        if let Some(d) = to.iter().find(|d| self.knows(d, name)) {
+            return self.intern(d, name);
         }
         self.intern(dll, name)
     }
