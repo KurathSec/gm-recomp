@@ -285,6 +285,9 @@ pub struct D3dObject {
     pub data: HashMap<&'static str, u32>,
 }
 
+/// The temp directory (TEMP, GetTempPath), where Windows has it.
+pub const TEMP_DIR: &str = "C:\\Users\\player\\AppData\\Local\\Temp";
+
 pub struct Process {
     pub vm: Vm,
     pub registry: Registry,
@@ -509,8 +512,9 @@ impl Process {
             env: vec![
                 ("PATH".into(), "C:\\Windows\\system32;C:\\Windows".into()),
                 ("SystemRoot".into(), "C:\\Windows".into()),
-                ("TEMP".into(), "C:\\Temp".into()),
-                ("TMP".into(), "C:\\Temp".into()),
+                // (where Windows keeps it: games find their LocalAppData folder from it)
+                ("TEMP".into(), TEMP_DIR.into()),
+                ("TMP".into(), TEMP_DIR.into()),
                 ("USERPROFILE".into(), "C:\\Users\\player".into()),
                 ("APPDATA".into(), "C:\\Users\\player\\AppData\\Roaming".into()),
                 ("LOCALAPPDATA".into(), "C:\\Users\\player\\AppData\\Local".into()),
@@ -688,7 +692,15 @@ impl Process {
 
     /// Hands the files changed since the last call to the save sink (temp files stay).
     pub fn flush_saves(&mut self) {
-        let changes: Vec<_> = self.fs.take_changes().into_iter().filter(|(p, _)| !p.to_ascii_lowercase().starts_with("c\\temp\\")).collect();
+        let changes: Vec<_> = self
+            .fs
+            .take_changes()
+            .into_iter()
+            .filter(|(p, _)| {
+                let p = p.to_ascii_lowercase();
+                !p.starts_with("c\\temp\\") && !p.starts_with("c\\users\\player\\appdata\\local\\temp\\")
+            })
+            .collect();
         if !changes.is_empty() {
             self.saves.save(&changes);
         }

@@ -401,7 +401,7 @@ pub fn register(r: &mut Registry) {
         ok(2, n)
     });
     r.add(k, "GetTempPathA", |c| {
-        let n = copy_str_out(c, c.arg(1), c.arg(0), b"C:\\Temp\\");
+        let n = copy_str_out(c, c.arg(1), c.arg(0), format!("{}\\", crate::process::TEMP_DIR).as_bytes());
         ok(2, n)
     });
     r.add(k, "GetComputerNameA", |c| {
@@ -3412,7 +3412,7 @@ pub fn register_extra(r: &mut Registry) {
     r.add(k, "IsBadStringPtrW", |_c| ok(2, 0));
     r.add(k, "IsBadStringPtrA", |_c| ok(2, 0));
     r.add(k, "GetTempPathW", |c| {
-        let n = copy_wstr_out(c, c.arg(1), c.arg(0), "C:\\Temp\\");
+        let n = copy_wstr_out(c, c.arg(1), c.arg(0), &format!("{}\\", crate::process::TEMP_DIR));
         ok(2, n)
     });
     r.add(k, "CreateEventExW", |c| {

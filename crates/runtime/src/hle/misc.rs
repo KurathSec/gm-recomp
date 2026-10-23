@@ -567,6 +567,15 @@ fn register_newer(r: &mut Registry) {
     // (EventSetInformation's RegHandle is 64-bit: two slots)
     r.add_on_demand("advapi32.dll", "EventSetInformation", |_c| ok(5, 0));
     r.add_on_demand("kernel32.dll", "SetProcessInformation", |_c| ok(4, 1));
+    // a DLL's thread notifications off (the CRT a runtime-extracted extension brings)
+    r.add_on_demand("ntdll.dll", "LdrDisableThreadCalloutsForDll", |_c| ok(1, 0));
+    // the service manager: not there (ERROR_ACCESS_DENIED)
+    for name in ["OpenSCManagerA", "OpenSCManagerW"] {
+        r.add_on_demand("advapi32.dll", name, |c| {
+            c.set_last_error(5);
+            ok(3, 0)
+        });
+    }
     // avrt: a thread's multimedia scheduling class (GameMaker Studio 2's audio thread)
     for name in ["AvSetMmThreadCharacteristicsA", "AvSetMmThreadCharacteristicsW"] {
         r.add_on_demand("avrt.dll", name, |c| {

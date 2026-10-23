@@ -1612,7 +1612,7 @@ pub fn register_more(r: &mut Registry) {
     r.add(m, "_tempnam", |c| {
         let prefix = if c.arg(1) != 0 { c.host.read_cstr_lossy(c.arg(1)) } else { String::new() };
         c.p.crt_rand = c.p.crt_rand.wrapping_add(1);
-        let name = format!("C:\\Temp\\{prefix}{:x}", c.p.crt_rand);
+        let name = format!("{}\\{prefix}{:x}", crate::process::TEMP_DIR, c.p.crt_rand);
         let p = strdup(c, name.as_bytes());
         ok(p)
     });
