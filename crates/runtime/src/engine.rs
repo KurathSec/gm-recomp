@@ -83,6 +83,9 @@ pub struct Engine {
     pub p: Option<Box<Process>>,
     /// Guest entry address -> function table index (looked up at every dispatch).
     pub funcs: HashMap<u32, u32, AddrHash>,
+    /// The code each translated function came from (`recomp::Output::ranges`), to find
+    /// the ones a write into code makes stale.
+    pub code_ranges: HashMap<u32, Vec<(u32, u32)>, AddrHash>,
     /// Table index of a function that does nothing (returned after an API call).
     pub nop_index: u32,
     /// The same for 64-bit code (`nop_module64`).
@@ -190,6 +193,7 @@ impl Engine {
         Engine {
             p: Some(Box::new(p)),
             funcs: HashMap::default(),
+            code_ranges: HashMap::default(),
             nop_index: 0,
             nop_index64: 0,
             x64: false,
@@ -296,6 +300,10 @@ pub trait Machine: Guest {
     /// Compiles and instantiates a translated module; returns the table index of each
     /// named export, in order.
     fn instantiate(&mut self, wasm: &[u8], exports: &[String]) -> Result<Vec<u32>, String>;
+    /// Puts the function in table slot `src` into slot `dst` as well.
+    fn table_copy(&mut self, _dst: u32, _src: u32) -> Result<(), String> {
+        Err("the host cannot change table slots".into())
+    }
     /// Wall-clock microseconds (statistics only).
     fn now_us(&self) -> u64;
     fn print(&mut self, s: &str);
@@ -788,6 +796,10 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
         Ok(r) => r,
         Err(e) => return stop(m, e),
     };
+    // (code the call wrote, WriteProcessMemory: its translations go before it runs)
+    if m.engine_ref().p.as_ref().is_some_and(|p| p.code_written.len() > m.engine_ref().code_written_seen) {
+        note_code_written(m);
+    }
     match result {
         Ok(ret) => {
             if ret.resume {
@@ -1252,6 +1264,9 @@ pub fn translate_batch_checked<M: Machine>(m: &mut M, entries: &[u32], fill: usi
     for ((entry, _), idx) in out.functions.iter().zip(indices) {
         e.funcs.insert(*entry, idx);
     }
+    for (entry, r) in out.ranges {
+        e.code_ranges.insert(entry, r);
+    }
     if volatile_batch {
         let list: Vec<u32> = out.functions.iter().map(|(a, _)| *a).collect();
         for &a in &list {
@@ -1661,6 +1676,7 @@ fn drop_stale<M: Machine>(m: &mut M, tag: u32, at: u32) {
         if e.tag_of.get(&a) == Some(&tag) {
             e.tag_of.remove(&a);
             e.funcs.remove(&a);
+            e.code_ranges.remove(&a);
             dropped.push(a);
         }
     }
@@ -1673,9 +1689,11 @@ fn drop_stale<M: Machine>(m: &mut M, tag: u32, at: u32) {
     }
 }
 
-/// Ranges of the images the game made writable since the last look: the functions
-/// translated there are forgotten (they may have been translated from bytes that are
-/// about to change); later translations there check their blocks.
+/// Ranges of the images the game made writable, or wrote code into, since the last
+/// look: the functions translated from code there are forgotten (they may have been
+/// translated from bytes that are about to change, or have), and the table slots of
+/// those that were translated lead to their new translations from now on; later
+/// translations there check their blocks.
 fn note_code_written<M: Machine>(m: &mut M) {
     let ranges: Vec<(u32, u32)> = {
         let e = m.engine_ref();
@@ -1687,14 +1705,36 @@ fn note_code_written<M: Machine>(m: &mut M) {
     }
     let e = m.engine();
     e.code_written_seen += ranges.len();
-    let dropped: Vec<u32> = e.funcs.keys().copied().filter(|&a| ranges.iter().any(|&(s, end)| a >= s && a < end)).collect();
-    for a in &dropped {
+    let hit = |a: u32, code: Option<&Vec<(u32, u32)>>| {
+        ranges.iter().any(|&(s, end)| (a >= s && a < end) || code.is_some_and(|c| c.iter().any(|&(cs, ce)| cs < end && s < ce)))
+    };
+    let dropped: Vec<(u32, u32)> = e.funcs.iter().filter(|&(&a, _)| hit(a, e.code_ranges.get(&a))).map(|(&a, &i)| (a, i)).collect();
+    for (a, _) in &dropped {
         e.funcs.remove(a);
         e.tag_of.remove(a);
+        e.code_ranges.remove(a);
     }
     e.inline_cache = None;
-    for &a in &dropped {
+    for &(a, _) in &dropped {
         uncache_resolved(m, a);
+    }
+    // (calls already translated go by the table index: it now looks the function up)
+    if dropped.is_empty() || m.engine_ref().x64 {
+        return;
+    }
+    let entries: Vec<u32> = dropped.iter().map(|&(a, _)| a).collect();
+    let out = recomp::redirects(&entries);
+    let names: Vec<String> = out.functions.iter().map(|(_, n)| n.clone()).collect();
+    match m.instantiate(&out.wasm, &names) {
+        Ok(thunks) => {
+            for (&(_, old), new) in dropped.iter().zip(thunks) {
+                if let Err(err) = m.table_copy(old, new) {
+                    m.print(&format!("code written: {err}"));
+                    break;
+                }
+            }
+        }
+        Err(err) => m.print(&format!("code written: redirects rejected: {err}")),
     }
 }
 

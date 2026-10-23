@@ -296,6 +296,10 @@ impl<C: Cx> Machine for Wt<'_, C> {
         }
         Ok(out)
     }
+    fn table_copy(&mut self, dst: u32, src: u32) -> Result<(), String> {
+        let f = self.cpu.table.get(&mut *self.cx, src as _).ok_or("no such table slot")?;
+        self.cpu.table.set(&mut *self.cx, dst as _, f).map_err(|e| format!("table set: {e:?}"))
+    }
     fn now_us(&self) -> u64 {
         self.cx.hd_ref().t0.elapsed().as_micros() as u64
     }

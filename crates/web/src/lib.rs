@@ -23,6 +23,8 @@ unsafe extern "C" {
     /// Compiles and instantiates a translated module; writes the table index of each
     /// export named in `names` (newline-separated) to `out`. Returns 1 on success.
     fn instantiate(wasm: *const u8, len: usize, names: *const u8, names_len: usize, out: *mut u32) -> i32;
+    /// Puts the function in table slot `src` into slot `dst` too. Returns 1 on success.
+    fn table_copy(dst: u32, src: u32) -> i32;
     fn print(ptr: *const u8, len: usize);
     fn now_us() -> f64;
     /// A system DLL from the player's system32/ (hle `Host::system_dll`): its length, or
@@ -366,6 +368,9 @@ impl Machine for Web {
         let mut out = vec![0u32; exports.len()];
         let ok = unsafe { instantiate(wasm.as_ptr(), wasm.len(), names.as_ptr(), names.len(), out.as_mut_ptr()) };
         if ok == 1 { Ok(out) } else { Err("module rejected by the host (see console)".into()) }
+    }
+    fn table_copy(&mut self, dst: u32, src: u32) -> Result<(), String> {
+        if unsafe { table_copy(dst, src) } == 1 { Ok(()) } else { Err("table slot not set (see console)".into()) }
     }
     fn now_us(&self) -> u64 {
         unsafe { now_us() as u64 }

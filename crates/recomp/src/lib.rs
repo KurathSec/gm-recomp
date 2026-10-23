@@ -64,6 +64,72 @@ pub struct Output {
     pub functions: Vec<(u32, String)>,
     /// Instructions that were emitted as `UNIMPLEMENTED` traps: (address, disassembly).
     pub unimplemented: Vec<(u32, String)>,
+    /// Entry -> the address ranges of the code each function was translated from
+    /// (inlined callees' included), merged.
+    pub ranges: Vec<(u32, Vec<(u32, u32)>)>,
+}
+
+/// The code ranges of a function's blocks, merged.
+fn code_ranges(cfg: &Cfg) -> Vec<(u32, u32)> {
+    let mut r: Vec<(u32, u32)> = cfg
+        .blocks
+        .values()
+        .filter_map(|b| Some((b.instrs.first()?.ip() as u32, b.instrs.last()?.next_ip() as u32)))
+        .collect();
+    r.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(r.len());
+    for (s, e) in r {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+/// A module of stand-ins for 32-bit functions whose translations were dropped (their
+/// code changed): each looks its address up again (`rt.resolve`, which translates it
+/// anew) and calls that, so the table slot of the old translation, which callers keep,
+/// leads to the new one.
+pub fn redirects(entries: &[u32]) -> Output {
+    use wasm_encoder::{Function, Instruction as W};
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32; 8], [ValType::I32; 8]); // FUNC
+    types.ty().function([ValType::I32], [ValType::I32]); // RESOLVE
+    let mut imports = ImportSection::new();
+    imports.import(
+        abi::CPU_MODULE,
+        abi::TABLE_NAME,
+        EntityType::Table(TableType { element_type: RefType::FUNCREF, table64: false, minimum: 0, maximum: None, shared: false }),
+    );
+    let resolve = RT_FUNCS.iter().find(|(f, _)| matches!(f, abi::RtFunc::Resolve)).map(|(_, n)| *n).expect("resolve");
+    imports.import(abi::RT_MODULE, resolve, EntityType::Function(1));
+    let mut functions = FunctionSection::new();
+    let mut exports = ExportSection::new();
+    let mut code = CodeSection::new();
+    let mut out_funcs = Vec::new();
+    for (i, &entry) in entries.iter().enumerate() {
+        functions.function(0);
+        let name = abi::export_name(entry);
+        exports.export(&name, ExportKind::Func, 1 + i as u32);
+        let mut f = Function::new([]);
+        for r in 0..8 {
+            f.instruction(&W::LocalGet(r));
+        }
+        f.instruction(&W::I32Const(entry as i32));
+        f.instruction(&W::Call(0));
+        f.instruction(&W::CallIndirect { type_index: 0, table_index: 0 });
+        f.instruction(&W::End);
+        code.function(&f);
+        out_funcs.push((entry, name));
+    }
+    let mut module = Module::new();
+    module.section(&types);
+    module.section(&imports);
+    module.section(&functions);
+    module.section(&exports);
+    module.section(&code);
+    Output { wasm: module.finish(), functions: out_funcs, unimplemented: Vec::new(), ranges: Vec::new() }
 }
 
 impl<'m> Translator<'m> {
@@ -216,6 +282,7 @@ impl<'m> Translator<'m> {
         let mut exports = ExportSection::new();
         let mut code = CodeSection::new();
         let mut out_funcs = Vec::new();
+        let ranges: Vec<(u32, Vec<(u32, u32)>)> = self.cfgs.iter().map(|(&e, cfg)| (e, code_ranges(cfg))).collect();
         for (&entry, cfg) in &self.cfgs {
             let emit = |x87_inline: bool| {
                 let mut fe = if x64 { lift::FuncEmit::new64(cfg, &func_index) } else { lift::FuncEmit::new(cfg, &func_index) };
@@ -257,7 +324,7 @@ impl<'m> Translator<'m> {
         module.section(&exports);
         module.section(&code);
         module.section(&name_section);
-        Output { wasm: module.finish(), functions: out_funcs, unimplemented: std::mem::take(&mut self.unimplemented) }
+        Output { wasm: module.finish(), functions: out_funcs, unimplemented: std::mem::take(&mut self.unimplemented), ranges }
     }
 }
 

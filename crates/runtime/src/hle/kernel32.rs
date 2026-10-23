@@ -3589,6 +3589,10 @@ pub fn register_extra(r: &mut Registry) {
         let mut b = vec![0u8; n as usize];
         let _ = c.host.read(from, &mut b);
         let _ = c.host.write(to, &b);
+        // into an image: code patched (GM 8.2's gm82dx9 rewrites the runner's Direct3D calls)
+        if c.p.modules.iter().any(|m| to >= m.base && to < m.base + m.size) {
+            c.p.code_written.push((to, to + n));
+        }
         let hex: String = b.iter().take(16).map(|x| format!("{x:02x}")).collect();
         c.p.log(format!("WriteProcessMemory({to:#x}, {n}) = {hex}"));
         write_out(c, written, n);

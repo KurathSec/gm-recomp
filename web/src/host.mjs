@@ -485,6 +485,15 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         return 0;
       }
     },
+    table_copy(dst, src) {
+      try {
+        table.set(dst, table.get(src));
+        return 1;
+      } catch (e) {
+        print(`table_copy failed: ${e}`);
+        return 0;
+      }
+    },
   };
 
   // Sound: the runtime pushes finished mix samples; they go into the ring the page's
