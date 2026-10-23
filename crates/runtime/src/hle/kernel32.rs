@@ -1310,6 +1310,11 @@ pub fn register(r: &mut Registry) {
         let i = c.arg(0);
         set_slot(c, i, 1)
     });
+    // Windows 11's: the same without touching the last error (VS 2022's CRT)
+    r.add_on_demand(k, "FlsGetValue2", |c| {
+        let i = c.arg(0);
+        get_slot(c, i)
+    });
 
     // ntdll pieces Delphi/MSVC runtimes import directly
     let n = "ntdll.dll";
@@ -1422,7 +1427,7 @@ pub fn register(r: &mut Registry) {
 /// Where DLLs the game does not ship come from (the importer copies them there).
 pub const SYSTEM_DIR: &str = "C\\Windows\\system32";
 
-pub const CORE_DLLS: &[&str] = &["kernel32", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid", "opengl32"];
+pub const CORE_DLLS: &[&str] = &["kernel32", "kernelbase", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid", "opengl32"];
 /// Further HLE DLLs, used when the game does not ship its own copy.
 pub const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "d3d11", "dxgi", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
 /// DLLs emulated only when the game has no file for them (the importers do not count
@@ -1592,7 +1597,7 @@ fn proc_address(c: &mut Ctx, base: u32, name: &str) -> u32 {
         Some(d) => d.to_string(),
         None => return 0,
     };
-    let id = c.p.registry.intern(&dll, name);
+    let id = c.p.registry.intern_import(&dll, name);
     Process::stub_addr(id)
 }
 

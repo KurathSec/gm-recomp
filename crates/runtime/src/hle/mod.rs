@@ -648,6 +648,24 @@ impl Registry {
         id
     }
 
+    /// `intern` for an import or GetProcAddress: kernelbase.dll holds what kernel32.dll
+    /// and advapi32.dll forward to, so it is theirs when they have it.
+    pub fn intern_import(&mut self, dll: &str, name: &str) -> ApiId {
+        let stem = dll.to_lowercase();
+        if stem.trim_end_matches(".dll") == "kernelbase" {
+            if let Some(d) = ["kernel32.dll", "advapi32.dll", "user32.dll"].into_iter().find(|d| self.knows(d, name)) {
+                return self.intern(d, name);
+            }
+        }
+        self.intern(dll, name)
+    }
+
+    /// `dll!name` is implemented, or will be when imported (`on_demand`).
+    pub fn knows(&self, dll: &str, name: &str) -> bool {
+        let key = (dll.to_lowercase(), name.to_string());
+        self.by_name.get(&key).is_some_and(|&id| self.entries[id.0 as usize].func.is_some()) || self.on_demand.contains_key(&key)
+    }
+
     /// `f` implements `dll!name` once a module imports it (see `on_demand`).
     pub fn add_on_demand(&mut self, dll: &str, name: &str, f: ApiFn) {
         self.on_demand.insert((dll.to_lowercase(), name.to_string()), f);

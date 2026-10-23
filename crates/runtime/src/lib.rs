@@ -42,7 +42,7 @@ impl ImportResolver for StubResolver<'_> {
         if let Some(a) = self.registry.data_export(dll, name) {
             return a;
         }
-        let id = self.registry.intern(dll, name);
+        let id = self.registry.intern_import(dll, name);
         Process::stub_addr(id)
     }
 }
