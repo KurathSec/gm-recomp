@@ -1819,6 +1819,9 @@ fn surface_desc(c: &mut Ctx, p: u32, fmt: u32, ty: u32, usage: u32, pool: u32, w
 
 fn tex_get_level_desc(c: &mut Ctx) -> ApiResult {
     let (t, level, p) = (this(c), c.arg(1), c.arg(2));
+    if level >= field(c, t, "levels") {
+        return ret(c, D3DERR_INVALIDCALL);
+    }
     let (w, h) = level_dims(field(c, t, "w"), field(c, t, "h"), level);
     let (fmt, usage, pool) = (field(c, t, "fmt"), field(c, t, "usage"), field(c, t, "pool"));
     surface_desc(c, p, fmt, 1, usage, pool, w, h);
@@ -1857,6 +1860,10 @@ fn tex_unlock_rect(c: &mut Ctx) -> ApiResult {
 
 fn tex_get_surface_level(c: &mut Ctx) -> ApiResult {
     let (t, level, pp) = (this(c), c.arg(1), c.arg(2));
+    // (past the last level it fails: D3DXFilterTexture asks for levels until one does)
+    if level >= field(c, t, "levels") {
+        return ret(c, D3DERR_INVALIDCALL);
+    }
     let (w, h) = level_dims(field(c, t, "w"), field(c, t, "h"), level);
     let (pitch, bits) = level_bits(c, t, level);
     let (fmt, usage, pool) = (field(c, t, "fmt"), field(c, t, "usage"), field(c, t, "pool"));

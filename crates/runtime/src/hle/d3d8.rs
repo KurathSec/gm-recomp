@@ -1086,6 +1086,9 @@ fn level_dims(w: u32, h: u32, level: u32) -> (u32, u32) {
 fn tex_get_level_desc(c: &mut Ctx) -> ApiResult {
     let t = this(c);
     let level = c.arg(1);
+    if level >= field(c, t, "levels") {
+        return ret(c, D3DERR_INVALIDCALL);
+    }
     let p = c.arg(2);
     let (w, h) = level_dims(field(c, t, "w"), field(c, t, "h"), level);
     let (fmt, usage, pool) = (field(c, t, "fmt"), field(c, t, "usage"), field(c, t, "pool"));
@@ -1133,6 +1136,9 @@ fn tex_lock_rect(c: &mut Ctx) -> ApiResult {
 fn tex_get_surface_level(c: &mut Ctx) -> ApiResult {
     let t = this(c);
     let level = c.arg(1);
+    if level >= field(c, t, "levels") {
+        return ret(c, D3DERR_INVALIDCALL);
+    }
     let (w, h) = level_dims(field(c, t, "w"), field(c, t, "h"), level);
     let (pitch, bits) = level_bits(c, t, level);
     let (fmt, usage, pool) = (field(c, t, "fmt"), field(c, t, "usage"), field(c, t, "pool"));
