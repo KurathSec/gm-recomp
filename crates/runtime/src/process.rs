@@ -235,7 +235,8 @@ pub struct ThreadCtx {
     pub regs: crate::hle::Regs,
     /// cf, pf, af, zf, sf, of, df
     pub flags: [u32; 7],
-    pub xmm: [u128; 8],
+    /// xmm0..7, and xmm8..15 in a 64-bit process.
+    pub xmm: [u128; 16],
     pub mxcsr: u32,
 }
 
@@ -303,6 +304,13 @@ pub struct Process {
     /// threads that woke up waiting for them.
     pub cs_owners: HashMap<u32, u32>,
     pub cs_pending: Vec<(u32, u32)>,
+    /// Callbacks APIs of a 64-bit process are making, innermost last: the return marker
+    /// and the API caller's registers and return address, for exception dispatch to
+    /// walk on past them (hle::seh64).
+    pub host_frames64: Vec<(u32, [u64; 16], u64)>,
+    /// Slim reader/writer locks: the critical section (in guest memory) each one is
+    /// taken as.
+    pub srw_locks: HashMap<u32, u32>,
     pub cmdline: String,
     pub exe_path: String,
     pub cwd: String,
@@ -413,6 +421,8 @@ pub struct Process {
     pub textures_created: u64,
     pub next_d3d_handle: u32,
     pub trace: bool,
+    /// A 64-bit process (docs/x64.md): the Win64 ABI and layouts, the TEB at GS.
+    pub x64: bool,
     pub api_calls: u64,
     pub unimplemented: Vec<String>,
     pub key_state: [u8; 256],
@@ -467,6 +477,8 @@ impl Process {
             in_scheduler: false,
             cs_owners: HashMap::default(),
             cs_pending: Vec::new(),
+            srw_locks: HashMap::default(),
+            host_frames64: Vec::new(),
             cmdline: cmdline.to_string(),
             exe_path: exe_path.to_string(),
             cwd,
@@ -548,6 +560,7 @@ impl Process {
             textures_created: 0,
             next_d3d_handle: 0x1000,
             trace: false,
+            x64: false,
             api_calls: 0,
             unimplemented: Vec::new(),
             key_state: [0; 256],
@@ -669,6 +682,9 @@ impl Process {
 
     /// Lays out the main thread: TEB, PEB, stack, process heap, command line in guest memory.
     pub fn setup_main_thread(&mut self, mem: &mut dyn Guest, image_base: u32) -> Result<(u32, u32), String> {
+        if self.x64 {
+            return self.setup_main_thread64(mem, image_base);
+        }
         for (base, size) in [(TEB_BASE - 0x1000, 0x1000u32), (TEB_BASE, 0x1000), (PEB_BASE, 0x1000), (STACK_BASE, STACK_SIZE), (RET_TO_HOST, 0x1000), (STUB_BASE, 0x0010_0000)] {
             mem.ensure_mapped(base, size).map_err(|e| e.to_string())?;
         }
@@ -718,6 +734,61 @@ impl Process {
         Ok((TEB_BASE, stack_top))
     }
 
+    /// The 64-bit layouts (TEB64 at GS, PEB64): the TEB takes two pages, so it does not
+    /// go at TEB_BASE (the PEB follows there); the page below it holds the x87 state as
+    /// in 32-bit processes. The image base in the PEB is the full 64-bit one.
+    fn setup_main_thread64(&mut self, mem: &mut dyn Guest, image_base: u32) -> Result<(u32, u32), String> {
+        for (base, size) in [(PEB_BASE, 0x1000u32), (STACK_BASE, STACK_SIZE), (RET_TO_HOST, 0x1000), (STUB_BASE, 0x0010_0000)] {
+            mem.ensure_mapped(base, size).map_err(|e| e.to_string())?;
+        }
+        let state = self.vm.alloc(0, 0x3000, true, PAGE_READWRITE, false, "teb64").ok_or("no space for the TEB")?;
+        mem.ensure_mapped(state, 0x3000).map_err(|e| e.to_string())?;
+        let teb = state + 0x1000;
+        let stack_top = STACK_BASE + STACK_SIZE;
+        let mut fpu_state = [0u8; fpu::block::SIZE];
+        fpu::Fpu::new().to_block(&mut fpu_state);
+        mem.write(teb - fpu::block::OFFSET, &fpu_state).map_err(|e| e.to_string())?;
+        let w = |mem: &mut dyn Guest, at: u32, v: u64| mem.write_u64(at, v).map_err(|e| e.to_string());
+        let full = |a: u32| self.full_addr(a);
+        w(mem, teb + 0x08, stack_top as u64)?; // StackBase
+        w(mem, teb + 0x10, STACK_BASE as u64)?; // StackLimit
+        w(mem, teb + 0x30, teb as u64)?; // Self
+        w(mem, teb + 0x40, 0x1234)?; // ClientId.UniqueProcess
+        w(mem, teb + 0x48, 0x1238)?; // ClientId.UniqueThread
+        w(mem, teb + 0x60, PEB_BASE as u64)?; // ProcessEnvironmentBlock
+        // PEB64
+        w(mem, PEB_BASE + 0x10, full(image_base))?; // ImageBaseAddress
+        mem.write_u32(PEB_BASE + 0xB8, 1).map_err(|e| e.to_string())?; // NumberOfProcessors
+        for (off, v) in [(0x118, 5u32), (0x11C, 1), (0x120, 2600), (0x124, 2)] {
+            mem.write_u32(PEB_BASE + off, v).map_err(|e| e.to_string())?; // OS version, platform
+        }
+        // RTL_USER_PROCESS_PARAMETERS: image path (0x60) and command line (0x70)
+        let params = PEB_BASE + 0x400;
+        w(mem, PEB_BASE + 0x20, params as u64)?;
+        for (off, at, text) in [(0x60, params + 0x600, self.exe_path.clone()), (0x70, params + 0x200, self.cmdline.clone())] {
+            mem.write_wstr(at, &text).map_err(|e| e.to_string())?;
+            let len = (text.encode_utf16().count() * 2) as u16;
+            mem.write_u16(params + off, len).map_err(|e| e.to_string())?;
+            mem.write_u16(params + off + 2, len + 2).map_err(|e| e.to_string())?;
+            w(mem, params + off + 8, at as u64)?;
+        }
+        let heap = self.create_heap(mem, 0x0100_0000)?;
+        self.process_heap = heap;
+        w(mem, PEB_BASE + 0x30, heap as u64)?;
+        self.threads.push(Thread { id: 0x1238, teb, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None });
+        self.main_thread = 0x1238;
+        Ok((teb, stack_top))
+    }
+
+    /// An address as the guest sees it: inside a 64-bit image the full address above
+    /// 4 GB, else zero-extended (docs/x64.md).
+    pub fn full_addr(&self, a: u32) -> u64 {
+        match self.modules.iter().find(|m| m.base_high != 0 && a.wrapping_sub(m.base) < m.size) {
+            Some(m) => (m.base_high as u64) << 32 | a as u64,
+            None => a as u64,
+        }
+    }
+
     /// Implicit TLS of statically loaded images: each module with a TLS directory
     /// gets an index and a copy of its template in the TEB's ThreadLocalStoragePointer array.
     pub fn setup_static_tls(&mut self, mem: &mut dyn Guest) -> Result<(), String> {
@@ -726,20 +797,22 @@ impl Process {
             return Ok(());
         }
         let heap = self.process_heap;
-        let array = self.heap_alloc(mem, heap, 4 * 64, true);
+        let ps = if self.x64 { 8 } else { 4 };
+        let array = self.heap_alloc(mem, heap, ps * 64, true);
         for (i, (index_va, (start, end, zero))) in templates.into_iter().enumerate() {
             let len = end.saturating_sub(start);
             let block = self.heap_alloc(mem, heap, len + zero + 16, true);
             let mut buf = vec![0u8; len as usize];
             mem.read(start, &mut buf).map_err(|e| e.to_string())?;
             mem.write(block, &buf).map_err(|e| e.to_string())?;
-            mem.write_u32(array + 4 * i as u32, block).map_err(|e| e.to_string())?;
+            mem.write_u32(array + ps * i as u32, block).map_err(|e| e.to_string())?;
             if index_va != 0 {
                 mem.write_u32(index_va, i as u32).map_err(|e| e.to_string())?;
             }
             self.tls_used[i] = true;
         }
-        mem.write_u32(TEB_BASE + 0x2C, array).map_err(|e| e.to_string())?;
+        let teb = self.threads[0].teb;
+        mem.write_u32(teb + crate::hle::TebField::TlsPointer.offset(self.x64), array).map_err(|e| e.to_string())?;
         Ok(())
     }
 

@@ -332,7 +332,7 @@ impl Machine for Web {
     fn regs(&mut self) -> runtime::hle::Regs {
         let mut r = [0u32; 10];
         (glue().rget)(r.as_mut_ptr());
-        runtime::hle::Regs { eax: r[0], ecx: r[1], edx: r[2], ebx: r[3], esp: r[4], ebp: r[5], esi: r[6], edi: r[7], eip: r[8], fs_base: r[9] }
+        runtime::hle::Regs { eax: r[0], ecx: r[1], edx: r[2], ebx: r[3], esp: r[4], ebp: r[5], esi: r[6], edi: r[7], eip: r[8], fs_base: r[9], r64: None }
     }
     fn set_regs(&mut self, x: &runtime::hle::Regs) {
         let r = [x.eax, x.ecx, x.edx, x.ebx, x.esp, x.ebp, x.esi, x.edi, x.eip, x.fs_base];

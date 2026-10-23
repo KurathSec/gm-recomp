@@ -4,7 +4,7 @@
 //! standard data formats (c_dfDIKeyboard, c_dfDIMouse/2, c_dfDIJoystick/2); buffered
 //! data is not kept (GetDeviceData returns no items).
 
-use super::com::{self, Interface, Method, field, out, ret, set_field};
+use super::com::{self, Interface, Method, field, out, out_ptr, ret, set_field};
 use super::{ApiResult, Ctx, Registry, Ret};
 use crate::fasthash::HashMap;
 use crate::mem::Guest;
@@ -123,11 +123,11 @@ fn create_device(c: &mut Ctx) -> ApiResult {
     let (this, rguid, pp) = (c.arg(0), c.arg(1), c.arg(2));
     let g = read_guid(c, rguid);
     let Some((kind, index)) = device_of(&g) else {
-        out(c, pp, 0);
+        out_ptr(c, pp, 0);
         return ret(c, DIERR_DEVICENOTREG);
     };
     if kind == JOYSTICK && !pad_connected(c, index) {
-        out(c, pp, 0);
+        out_ptr(c, pp, 0);
         return ret(c, DIERR_DEVICENOTREG);
     }
     let w = wide(c, this);
@@ -135,7 +135,7 @@ fn create_device(c: &mut Ctx) -> ApiResult {
     let class: &'static [&'static Interface] = if w { &DEVICE_W_CLASS } else { &DEVICE_A_CLASS };
     let dev = com::create(c, "DirectInputDevice8", class, data);
     c.trace(format!(" = {dev:#x} ({})", ["", "keyboard", "mouse", "joystick"][kind as usize]));
-    out(c, pp, dev);
+    out_ptr(c, pp, dev);
     ret(c, DI_OK)
 }
 
@@ -496,13 +496,13 @@ pub fn register(r: &mut Registry) {
         let iid = com::format_iid(&read_guid(c, riid));
         let w = iid.eq_ignore_ascii_case(IID_DI8W);
         if !w && !iid.eq_ignore_ascii_case(IID_DI8A) {
-            out(c, pp, 0);
+            out_ptr(c, pp, 0);
             return Ok(Ret::stdcall(5, DIERR_NOINTERFACE));
         }
         let class: &'static [&'static Interface] = if w { &DI8W_CLASS } else { &DI8A_CLASS };
         let obj = com::create(c, "DirectInput8", class, HashMap::from_iter([("wide", w as u32)]));
         c.trace(format!(" = {obj:#x}"));
-        out(c, pp, obj);
+        out_ptr(c, pp, obj);
         Ok(Ret::stdcall(5, DI_OK))
     });
 }

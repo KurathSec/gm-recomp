@@ -49,15 +49,21 @@ fn read_bytes(c: &Ctx, p: u32, n: u32) -> Vec<u8> {
 
 // ---- printf -------------------------------------------------------------------------
 
-/// Reads successive cdecl variadic arguments.
+/// Reads successive cdecl variadic arguments: 4-byte slots (8-byte ones for 64-bit
+/// values), or 8-byte slots for everything in a 64-bit process.
 pub struct VaList {
     pub p: u32,
+    pub x64: bool,
 }
 
 impl VaList {
+    /// A `va_list` (or the variadic part of the stack) at `p`.
+    pub fn new(c: &Ctx, p: u32) -> Self {
+        VaList { p, x64: c.x64() }
+    }
     fn u32(&mut self, c: &Ctx) -> u32 {
         let v = c.host.read_u32(self.p).unwrap_or(0);
-        self.p += 4;
+        self.p += if self.x64 { 8 } else { 4 };
         v
     }
     fn u64(&mut self, c: &Ctx) -> u64 {
@@ -615,7 +621,8 @@ pub fn register(r: &mut Registry) {
     });
     r.add(m, "sprintf", |c| {
         let (buf, fmt) = (c.arg(0), c.host.read_cstr(c.arg(1)).unwrap_or_default());
-        let mut va = VaList { p: c.regs.esp + 12 };
+        let va_at = c.varargs(2);
+        let mut va = VaList::new(c, va_at);
         let mut out = format(c, &fmt, &mut va, false);
         let n = out.len() as u32;
         out.push(0);
@@ -624,7 +631,8 @@ pub fn register(r: &mut Registry) {
     });
     r.add(m, "_snprintf", |c| {
         let (buf, cap, fmt) = (c.arg(0), c.arg(1), c.host.read_cstr(c.arg(2)).unwrap_or_default());
-        let mut va = VaList { p: c.regs.esp + 16 };
+        let va_at = c.varargs(3);
+        let mut va = VaList::new(c, va_at);
         let out = format(c, &fmt, &mut va, false);
         let n = out.len().min(cap as usize);
         let _ = c.host.write(buf, &out[..n]);
@@ -637,7 +645,7 @@ pub fn register(r: &mut Registry) {
     });
     r.add(m, "vsprintf", |c| {
         let (buf, fmt, va) = (c.arg(0), c.host.read_cstr(c.arg(1)).unwrap_or_default(), c.arg(2));
-        let mut va = VaList { p: va };
+        let mut va = VaList::new(c, va);
         let mut out = format(c, &fmt, &mut va, false);
         let n = out.len() as u32;
         out.push(0);
@@ -689,7 +697,8 @@ pub fn register(r: &mut Registry) {
     });
     r.add(m, "fprintf", |c| {
         let (f, fmt) = (c.arg(0), c.host.read_cstr(c.arg(1)).unwrap_or_default());
-        let mut va = VaList { p: c.regs.esp + 12 };
+        let va_at = c.varargs(2);
+        let mut va = VaList::new(c, va_at);
         let out = format(c, &fmt, &mut va, false);
         match file_handle(c, f) {
             Some(h) => {
@@ -701,7 +710,8 @@ pub fn register(r: &mut Registry) {
     });
     r.add(m, "printf", |c| {
         let fmt = c.host.read_cstr(c.arg(0)).unwrap_or_default();
-        let mut va = VaList { p: c.regs.esp + 8 };
+        let va_at = c.varargs(1);
+        let mut va = VaList::new(c, va_at);
         let out = format(c, &fmt, &mut va, false);
         c.p.log(format!("printf: {}", String::from_utf8_lossy(&out).trim_end()));
         ok(out.len() as u32)
@@ -1242,7 +1252,7 @@ fn itoa(v: u64, neg: bool, radix: u32) -> Vec<u8> {
 /// widened into `buf` (`cap` units; -1 when it does not fit with its terminator).
 fn snwprintf(c: &mut Ctx, buf: u32, cap: u32, fmt: u32, va: u32) -> u32 {
     let f = c.host.read_wstr(fmt).unwrap_or_default();
-    let mut va = VaList { p: va };
+    let mut va = VaList::new(c, va);
     let out = format(c, f.as_bytes(), &mut va, true);
     let text: Vec<u16> = String::from_utf8_lossy(&out).encode_utf16().collect();
     let n = text.len().min(cap as usize);
@@ -1432,7 +1442,7 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(m, "vfprintf", |c| {
         let (f, fmt, va) = (c.arg(0), c.host.read_cstr(c.arg(1)).unwrap_or_default(), c.arg(2));
-        let mut va = VaList { p: va };
+        let mut va = VaList::new(c, va);
         let out = format(c, &fmt, &mut va, false);
         match file_handle(c, f) {
             Some(h) => {
@@ -1608,7 +1618,7 @@ pub fn register_more(r: &mut Registry) {
     });
     r.add(m, "_vsnprintf", |c| {
         let (buf, cap, fmt, va) = (c.arg(0), c.arg(1), c.host.read_cstr(c.arg(2)).unwrap_or_default(), c.arg(3));
-        let mut va = VaList { p: va };
+        let mut va = VaList::new(c, va);
         let out = format(c, &fmt, &mut va, false);
         let n = out.len().min(cap as usize);
         let _ = c.host.write(buf, &out[..n]);
@@ -1631,7 +1641,8 @@ pub fn register_more(r: &mut Registry) {
     r.add(m, "sscanf", |c| {
         let input = c.host.read_cstr(c.arg(0)).unwrap_or_default();
         let fmt = c.host.read_cstr(c.arg(1)).unwrap_or_default();
-        let mut va = VaList { p: c.regs.esp + 12 };
+        let va_at = c.varargs(2);
+        let mut va = VaList::new(c, va_at);
         let n = scan(c, &input, &fmt, &mut va);
         ok(n as u32)
     });

@@ -756,7 +756,7 @@ pub fn register(r: &mut Registry) {
             None => {
                 c.p.log(format!("CoCreateInstance({clsid}): class not registered"));
                 if ppv != 0 {
-                    let _ = c.host.write_u32(ppv, 0);
+                    c.write_ptr(ppv, 0);
                 }
                 ok(5, REGDB_E_CLASSNOTREG)
             }
@@ -1577,9 +1577,13 @@ pub fn register(r: &mut Registry) {
     r.add("gdiplus.dll", "GdiplusStartup", |c| {
         let token = c.arg(0);
         let output = c.arg(2);
-        let _ = c.host.write_u32(token, 1);
+        c.write_ptr(token, 1);
         if output != 0 {
+            // (two function pointers)
             let _ = c.host.write_u64(output, 0);
+            if c.x64() {
+                let _ = c.host.write_u64(output + 8, 0);
+            }
         }
         ok(3, 0)
     });

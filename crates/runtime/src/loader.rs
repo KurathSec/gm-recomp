@@ -30,6 +30,9 @@ pub struct LoadedModule {
     /// The upper half of its addresses: a 64-bit image stays at its preferred base above
     /// 4 GB, `base` being where that falls in the 32-bit guest memory (docs/x64.md).
     pub base_high: u32,
+    /// A 64-bit image's function table (.pdata: RUNTIME_FUNCTION entries, sorted): its
+    /// address and entry count.
+    pub pdata: (u32, u32),
 }
 
 pub struct LoadRequest<'a> {
@@ -123,6 +126,7 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
     }
     let tls = pe.tls().map_err(|e| e.to_string())?;
     let pe64 = pe.pe64;
+    let pdata = if pe64 { (base + pe.dir(3).rva, pe.dir(3).size / 12) } else { (0, 0) };
     let (tls_callbacks, tls_index_va, tls_template) = match tls {
         Some(t) => (
             t.callbacks.iter().map(|c| c.wrapping_add(delta)).collect(),
@@ -147,5 +151,6 @@ pub fn load(req: LoadRequest, vm: &mut Vm, mem: &mut dyn Guest, resolver: &mut d
         imports,
         pe64,
         base_high,
+        pdata,
     })
 }

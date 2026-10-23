@@ -3,7 +3,7 @@
 
 use super::{Regs, ApiError, ApiResult, Ctx, Registry, Ret, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_MOD_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PROC_NOT_FOUND, ERROR_SUCCESS, INVALID_HANDLE_VALUE, ERROR_ENVVAR_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER};
 use crate::mem::{Guest, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEM_TOP_DOWN, PAGE_READWRITE};
-use crate::process::{FileHandle, FindEntry, Handle, Process, RET_TO_HOST, TEB_BASE};
+use crate::process::{FileHandle, FindEntry, Handle, Process, RET_TO_HOST};
 
 fn ok(nargs: u32, v: u32) -> ApiResult {
     Ok(Ret::stdcall(nargs, v))
@@ -13,6 +13,60 @@ fn write_out(c: &mut Ctx, addr: u32, v: u32) {
     if addr != 0 {
         let _ = c.host.write_u32(addr, v);
     }
+}
+
+/// Writes a pointer-sized out value: in a 64-bit process the full 8 bytes (`Ctx::full`).
+fn write_out_ptr(c: &mut Ctx, addr: u32, v: u32) {
+    if addr != 0 {
+        if c.x64() {
+            let full = c.full(v);
+            let _ = c.host.write_u64(addr, full);
+        } else {
+            let _ = c.host.write_u32(addr, v);
+        }
+    }
+}
+
+/// Where TLS/FLS slot `i` of the thread with TEB `teb` is (TlsSlots: 4- or 8-byte
+/// entries).
+fn tls_slot(c: &Ctx, teb: u32, i: u32) -> u32 {
+    teb + c.teb_off(super::TebField::TlsSlots) + c.ptr_size() * i
+}
+
+/// TlsGetValue/FlsGetValue: the calling thread's slot `i` (a full 8-byte value in a
+/// 64-bit process).
+fn get_slot(c: &mut Ctx, i: u32) -> ApiResult {
+    let at = tls_slot(c, c.regs.fs_base, i);
+    if c.x64() {
+        return Ok(Ret::ptr(1, c.host.read_u64(at).unwrap_or(0)));
+    }
+    ok(1, c.host.read_u32(at).unwrap_or(0))
+}
+
+/// TlsSetValue/FlsSetValue: slot `i` = argument `arg`.
+fn set_slot(c: &mut Ctx, i: u32, arg: u32) -> ApiResult {
+    let at = tls_slot(c, c.regs.fs_base, i);
+    if c.x64() {
+        let v = c.arg64(arg);
+        let _ = c.host.write_u64(at, v);
+    } else {
+        let v = c.arg(arg);
+        let _ = c.host.write_u32(at, v);
+    }
+    ok(2, 1)
+}
+
+/// Clears a CRITICAL_SECTION (24 bytes, 40 in a 64-bit process), LockCount -1 if `unlocked`.
+fn init_cs(c: &mut Ctx, cs: u32, unlocked: bool) {
+    let _ = c.host.fill(cs, if c.x64() { 40 } else { 24 }, 0);
+    if unlocked {
+        let _ = c.host.write_u32(cs + super::threads::cs_fields(c)[0], 0xFFFF_FFFF);
+    }
+}
+
+/// A pointer-sized result (`Ret::ptr` of the full address).
+fn ok_ptr(c: &Ctx, nargs: u32, v: u32) -> ApiResult {
+    Ok(Ret::ptr(nargs, c.full(v)))
 }
 
 /// Writes a byte string into a sized buffer; returns the length the API should report.
@@ -46,17 +100,17 @@ pub fn register(r: &mut Registry) {
         let name = c.str_arg(0);
         let base = module_handle(c, &name);
         c.trace(format!("({name:?}) = {base:#x}"));
-        ok(1, base)
+        ok_ptr(c, 1, base)
     });
     r.add(k, "GetModuleHandleW", |c| {
         let name = c.wstr_arg(0);
         let base = module_handle(c, &name);
-        ok(1, base)
+        ok_ptr(c, 1, base)
     });
     r.add(k, "GetModuleHandleExW", |c| {
         let name = if c.arg(0) & 4 != 0 { String::new() } else { c.wstr_arg(1) };
         let base = module_handle(c, &name);
-        write_out(c, c.arg(2), base);
+        write_out_ptr(c, c.arg(2), base);
         ok(3, (base != 0) as u32)
     });
     r.add(k, "GetModuleFileNameA", |c| {
@@ -154,15 +208,31 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "GetStartupInfoA", |c| {
         let p = c.arg(0);
-        let _ = c.host.fill(p, 68, 0);
-        let _ = c.host.write_u32(p, 68);
-        let _ = c.host.write_u32(p + 44, 1); // dwFlags STARTF_USESHOWWINDOW
-        let _ = c.host.write_u16(p + 48, 1); // wShowWindow SW_SHOWNORMAL
+        // (STARTUPINFO: 104 bytes with 8-byte pointers in a 64-bit process)
+        let (size, flags) = if c.x64() { (104, 60) } else { (68, 44) };
+        let _ = c.host.fill(p, size, 0);
+        let _ = c.host.write_u32(p, size);
+        let _ = c.host.write_u32(p + flags, 1); // dwFlags STARTF_USESHOWWINDOW
+        let _ = c.host.write_u16(p + flags + 4, 1); // wShowWindow SW_SHOWNORMAL
         ok(1, 0)
     });
     r.alias(k, "GetStartupInfoW", k, "GetStartupInfoA");
     r.add(k, "GetSystemInfo", |c| {
         let p = c.arg(0);
+        if c.x64() {
+            // SYSTEM_INFO with 8-byte pointers and mask; PROCESSOR_ARCHITECTURE_AMD64
+            let _ = c.host.fill(p, 48, 0);
+            let _ = c.host.write_u16(p, 9);
+            let _ = c.host.write_u32(p + 4, 0x1000);
+            let _ = c.host.write_u64(p + 8, 0x10000);
+            let _ = c.host.write_u64(p + 16, 0x7FFE_FFFF);
+            let _ = c.host.write_u64(p + 24, 1);
+            let _ = c.host.write_u32(p + 32, 1);
+            let _ = c.host.write_u32(p + 36, 8664);
+            let _ = c.host.write_u32(p + 40, 0x10000);
+            let _ = c.host.write_u16(p + 44, 6);
+            return ok(1, 0);
+        }
         let _ = c.host.fill(p, 36, 0);
         let _ = c.host.write_u32(p + 4, 0x1000); // dwPageSize
         let _ = c.host.write_u32(p + 8, 0x10000); // lpMinimumApplicationAddress
@@ -210,6 +280,9 @@ pub fn register(r: &mut Registry) {
     r.add(k, "RaiseException", |c| {
         let code = c.arg(0);
         let flags = c.arg(1);
+        if c.x64() {
+            return raise_exception64(c, code);
+        }
         let n = c.arg(2).min(15);
         let args_p = c.arg(3);
         let params: Vec<u32> = (0..n).map(|i| c.host.read_u32(args_p + 4 * i).unwrap_or(0)).collect();
@@ -543,6 +616,22 @@ pub fn register(r: &mut Registry) {
     r.add(k, "VirtualQuery", |c| {
         let (addr, buf, len) = (c.arg(0), c.arg(1), c.arg(2));
         let (base, size, state, protect, alloc_base) = c.p.vm.query(addr);
+        if c.x64() {
+            // MEMORY_BASIC_INFORMATION64: 8-byte addresses and size
+            if len < 48 {
+                return ok(3, 0);
+            }
+            let (base64, alloc64) = (c.full(base), c.full(alloc_base));
+            let _ = c.host.fill(buf, 48, 0);
+            let _ = c.host.write_u64(buf, base64);
+            let _ = c.host.write_u64(buf + 8, alloc64);
+            let _ = c.host.write_u32(buf + 16, protect);
+            let _ = c.host.write_u64(buf + 24, size as u64);
+            let _ = c.host.write_u32(buf + 32, state);
+            let _ = c.host.write_u32(buf + 36, protect);
+            let _ = c.host.write_u32(buf + 40, if state == crate::mem::MEM_FREE { 0 } else { crate::mem::MEM_PRIVATE });
+            return ok(3, 48);
+        }
         if len >= 28 {
             let _ = c.host.write_u32(buf, base);
             let _ = c.host.write_u32(buf + 4, alloc_base);
@@ -667,7 +756,8 @@ pub fn register(r: &mut Registry) {
     r.add(k, "TlsAlloc", |c| {
         let i = c.p.tls_used.iter().position(|u| !u).unwrap_or(0);
         c.p.tls_used[i] = true;
-        let _ = c.host.write_u32(TEB_BASE + 0xE10 + 4 * i as u32, 0);
+        let at = tls_slot(c, c.p.threads[0].teb, i as u32);
+        c.write_ptr(at, 0);
         ok(0, i as u32)
     });
     r.add(k, "TlsFree", |c| {
@@ -679,29 +769,25 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "TlsGetValue", |c| {
         let i = c.arg(0);
-        let v = c.host.read_u32(c.regs.fs_base + 0xE10 + 4 * i).unwrap_or(0);
-        ok(1, v)
+        get_slot(c, i)
     });
     r.add(k, "TlsSetValue", |c| {
-        let (i, v) = (c.arg(0), c.arg(1));
-        let _ = c.host.write_u32(c.regs.fs_base + 0xE10 + 4 * i, v);
-        ok(2, 1)
+        let i = c.arg(0);
+        set_slot(c, i, 1)
     });
     r.add(k, "InitializeCriticalSection", |c| {
         let cs = c.arg(0);
-        let _ = c.host.fill(cs, 24, 0);
-        let _ = c.host.write_u32(cs + 4, 0xFFFF_FFFF);
+        init_cs(c, cs, true);
         ok(1, 0)
     });
     r.add(k, "InitializeCriticalSectionAndSpinCount", |c| {
         let cs = c.arg(0);
-        let _ = c.host.fill(cs, 24, 0);
-        let _ = c.host.write_u32(cs + 4, 0xFFFF_FFFF);
+        init_cs(c, cs, true);
         ok(2, 1)
     });
     r.add(k, "InitializeCriticalSectionEx", |c| {
         let cs = c.arg(0);
-        let _ = c.host.fill(cs, 24, 0);
+        init_cs(c, cs, false);
         ok(3, 1)
     });
     r.add(k, "EnterCriticalSection", |_c| ok(1, 0));
@@ -996,7 +1082,12 @@ pub fn register(r: &mut Registry) {
         }
     });
     r.add(k, "SetFilePointerEx", |c| {
-        let (h, dist, out, method) = (c.arg(0), c.host.read_u64(c.regs.esp + 8).unwrap_or(0) as i64, c.arg(3), c.arg(4));
+        // (the LARGE_INTEGER distance by value: two stack slots, or one register in Win64)
+        let (h, dist, out, method) = if c.x64() {
+            (c.arg(0), c.arg64(1) as i64, c.arg(2), c.arg(3))
+        } else {
+            (c.arg(0), c.host.read_u64(c.regs.esp + 8).unwrap_or(0) as i64, c.arg(3), c.arg(4))
+        };
         match seek_file(c, h, dist, method) {
             Some(pos) => {
                 if out != 0 {
@@ -1088,7 +1179,7 @@ pub fn register(r: &mut Registry) {
         let fp = c.arg(3);
         if fp != 0 {
             let pos = full.rfind('\\').map(|p| p + 1).unwrap_or(0);
-            let _ = c.host.write_u32(fp, c.arg(2) + pos as u32);
+            c.write_ptr(fp, c.arg(2) + pos as u32);
         }
         ok(4, n)
     });
@@ -1198,8 +1289,8 @@ pub fn register(r: &mut Registry) {
     r.add(k, "GetThreadContext", |_c| ok(2, 0));
     r.add(k, "SetThreadContext", |_c| ok(2, 0));
     r.add(k, "GetCurrentProcessorNumber", |_c| ok(0, 0));
-    r.add(k, "EncodePointer", |c| ok(1, c.arg(0) ^ 0x5a5a_5a5a));
-    r.add(k, "DecodePointer", |c| ok(1, c.arg(0) ^ 0x5a5a_5a5a));
+    r.add(k, "EncodePointer", |c| Ok(Ret::ptr(1, c.arg64(0) ^ 0x5a5a_5a5a)));
+    r.add(k, "DecodePointer", |c| Ok(Ret::ptr(1, c.arg64(0) ^ 0x5a5a_5a5a)));
     r.add(k, "FlsAlloc", |c| {
         let i = c.p.tls_used.iter().position(|u| !u).unwrap_or(0);
         c.p.tls_used[i] = true;
@@ -1208,13 +1299,11 @@ pub fn register(r: &mut Registry) {
     r.add(k, "FlsFree", |_c| ok(1, 1));
     r.add(k, "FlsGetValue", |c| {
         let i = c.arg(0);
-        let v = c.host.read_u32(c.regs.fs_base + 0xE10 + 4 * i).unwrap_or(0);
-        ok(1, v)
+        get_slot(c, i)
     });
     r.add(k, "FlsSetValue", |c| {
-        let (i, v) = (c.arg(0), c.arg(1));
-        let _ = c.host.write_u32(c.regs.fs_base + 0xE10 + 4 * i, v);
-        ok(2, 1)
+        let i = c.arg(0);
+        set_slot(c, i, 1)
     });
 
     // ntdll pieces Delphi/MSVC runtimes import directly
@@ -2146,7 +2235,7 @@ fn format_message(c: &mut Ctx, wide: bool) -> ApiResult {
         } else {
             let _ = c.host.write_cstr(mem, text.as_bytes());
         }
-        let _ = c.host.write_u32(buf, mem);
+        c.write_ptr(buf, mem);
         return ok(7, if wide { units.len() as u32 } else { text.len() as u32 });
     }
     if buf == 0 || size == 0 {
@@ -2614,7 +2703,7 @@ pub fn register_more(r: &mut Registry) {
         copy_wstr_out(c, buf, cch, &full);
         if part != 0 {
             let off = full.rfind('\\').map(|i| full[..i + 1].encode_utf16().count() as u32).unwrap_or(0);
-            let _ = c.host.write_u32(part, if full.ends_with('\\') { 0 } else { buf + 2 * off });
+            c.write_ptr(part, if full.ends_with('\\') { 0 } else { buf + 2 * off });
         }
         ok(4, units)
     });
@@ -2946,7 +3035,122 @@ pub fn register_paths(r: &mut Registry) {
 }
 
 /// Newer and rarer kernel32 entry points (GameMaker: Studio runners, their CRTs).
+/// RaiseException in a 64-bit process. Win64 dispatches exceptions through the
+/// images' unwind tables (.pdata), which is not implemented: only the thread-naming
+/// exception, whose `__except` handler just carries on, returns.
+fn raise_exception64(c: &mut Ctx, code: u32) -> ApiResult {
+    let flags = c.arg(1);
+    let (n, args_p) = (c.arg(2).min(15), c.arg(3));
+    let params: Vec<u64> = (0..n).map(|i| c.host.read_u64(args_p + 8 * i).unwrap_or(0)).collect();
+    // The context describes the caller as if RaiseException had returned.
+    let ctx = super::seh64::Context64::of_caller(c);
+    c.trace(format!("({code:#x}, {flags:#x}, {params:x?}) from {:#x}", ctx.rip));
+    // (MSVC's thread naming expects its own `__except` to take it; without one taking
+    // it, carrying on is what that handler would have done)
+    const MS_VC_THREAD_NAME: u32 = 0x406D_1388;
+    match super::seh64::dispatch(c, code, flags, &params, &ctx) {
+        Err(ApiError(msg)) if code == MS_VC_THREAD_NAME && msg.starts_with("unhandled") => ctx.resume(c),
+        r => r,
+    }
+}
+
+/// 64-bit only entry points (Win64 unwinding, newer file and process queries).
+fn register_x64(r: &mut Registry) {
+    let k = "kernel32.dll";
+    // Win64 exceptions (hle::seh64)
+    for dll in [k, "ntdll.dll"] {
+        r.add_on_demand(dll, "RtlCaptureContext", super::seh64::capture_context);
+        r.add_on_demand(dll, "RtlLookupFunctionEntry", super::seh64::lookup_function_entry);
+        r.add_on_demand(dll, "RtlVirtualUnwind", super::seh64::virtual_unwind_api);
+        r.add_on_demand(dll, "RtlUnwindEx", super::seh64::unwind_ex);
+        r.add_on_demand(dll, "RtlRestoreContext", super::seh64::restore_context);
+    }
+    r.add_on_demand(k, "RtlPcToFileHeader", |c| {
+        let (pc, out) = (c.arg(0), c.arg(1));
+        let base = c.p.module_containing(pc).map(|m| m.base).unwrap_or(0);
+        write_out_ptr(c, out, base);
+        ok_ptr(c, 2, base)
+    });
+    // PROCESS_MEMORY_COUNTERS: cb, PageFaultCount, then SIZE_T counters
+    r.add_on_demand(k, "K32GetProcessMemoryInfo", |c| {
+        let (p, cb) = (c.arg(1), c.arg(2));
+        let ps = c.ptr_size();
+        let _ = c.host.fill(p, cb, 0);
+        let _ = c.host.write_u32(p, cb);
+        // (working set and commit charge: a modest constant)
+        let v = 0x1000_0000u64;
+        for i in 0..8u32 {
+            let at = p + 8 + ps * i;
+            if at + ps <= p + cb {
+                if ps == 8 {
+                    let _ = c.host.write_u64(at, v);
+                } else {
+                    let _ = c.host.write_u32(at, v as u32);
+                }
+            }
+        }
+        ok(3, 1)
+    });
+    r.add_on_demand(k, "GetFileInformationByHandleEx", |c| {
+        let (h, class, p, size) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        let Some(len) = file_size(c, h) else {
+            c.set_last_error(6);
+            return ok(4, 0);
+        };
+        let _ = c.host.fill(p, size, 0);
+        match class {
+            // FILE_BASIC_INFO: times, FileAttributes
+            0 if size >= 40 => {
+                for i in 0..4 {
+                    let _ = c.host.write_u64(p + 8 * i, 0x01DC_5A6B_0000_0000);
+                }
+                let _ = c.host.write_u32(p + 32, 0x80);
+            }
+            // FILE_STANDARD_INFO: AllocationSize, EndOfFile, NumberOfLinks, DeletePending, Directory
+            1 if size >= 22 => {
+                let _ = c.host.write_u64(p, len.div_ceil(4096) * 4096);
+                let _ = c.host.write_u64(p + 8, len);
+                let _ = c.host.write_u32(p + 16, 1);
+            }
+            _ => {
+                c.set_last_error(87);
+                return ok(4, 0);
+            }
+        }
+        ok(4, 1)
+    });
+    r.add_on_demand(k, "SetFileInformationByHandle", |c| {
+        let (h, class, p) = (c.arg(0), c.arg(1), c.arg(2));
+        match class {
+            // FILE_END_OF_FILE_INFO
+            6 => {
+                let end = c.host.read_u64(p).unwrap_or(0);
+                let Some(key) = with_file(c, h, |fh| fh.key.clone()) else { return ok(4, 0) };
+                let r = c.p.fs.set_len(&key, end);
+                ok(4, r as u32)
+            }
+            // FILE_BASIC_INFO (times, attributes) and the rest: accepted
+            _ => ok(4, 1),
+        }
+    });
+    r.add_on_demand(k, "GetFinalPathNameByHandleW", |c| {
+        let (h, buf, cch) = (c.arg(0), c.arg(1), c.arg(2));
+        let Some(path) = with_file(c, h, |fh| fh.path.clone()) else {
+            c.set_last_error(6);
+            return ok(4, 0);
+        };
+        let full = format!("\\\\?\\{}", full_path(c, &path));
+        let units = full.encode_utf16().count() as u32;
+        if cch <= units {
+            return ok(4, units + 1);
+        }
+        copy_wstr_out(c, buf, cch, &full);
+        ok(4, units)
+    });
+}
+
 pub fn register_extra(r: &mut Registry) {
+    register_x64(r);
     let k = "kernel32.dll";
     r.add(k, "DisableThreadLibraryCalls", |_c| ok(1, 1));
     r.add(k, "GetModuleHandleExA", |c| {
@@ -2967,13 +3171,26 @@ pub fn register_extra(r: &mut Registry) {
         ok(3, r as u32)
     });
     r.add(k, "SetThreadDescription", |_c| ok(2, 0));
-    // Interlocked singly linked lists. SLIST_HEADER: Next, Depth (u16), Sequence (u16).
+    // Interlocked singly linked lists. SLIST_HEADER: Next, Depth (u16), Sequence (u16);
+    // in a 64-bit process 16 bytes: Depth, Sequence, then the 8-byte Next (entries
+    // link with 8-byte pointers, which the guest follows after a flush).
     r.add(k, "InitializeSListHead", |c| {
         let _ = c.host.write_u64(c.arg(0), 0);
+        if c.x64() {
+            let _ = c.host.write_u64(c.arg(0) + 8, 0);
+        }
         ok(1, 0)
     });
     r.add(k, "InterlockedPushEntrySList", |c| {
         let (head, entry) = (c.arg(0), c.arg(1));
+        if c.x64() {
+            let first = c.host.read_u64(head + 8).unwrap_or(0);
+            let depth = c.host.read_u16(head).unwrap_or(0);
+            let _ = c.host.write_u64(entry, first);
+            let _ = c.host.write_u64(head + 8, c.arg64(1));
+            let _ = c.host.write_u16(head, depth.wrapping_add(1));
+            return Ok(Ret::ptr(2, first));
+        }
         let first = c.host.read_u32(head).unwrap_or(0);
         let depth = c.host.read_u16(head + 4).unwrap_or(0);
         let seq = c.host.read_u16(head + 6).unwrap_or(0);
@@ -2985,6 +3202,16 @@ pub fn register_extra(r: &mut Registry) {
     });
     r.add(k, "InterlockedPopEntrySList", |c| {
         let head = c.arg(0);
+        if c.x64() {
+            let first = c.host.read_u64(head + 8).unwrap_or(0);
+            if first != 0 {
+                let next = c.host.read_u64(first as u32).unwrap_or(0);
+                let depth = c.host.read_u16(head).unwrap_or(1);
+                let _ = c.host.write_u64(head + 8, next);
+                let _ = c.host.write_u16(head, depth.wrapping_sub(1));
+            }
+            return Ok(Ret::ptr(1, first));
+        }
         let first = c.host.read_u32(head).unwrap_or(0);
         if first != 0 {
             let next = c.host.read_u32(first).unwrap_or(0);
@@ -2998,13 +3225,19 @@ pub fn register_extra(r: &mut Registry) {
     });
     r.add(k, "InterlockedFlushSList", |c| {
         let head = c.arg(0);
+        if c.x64() {
+            let first = c.host.read_u64(head + 8).unwrap_or(0);
+            let _ = c.host.write_u64(head, 0);
+            let _ = c.host.write_u64(head + 8, 0);
+            return Ok(Ret::ptr(1, first));
+        }
         let first = c.host.read_u32(head).unwrap_or(0);
         let _ = c.host.write_u32(head, 0);
         let _ = c.host.write_u16(head + 4, 0);
         ok(1, first)
     });
     r.add(k, "QueryDepthSList", |c| {
-        let d = c.host.read_u16(c.arg(0) + 4).unwrap_or(0);
+        let d = c.host.read_u16(c.arg(0) + if c.x64() { 0 } else { 4 }).unwrap_or(0);
         ok(1, d as u32)
     });
     r.alias("ntdll.dll", "RtlInitializeSListHead", k, "InitializeSListHead");
@@ -3029,7 +3262,7 @@ pub fn register_extra(r: &mut Registry) {
         c.set_last_error(6); // ERROR_INVALID_HANDLE
         ok(6, 0)
     });
-    r.add(k, "RtlCaptureStackBackTrace", |_c| ok(4, 0));
+    r.add(k, "RtlCaptureStackBackTrace", |c| if c.x64() { super::seh64::capture_stack_back_trace(c) } else { ok(4, 0) });
     r.add(k, "SetEnvironmentVariableW", |c| {
         let (n, v) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)));
         c.p.env.retain(|(k2, _)| !k2.eq_ignore_ascii_case(&n));
@@ -3113,9 +3346,10 @@ pub fn register_extra(r: &mut Registry) {
         ok(6, h)
     });
     r.add(k, "InitOnceExecuteOnce", |c| {
-        let (once, f, param, ctx) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        let (once, f) = (c.arg(0), c.arg(1));
         if c.host.read_u32(once).unwrap_or(0) & 2 == 0 {
-            let r = c.call_guest(f, &[once, param, ctx])?;
+            let args = [c.arg64(0), c.arg64(2), c.arg64(3)];
+            let r = c.call_guest64(f, &args)?;
             if r == 0 {
                 return ok(4, 0);
             }
@@ -3311,8 +3545,12 @@ pub fn register_extra(r: &mut Registry) {
     r.add_on_demand(k, "Process32NextW", |_c| ok(2, 0));
     // VerSetConditionMask(mask, type, condition): the condition's 3 bits at the type's slot
     r.add_on_demand(k, "VerSetConditionMask", |c| {
-        let mut mask = c.arg(0) as u64 | (c.arg(1) as u64) << 32;
-        let (ty, cond) = (c.arg(2), (c.arg(3) & 7) as u64);
+        // (the ULONGLONG mask by value: two stack slots, or one register in Win64)
+        let (mut mask, ty, cond) = if c.x64() {
+            (c.arg64(0), c.arg(1), (c.arg(2) & 7) as u64)
+        } else {
+            (c.arg(0) as u64 | (c.arg(1) as u64) << 32, c.arg(2), (c.arg(3) & 7) as u64)
+        };
         for bit in 0..8 {
             if ty & (1 << bit) != 0 {
                 mask |= cond << (3 * bit);
@@ -3324,7 +3562,7 @@ pub fn register_extra(r: &mut Registry) {
     // and service pack compare as one version under the major's condition
     r.add_on_demand(k, "VerifyVersionInfoW", |c| {
         let (info, ty) = (c.arg(0), c.arg(1));
-        let mask = c.arg(2) as u64 | (c.arg(3) as u64) << 32;
+        let mask = if c.x64() { c.arg64(2) } else { c.arg(2) as u64 | (c.arg(3) as u64) << 32 };
         let rd = |c: &mut Ctx, o: u32| c.host.read_u32(info + o).unwrap_or(0);
         let want = [rd(c, 4), rd(c, 8), rd(c, 276) & 0xFFFF, rd(c, 276) >> 16];
         let have = [5u32, 1, 3, 0];

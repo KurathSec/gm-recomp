@@ -125,10 +125,11 @@ fn vtable(c: &mut Ctx, iface: &'static str, methods: &[Method]) -> u32 {
     if let Some(&v) = c.p.com_vtables.get(iface) {
         return v;
     }
-    let v = alloc(c, methods.len() as u32 * 4);
+    let ps = c.ptr_size();
+    let v = alloc(c, methods.len() as u32 * ps);
     for (i, (name, _, _)) in methods.iter().enumerate() {
         let id = c.p.registry.lookup(DLL, &format!("{iface}::{name}")).expect("d3d11 method registered");
-        let _ = c.host.write_u32(v + 4 * i as u32, Process::stub_addr(id));
+        c.write_ptr(v + ps * i as u32, Process::stub_addr(id));
     }
     c.p.com_vtables.insert(iface, v);
     v
@@ -138,7 +139,7 @@ fn new_object(c: &mut Ctx, iface: &'static str, data: HashMap<&'static str, u32>
     let methods = methods_of(iface);
     let vt = vtable(c, iface, methods);
     let obj = alloc(c, 16);
-    let _ = c.host.write_u32(obj, vt);
+    c.write_ptr(obj, vt);
     c.p.d3d_objects.insert(obj, D3dObject { kind: iface, refcount: 1, data });
     obj
 }
@@ -163,7 +164,15 @@ fn add_ref_obj(c: &mut Ctx, obj: u32) {
     }
 }
 
+/// Writes an interface pointer to an out parameter (8 bytes in a 64-bit process).
 fn out(c: &mut Ctx, p: u32, v: u32) {
+    if p != 0 {
+        c.write_ptr(p, v);
+    }
+}
+
+/// Writes a UINT/BOOL/enum out value.
+fn out32(c: &mut Ctx, p: u32, v: u32) {
     if p != 0 {
         let _ = c.host.write_u32(p, v);
     }
@@ -366,6 +375,7 @@ fn create_device(c: &mut Ctx) -> ApiResult {
     // the first level asked for at or under 11_0
     let mut level = FEATURE_LEVEL_11_0;
     if levels != 0 {
+        // (an array of D3D_FEATURE_LEVEL: 4-byte enums in both layouts)
         for i in 0..nlevels.min(16) {
             let l = rd(c, levels + 4 * i);
             if l <= FEATURE_LEVEL_11_0 {
@@ -376,7 +386,7 @@ fn create_device(c: &mut Ctx) -> ApiResult {
     }
     let dev = device(c);
     set_field(c, dev, "level", level);
-    out(c, p_level, level);
+    out32(c, p_level, level);
     if pp_dev != 0 {
         add_ref_obj(c, dev);
         out(c, pp_dev, dev);
@@ -457,14 +467,21 @@ fn factory_create_swap_chain(c: &mut Ctx) -> ApiResult {
 }
 
 /// A swap chain from a DXGI_SWAP_CHAIN_DESC: its back buffer is the GPU's (target 0).
+/// DXGI_SWAP_CHAIN_DESC offsets of BufferCount, OutputWindow and Windowed (the window
+/// handle is 8-byte aligned in a 64-bit process), and its size.
+fn swap_chain_desc_layout(c: &Ctx) -> (u32, u32, u32, u32) {
+    if c.x64() { (40, 48, 56, 72) } else { (40, 44, 48, 60) }
+}
+
 fn new_swap_chain(c: &mut Ctx, dev: u32, desc: u32) -> u32 {
+    let (count_at, hwnd_at, windowed_at, _) = swap_chain_desc_layout(c);
     let (mut w, mut h, fmt) = (rd(c, desc), rd(c, desc + 4), rd(c, desc + 16));
-    let hwnd = rd(c, desc + 44);
+    let hwnd = rd(c, desc + hwnd_at);
     if w == 0 || h == 0 {
         let (ww, wh) = c.p.windows.get(&hwnd).map(|win| (win.w.max(1) as u32, win.h.max(1) as u32)).unwrap_or((800, 600));
         (w, h) = (ww, wh);
     }
-    let sc = new_object(c, "IDXGISwapChain", HashMap::from_iter([("device", dev), ("w", w), ("h", h), ("fmt", fmt), ("hwnd", hwnd), ("count", rd(c, desc + 40)), ("windowed", rd(c, desc + 48))]));
+    let sc = new_object(c, "IDXGISwapChain", HashMap::from_iter([("device", dev), ("w", w), ("h", h), ("fmt", fmt), ("hwnd", hwnd), ("count", rd(c, desc + count_at)), ("windowed", rd(c, desc + windowed_at))]));
     let bb = new_object(c, "ID3D11Texture2D", HashMap::from_iter([("w", w), ("h", h), ("fmt", 22), ("dxgi", fmt), ("levels", 1), ("bind", BIND_RENDER_TARGET), ("backbuffer", 1)]));
     set_field(c, sc, "buffer", bb);
     let st = &mut c.p.d3d11;
@@ -518,18 +535,24 @@ fn adapter_enum_outputs(c: &mut Ctx) -> ApiResult {
 }
 
 /// DXGI_ADAPTER_DESC(1): a Description (WCHAR[128]), ids, memory sizes (SIZE_T), the LUID
-/// and (DESC1) flags: 292 or 296 bytes.
+/// and (DESC1) flags: 292 or 296 bytes, 304 or 312 in a 64-bit process.
 fn adapter_get_desc(c: &mut Ctx) -> ApiResult {
     let p = c.arg(1);
     let one = c.name().ends_with("GetDesc1");
-    let size = if one { 296 } else { 292 };
+    let size = match (c.x64(), one) {
+        (false, false) => 292,
+        (false, true) => 296,
+        (true, false) => 304,
+        (true, true) => 312,
+    };
     let _ = c.host.write(p, &vec![0u8; size]);
     let name: Vec<u8> = "WebGL".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let _ = c.host.write(p, &name);
     let _ = c.host.write_u32(p + 256, 0x10DE); // vendor
     let _ = c.host.write_u32(p + 260, 1);
+    let ps = c.ptr_size();
     let _ = c.host.write_u32(p + 272, 512 << 20); // dedicated video memory
-    let _ = c.host.write_u32(p + 280, 512 << 20); // shared system memory
+    let _ = c.host.write_u32(p + 272 + 2 * ps, 512 << 20); // shared system memory
     ret(c, S_OK)
 }
 
@@ -540,10 +563,11 @@ fn display_size(c: &Ctx) -> (u32, u32) {
 }
 
 /// DXGI_OUTPUT_DESC: DeviceName (WCHAR[32]), DesktopCoordinates, AttachedToDesktop,
-/// Rotation, Monitor: 92 bytes.
+/// Rotation, Monitor: 92 bytes, 96 in a 64-bit process.
 fn output_get_desc(c: &mut Ctx) -> ApiResult {
     let p = c.arg(1);
-    let _ = c.host.write(p, &[0u8; 92]);
+    let size = if c.x64() { 96 } else { 92 };
+    let _ = c.host.write(p, &vec![0u8; size]);
     let name: Vec<u8> = "\\\\.\\DISPLAY1".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let _ = c.host.write(p, &name);
     let (w, h) = display_size(c);
@@ -560,7 +584,7 @@ fn output_get_display_mode_list(c: &mut Ctx) -> ApiResult {
     const MODES: [(u32, u32); 5] = [(800, 600), (1024, 768), (1280, 720), (1600, 900), (1920, 1080)];
     let (fmt, pn, p) = (c.arg(1), c.arg(3), c.arg(4));
     if p == 0 {
-        out(c, pn, MODES.len() as u32);
+        out32(c, pn, MODES.len() as u32);
         return ret(c, S_OK);
     }
     let n = rd(c, pn).min(MODES.len() as u32);
@@ -570,7 +594,7 @@ fn output_get_display_mode_list(c: &mut Ctx) -> ApiResult {
             let _ = c.host.write_u32(m + 4 * k as u32, v);
         }
     }
-    out(c, pn, n);
+    out32(c, pn, n);
     ret(c, S_OK)
 }
 
@@ -617,8 +641,9 @@ fn sc_get_buffer(c: &mut Ctx) -> ApiResult {
 
 fn sc_get_desc(c: &mut Ctx) -> ApiResult {
     let (t, p) = (this(c), c.arg(1));
-    let _ = c.host.write(p, &[0u8; 60]);
-    for (off, key) in [(0, "w"), (4, "h"), (16, "fmt"), (40, "count"), (44, "hwnd"), (48, "windowed")] {
+    let (count_at, hwnd_at, windowed_at, size) = swap_chain_desc_layout(c);
+    let _ = c.host.write(p, &vec![0u8; size as usize]);
+    for (off, key) in [(0, "w"), (4, "h"), (16, "fmt"), (count_at, "count"), (hwnd_at, "hwnd"), (windowed_at, "windowed")] {
         let v = field(c, t, key);
         let _ = c.host.write_u32(p + off, v);
     }
@@ -655,7 +680,7 @@ fn sc_resize_buffers(c: &mut Ctx) -> ApiResult {
 
 fn sc_get_fullscreen_state(c: &mut Ctx) -> ApiResult {
     let (pfs, pout) = (c.arg(1), c.arg(2));
-    out(c, pfs, 0);
+    out32(c, pfs, 0);
     out(c, pout, 0);
     ret(c, S_OK)
 }
@@ -759,8 +784,11 @@ fn dev_create_texture2d(c: &mut Ctx) -> ApiResult {
         set_field(c, tex, "gpu", 1);
     }
     if init != 0 && !depth {
+        // (D3D11_SUBRESOURCE_DATA: 16 bytes, the pitch after an 8-byte pointer, in a
+        // 64-bit process)
+        let (stride, pitch_at) = if c.x64() { (16, 8) } else { (12, 4) };
         for level in 0..levels {
-            let (src, pitch) = (rd(c, init + 12 * level), rd(c, init + 12 * level + 4));
+            let (src, pitch) = (rd(c, init + stride * level), rd(c, init + stride * level + pitch_at));
             if src != 0 {
                 write_level(c, tex, level, src, pitch, None);
             }
@@ -812,7 +840,7 @@ fn texture_get_desc(c: &mut Ctx) -> ApiResult {
 fn resource_get_type(c: &mut Ctx) -> ApiResult {
     let (t, p) = (this(c), c.arg(1));
     let ty = if kind(c, t) == "ID3D11Buffer" { 1 } else { 3 }; // D3D11_RESOURCE_DIMENSION
-    out(c, p, ty);
+    out32(c, p, ty);
     ret(c, 0)
 }
 
@@ -872,10 +900,12 @@ fn dev_create_input_layout(c: &mut Ctx) -> ApiResult {
     let (descs, n, pp) = (c.arg(1), c.arg(2), c.arg(5));
     let mut els = Vec::new();
     let mut next = [0u32; 16];
+    // (32 bytes, the fields after an 8-byte SemanticName, in a 64-bit process)
+    let (stride, f) = if c.x64() { (32, 8) } else { (28, 4) };
     for i in 0..n.min(16) {
-        let d = descs + 28 * i;
+        let d = descs + stride * i;
         let name = c.host.read_cstr(rd(c, d)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-        let (index, fmt, slot, mut offset) = (rd(c, d + 4), rd(c, d + 8), rd(c, d + 12).min(15), rd(c, d + 16));
+        let (index, fmt, slot, mut offset) = (rd(c, d + f), rd(c, d + f + 4), rd(c, d + f + 8).min(15), rd(c, d + f + 12));
         if offset == 0xFFFF_FFFF {
             offset = next[slot as usize];
         }
@@ -937,13 +967,13 @@ fn dev_check_format_support(c: &mut Ctx) -> ApiResult {
     let (fmt, p) = (c.arg(1), c.arg(2));
     // texture 2D, shader sample, render target, blendable, display... (D3D11_FORMAT_SUPPORT)
     let bits = if d3d_format(fmt) != 0 || decl_type(fmt).is_some() || matches!(fmt, 42 | 57) { 0x0FFF_FFFF } else { 0 };
-    out(c, p, bits);
+    out32(c, p, bits);
     ret(c, if bits != 0 { S_OK } else { E_INVALIDARG })
 }
 
 fn dev_check_multisample(c: &mut Ctx) -> ApiResult {
     let (count, p) = (c.arg(2), c.arg(3));
-    out(c, p, (count <= 1) as u32);
+    out32(c, p, (count <= 1) as u32);
     ret(c, S_OK)
 }
 
@@ -974,8 +1004,9 @@ fn child_get_device(c: &mut Ctx) -> ApiResult {
 
 // ---- ID3D11DeviceContext: binding ---------------------------------------------------------
 
+/// An array of interface pointers (8-byte ones in a 64-bit process: their low halves).
 fn read_ptrs(c: &Ctx, p: u32, n: u32) -> Vec<u32> {
-    (0..n.min(16)).map(|i| if p == 0 { 0 } else { rd(c, p + 4 * i) }).collect()
+    (0..n.min(16)).map(|i| if p == 0 { 0 } else { rd(c, p + c.ptr_size() * i) }).collect()
 }
 
 fn ctx_set_slots(c: &mut Ctx) -> ApiResult {
@@ -1021,7 +1052,7 @@ fn ctx_ia_set_vertex_buffers(c: &mut Ctx) -> ApiResult {
         if slot >= 8 {
             break;
         }
-        let b = if pbufs != 0 { rd(c, pbufs + 4 * i) } else { 0 };
+        let b = if pbufs != 0 { rd(c, pbufs + c.ptr_size() * i) } else { 0 };
         let s = if pstrides != 0 { rd(c, pstrides + 4 * i) } else { 0 };
         let o = if poffsets != 0 { rd(c, poffsets + 4 * i) } else { 0 };
         c.p.d3d11.vbs[slot] = (b, s, o);
@@ -1077,7 +1108,8 @@ fn ctx_om_get_render_targets(c: &mut Ctx) -> ApiResult {
         }
         out(c, pp, rtv);
         for i in 1..n.min(8) {
-            out(c, pp + 4 * i, 0);
+            let at = pp + c.ptr_size() * i;
+            out(c, at, 0);
         }
     }
     if pdsv != 0 {
@@ -1124,7 +1156,7 @@ fn ctx_rs_get_viewports(c: &mut Ctx) -> ApiResult {
             let _ = c.host.write_u32(p + 4 * i as u32, v.to_bits());
         }
     }
-    out(c, pn, 1);
+    out32(c, pn, 1);
     ret(c, 0)
 }
 
@@ -1158,9 +1190,11 @@ fn ctx_map(c: &mut Ctx) -> ApiResult {
     if bits == 0 {
         return ret(c, E_INVALIDARG);
     }
+    // D3D11_MAPPED_SUBRESOURCE: pData, RowPitch, DepthPitch
+    let ps = c.ptr_size();
     out(c, p, bits);
-    out(c, p + 4, pitch);
-    out(c, p + 8, slice);
+    out32(c, p + ps, pitch);
+    out32(c, p + ps + 4, slice);
     ret(c, S_OK)
 }
 
@@ -1242,7 +1276,7 @@ fn ctx_clear_rtv(c: &mut Ctx) -> ApiResult {
 
 /// ClearDepthStencilView(dsv, flags, depth, stencil): of the current target's depth.
 fn ctx_clear_dsv(c: &mut Ctx) -> ApiResult {
-    let (flags, depth, stencil) = (c.arg(2), f32::from_bits(c.arg(3)), c.arg(4) & 0xFF);
+    let (flags, depth, stencil) = (c.arg(2), c.arg_f32(3), c.arg(4) & 0xFF);
     let t = c.p.d3d11.target;
     let f = (if flags & 1 != 0 { 2 } else { 0 }) | (if flags & 2 != 0 { 4 } else { 0 });
     c.p.gpu.clear(f, 0, depth, stencil, [0, 0, t.1 as i32, t.2 as i32]);

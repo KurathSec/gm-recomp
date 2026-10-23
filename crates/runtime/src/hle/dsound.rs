@@ -4,7 +4,7 @@
 //! events sees the timing of a real device. Mixing to an output is done by the host
 //! (the browser's audio worklet) from `Process::sound_buffers`.
 
-use super::com::{self, Interface, Method, okn, out, out_zero, ret, S_OK};
+use super::com::{self, Interface, Method, okn, out, out_ptr, out_zero, ret, S_OK};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{Handle, SoundBuffer};
@@ -155,7 +155,7 @@ fn ds_create_buffer(c: &mut Ctx) -> ApiResult {
         },
     );
     c.trace(format!("({bytes} bytes, {ch}ch {rate}Hz {bits}bit, flags {flags:#x}) = {obj:#x}"));
-    out(c, pp, obj);
+    out_ptr(c, pp, obj);
     ret(c, S_OK)
 }
 
@@ -180,7 +180,7 @@ fn ds_duplicate(c: &mut Ctx) -> ApiResult {
     b.notify.clear();
     let obj = com::create(c, "DirectSoundBuffer", &BUFFER_CLASS, HashMap::default());
     c.p.sound_buffers.insert(obj, b);
-    out(c, pp, obj);
+    out_ptr(c, pp, obj);
     ret(c, S_OK)
 }
 
@@ -250,13 +250,13 @@ fn buf_lock(c: &mut Ctx) -> ApiResult {
         return ret(c, DSERR_INVALIDPARAM);
     }
     let first = bytes.min(size - off);
-    out(c, pp1, data + off);
+    out_ptr(c, pp1, data + off);
     out(c, pb1, first);
     if first < bytes {
-        out(c, pp2, data);
+        out_ptr(c, pp2, data);
         out(c, pb2, bytes - first);
     } else {
-        out(c, pp2, 0);
+        out_ptr(c, pp2, 0);
         out(c, pb2, 0);
     }
     ret(c, S_OK)
@@ -361,9 +361,11 @@ fn buf_unlock(c: &mut Ctx) -> ApiResult {
 fn notify_set_positions(c: &mut Ctx) -> ApiResult {
     let (n, p) = (c.arg(1), c.arg(2));
     let mut list = Vec::new();
+    // DSBPOSITIONNOTIFY: offset, event handle (8-byte aligned in a 64-bit process)
+    let (stride, ev_at) = if c.x64() { (16, 8) } else { (8, 4) };
     for i in 0..n.min(1024) {
-        let pos = c.host.read_u32(p + 8 * i).unwrap_or(0);
-        let ev = c.host.read_u32(p + 8 * i + 4).unwrap_or(0);
+        let pos = c.host.read_u32(p + stride * i).unwrap_or(0);
+        let ev = c.host.read_u32(p + stride * i + ev_at).unwrap_or(0);
         list.push((pos, ev));
     }
     c.trace(format!("({list:x?})"));
@@ -460,7 +462,7 @@ fn create_device(c: &mut Ctx, nargs: u32) -> ApiResult {
     let pp = c.arg(1);
     let obj = com::create(c, "DirectSound", &DEVICE_CLASS, HashMap::default());
     c.trace(format!(" = {obj:#x}"));
-    out(c, pp, obj);
+    out_ptr(c, pp, obj);
     Ok(Ret::stdcall(nargs, S_OK))
 }
 

@@ -85,13 +85,14 @@ fn vtable(c: &mut Ctx, i: &'static Interface) -> u32 {
         return v;
     }
     let heap = c.p.process_heap;
+    let ps = c.ptr_size();
     let g: &mut dyn Guest = &mut *c.host;
-    let v = c.p.heap_alloc(g, heap, (3 + i.methods.len() as u32) * 4, true);
+    let v = c.p.heap_alloc(g, heap, (3 + i.methods.len() as u32) * ps, true);
     let mut names = vec!["QueryInterface", "AddRef", "Release"];
     names.extend(i.methods.iter().map(|m| m.0));
     for (k, m) in names.iter().enumerate() {
         let id = c.p.registry.intern(DLL, &method_name(i.name, m));
-        let _ = c.host.write_u32(v + 4 * k as u32, Process::stub_addr(id));
+        c.write_ptr(v + ps * k as u32, Process::stub_addr(id));
     }
     c.p.com_vtables.insert(i.name, v);
     v
@@ -101,12 +102,13 @@ fn vtable(c: &mut Ctx, i: &'static Interface) -> u32 {
 /// Returns the pointer of the primary interface.
 pub fn create(c: &mut Ctx, kind: &'static str, ifaces: &'static [&'static Interface], data: HashMap<&'static str, u32>) -> u32 {
     let heap = c.p.process_heap;
+    let ps = c.ptr_size();
     let g: &mut dyn Guest = &mut *c.host;
-    let base = c.p.heap_alloc(g, heap, ifaces.len() as u32 * 4 + 4, true);
+    let base = c.p.heap_alloc(g, heap, ifaces.len() as u32 * ps + ps, true);
     for (k, i) in ifaces.iter().enumerate() {
         let vt = vtable(c, i);
-        let _ = c.host.write_u32(base + 4 * k as u32, vt);
-        c.p.com_ifaces.insert(base + 4 * k as u32, (base, k as u32));
+        c.write_ptr(base + ps * k as u32, vt);
+        c.p.com_ifaces.insert(base + ps * k as u32, (base, k as u32));
     }
     c.p.com_classes.insert(base, ifaces);
     c.p.d3d_objects.insert(base, D3dObject { kind, refcount: 1, data });
@@ -134,9 +136,17 @@ pub fn ret(c: &Ctx, v: u32) -> ApiResult {
     Ok(Ret::stdcall(c.nargs(), v))
 }
 
+/// Writes a 32-bit value to an out parameter.
 pub fn out(c: &mut Ctx, p: u32, v: u32) {
     if p != 0 {
         let _ = c.host.write_u32(p, v);
+    }
+}
+
+/// Writes an interface pointer (or another pointer-sized value) to an out parameter.
+pub fn out_ptr(c: &mut Ctx, p: u32, v: u32) {
+    if p != 0 {
+        c.write_ptr(p, v);
     }
 }
 
@@ -146,7 +156,7 @@ fn query_interface(c: &mut Ctx) -> ApiResult {
     let _ = c.host.read(riid, &mut g);
     let want = format_iid(&g);
     let Some((base, _)) = object_of(c, this) else {
-        out(c, ppv, 0);
+        out_ptr(c, ppv, 0);
         return ret(c, E_NOINTERFACE);
     };
     let ifaces = c.p.com_classes.get(&base).copied().unwrap_or(&[]);
@@ -160,12 +170,13 @@ fn query_interface(c: &mut Ctx) -> ApiResult {
             if let Some(o) = c.p.d3d_objects.get_mut(&base) {
                 o.refcount += 1;
             }
-            out(c, ppv, base + 4 * k as u32);
+            let ps = c.ptr_size();
+            out_ptr(c, ppv, base + ps * k as u32);
             c.trace(format!("({want}) = {}", ifaces[k].name));
             ret(c, S_OK)
         }
         None => {
-            out(c, ppv, 0);
+            out_ptr(c, ppv, 0);
             let kind = c.p.d3d_objects.get(&base).map(|o| o.kind).unwrap_or("?");
             c.p.log(format!("QueryInterface on {kind}: {want} not supported"));
             ret(c, E_NOINTERFACE)
@@ -528,12 +539,13 @@ pub fn create_instance(c: &mut Ctx, clsid: &str, iid_p: u32, ppv: u32) -> Option
     let k = if want == IUNKNOWN { Some(0) } else { ifaces.iter().position(|i| i.iids.iter().any(|s| s.eq_ignore_ascii_case(&want))) };
     Some(match k {
         Some(k) => {
-            out(c, ppv, obj + 4 * k as u32);
+            let ps = c.ptr_size();
+            out_ptr(c, ppv, obj + ps * k as u32);
             S_OK
         }
         None => {
             c.p.log(format!("CoCreateInstance({clsid}): interface {want} not supported"));
-            out(c, ppv, 0);
+            out_ptr(c, ppv, 0);
             E_NOINTERFACE
         }
     })

@@ -51,11 +51,11 @@ pub fn register(r: &mut Registry) {
     });
     r.add(u, "RegisterClassExA", |c| {
         let p = c.arg(0);
-        ok(1, register_class(c, p + 4, true, false))
+        ok(1, register_class(c, p, true, false))
     });
     r.add(u, "RegisterClassExW", |c| {
         let p = c.arg(0);
-        ok(1, register_class(c, p + 4, true, true))
+        ok(1, register_class(c, p, true, true))
     });
     r.add(u, "UnregisterClassA", |c| {
         let name = class_name_arg(c, 0, false);
@@ -200,13 +200,12 @@ pub fn register(r: &mut Registry) {
     r.alias(u, "PeekMessageW", u, "PeekMessageA");
     r.add(u, "TranslateMessage", |c| {
         let p = c.arg(0);
-        let (hwnd, msg, wp) = (c.host.read_u32(p).unwrap_or(0), c.host.read_u32(p + 4).unwrap_or(0), c.host.read_u32(p + 8).unwrap_or(0));
+        let (hwnd, msg, wp, lp) = read_msg(c, p);
         if msg != WM_KEYDOWN {
             return ok(1, 0);
         }
         match key_char(&c.p.key_state, wp as u8) {
             Some(ch) => {
-                let lp = c.host.read_u32(p + 12).unwrap_or(0);
                 post_message(c, hwnd, 0x0102, ch, lp);
                 ok(1, 1)
             }
@@ -215,7 +214,7 @@ pub fn register(r: &mut Registry) {
     });
     r.add(u, "DispatchMessageA", |c| {
         let p = c.arg(0);
-        let (hwnd, msg, wp, lp) = (c.host.read_u32(p).unwrap_or(0), c.host.read_u32(p + 4).unwrap_or(0), c.host.read_u32(p + 8).unwrap_or(0), c.host.read_u32(p + 12).unwrap_or(0));
+        let (hwnd, msg, wp, lp) = read_msg(c, p);
         let r = if msg == WM_TIMER && lp != 0 {
             // timer with a callback procedure
             c.call_guest(lp, &[hwnd, msg, wp, c.p.now_ms()])?
@@ -394,19 +393,23 @@ pub fn register(r: &mut Registry) {
     r.add(u, "SetWindowLongA", |c| {
         let (hwnd, idx, v) = (c.arg(0), c.arg_i32(1), c.arg(2));
         let old = get_window_long(c, hwnd, idx);
-        if let Some(w) = c.p.windows.get_mut(&hwnd) {
-            match idx {
-                -4 => w.wndproc = v,
-                -16 => w.style = v,
-                -20 => w.exstyle = v,
-                -21 => w.userdata = v,
-                -12 => w.id = v,
-                _ => { w.longs.insert(idx, v); }
-            }
-        }
+        set_window_long(c, hwnd, idx, v);
         ok(3, old)
     });
     r.alias(u, "SetWindowLongW", u, "SetWindowLongA");
+    // (64-bit exports only; the values keep their low halves, `Ctx::full` gives an
+    // address in the image its upper half back)
+    r.add_on_demand(u, "GetWindowLongPtrW", |c| {
+        let (hwnd, idx) = (c.arg(0), c.arg_i32(1));
+        let v = get_window_long(c, hwnd, idx);
+        Ok(Ret::ptr(2, c.full(v)))
+    });
+    r.add_on_demand(u, "SetWindowLongPtrW", |c| {
+        let (hwnd, idx, v) = (c.arg(0), c.arg_i32(1), c.arg(2));
+        let old = get_window_long(c, hwnd, idx);
+        set_window_long(c, hwnd, idx, v);
+        Ok(Ret::ptr(3, c.full(old)))
+    });
     r.add(u, "GetWindowThreadProcessId", |c| {
         let out = c.arg(1);
         if out != 0 {
@@ -699,7 +702,8 @@ pub fn register(r: &mut Registry) {
     r.add(u, "wsprintfA", |c| {
         // cdecl: (buf, fmt, ...)
         let (buf, fmt) = (c.arg(0), c.str_arg(1));
-        let s = format_wsprintf(c, &fmt, c.regs.esp + 12);
+        let va_at = c.varargs(2);
+        let s = format_wsprintf(c, &fmt, va_at);
         let _ = c.host.write_cstr(buf, s.as_bytes());
         Ok(Ret::cdecl(s.len() as u32))
     });
@@ -1131,27 +1135,34 @@ fn atom(c: &mut Ctx, name: &str) -> u16 {
     a
 }
 
+/// Registers a WNDCLASS or (`ex`) WNDCLASSEX at `p`.
 fn register_class(c: &mut Ctx, p: u32, ex: bool, wide: bool) -> u32 {
     // WNDCLASS(A/W): style, wndproc, clsExtra, wndExtra, hInstance, hIcon, hCursor, hbrBackground, menuName, className
+    // (WNDCLASSEX: cbSize first; in 64-bit layouts it shares style's 8 bytes, the rest
+    // are where WNDCLASS has them)
     let r = |c: &Ctx, off: u32| c.host.read_u32(p + off).unwrap_or(0);
-    let name_ptr = r(c, 36);
+    let off: [u32; 10] = match (c.x64(), ex) {
+        (false, false) => [0, 4, 8, 12, 16, 20, 24, 28, 32, 36],
+        (false, true) => [4, 8, 12, 16, 20, 24, 28, 32, 36, 40],
+        (true, ex) => [4 * ex as u32, 8, 16, 20, 24, 32, 40, 48, 56, 64],
+    };
+    let name_ptr = r(c, off[9]);
     let name = if name_ptr < 0x10000 { format!("#{name_ptr}") } else if wide { c.host.read_wstr(name_ptr).unwrap_or_default() } else { c.host.read_cstr_lossy(name_ptr) };
     let cls = WndClass {
-        style: r(c, 0),
-        wndproc: r(c, 4),
-        cls_extra: r(c, 8) as i32,
-        wnd_extra: r(c, 12) as i32,
-        instance: r(c, 16),
-        icon: r(c, 20),
-        cursor: r(c, 24),
-        background: r(c, 28),
+        style: r(c, off[0]),
+        wndproc: r(c, off[1]),
+        cls_extra: r(c, off[2]) as i32,
+        wnd_extra: r(c, off[3]) as i32,
+        instance: r(c, off[4]),
+        icon: r(c, off[5]),
+        cursor: r(c, off[6]),
+        background: r(c, off[7]),
         menu_name: String::new(),
         atom: 0,
     };
     let a = atom(c, &format!("class:{name}"));
     let mut cls = cls;
     cls.atom = a;
-    let _ = ex;
     c.trace(format!("({name:?}, wndproc={:#x}) = {a:#x}", cls.wndproc));
     c.p.classes.insert(name, cls);
     a as u32
@@ -1207,18 +1218,31 @@ fn create_window(c: &mut Ctx, exstyle: u32, class: &str, title: &str, style: u32
     }
     c.trace(format!("({class:?}, {title:?}, style={style:#x}, {x},{y} {w}x{h}, parent={parent:#x}) = {hwnd:#x}"));
     if wndproc != 0 {
-        // CREATESTRUCT in guest memory
-        let cs = c.p.heap_alloc(c.host, 0, 48, true);
-        let strs = [param, instance, menu, parent, h as u32, w as u32, y as u32, x as u32, style, 0, 0, exstyle];
-        for (i, v) in strs.iter().enumerate() {
-            let _ = c.host.write_u32(cs + 4 * i as u32, *v);
-        }
+        // CREATESTRUCT in guest memory (lpCreateParams, hInstance, hMenu, hwndParent,
+        // cy, cx, y, x, style, lpszName, lpszClass, dwExStyle; pointers 8 bytes in
+        // a 64-bit process)
+        let x64 = c.x64();
+        let cs = c.p.heap_alloc(c.host, 0, if x64 { 80 } else { 48 }, true);
         let name_a = c.p.heap_alloc(c.host, 0, title.len() as u32 + 1, false);
         let _ = c.host.write_cstr(name_a, title.as_bytes());
-        let _ = c.host.write_u32(cs + 36, name_a);
         let class_a = c.p.heap_alloc(c.host, 0, class.len() as u32 + 1, false);
         let _ = c.host.write_cstr(class_a, class.as_bytes());
-        let _ = c.host.write_u32(cs + 40, class_a);
+        let ints = [h as u32, w as u32, y as u32, x as u32, style];
+        let (ints_at, strs_at) = if x64 { (32, 56) } else { (16, 36) };
+        for (i, v) in [param, instance, menu, parent].into_iter().enumerate() {
+            let full = c.full(v);
+            if x64 {
+                let _ = c.host.write_u64(cs + 8 * i as u32, full);
+            } else {
+                let _ = c.host.write_u32(cs + 4 * i as u32, v);
+            }
+        }
+        for (i, v) in ints.into_iter().enumerate() {
+            let _ = c.host.write_u32(cs + ints_at + 4 * i as u32, v);
+        }
+        c.write_ptr(cs + strs_at, name_a);
+        c.write_ptr(cs + strs_at + c.ptr_size(), class_a);
+        let _ = c.host.write_u32(cs + strs_at + 2 * c.ptr_size(), exstyle);
         if send_message(c, hwnd, WM_NCCREATE, 0, cs)? == 0 {
             c.p.windows.remove(&hwnd);
             return Ok(0);
@@ -1559,14 +1583,27 @@ fn get_message(c: &mut Ctx, hwnd_filter: u32, _remove: bool) -> Result<Msg, supe
     }
 }
 
+/// MSG field offsets: hwnd, message, wParam, lParam, time, pt.
+fn msg_layout(c: &Ctx) -> [u32; 6] {
+    if c.x64() { [0, 8, 16, 24, 32, 36] } else { [0, 4, 8, 12, 16, 20] }
+}
+
+/// hwnd, message, wParam, lParam of the MSG at `p`.
+fn read_msg(c: &Ctx, p: u32) -> (u32, u32, u32, u32) {
+    let o = msg_layout(c);
+    let r = |k: usize| c.host.read_u32(p + o[k]).unwrap_or(0);
+    (r(0), r(1), r(2), r(3))
+}
+
 fn write_msg(c: &mut Ctx, out: u32, m: &Msg) {
-    let _ = c.host.write_u32(out, m.hwnd);
-    let _ = c.host.write_u32(out + 4, m.msg);
-    let _ = c.host.write_u32(out + 8, m.wparam);
-    let _ = c.host.write_u32(out + 12, m.lparam);
-    let _ = c.host.write_u32(out + 16, m.time);
-    let _ = c.host.write_u32(out + 20, m.pt.0 as u32);
-    let _ = c.host.write_u32(out + 24, m.pt.1 as u32);
+    let o = msg_layout(c);
+    c.write_ptr(out + o[0], m.hwnd);
+    let _ = c.host.write_u32(out + o[1], m.msg);
+    c.write_ptr(out + o[2], m.wparam);
+    c.write_ptr(out + o[3], m.lparam);
+    let _ = c.host.write_u32(out + o[4], m.time);
+    let _ = c.host.write_u32(out + o[5], m.pt.0 as u32);
+    let _ = c.host.write_u32(out + o[5] + 4, m.pt.1 as u32);
 }
 
 pub fn write_rect(c: &mut Ctx, p: u32, l: i32, t: i32, r: i32, b: i32) {
@@ -1582,6 +1619,21 @@ pub fn write_rect(c: &mut Ctx, p: u32, l: i32, t: i32, r: i32, b: i32) {
 pub fn read_rect(c: &Ctx, p: u32) -> (i32, i32, i32, i32) {
     let r = |o: u32| c.host.read_u32(p + o).unwrap_or(0) as i32;
     (r(0), r(4), r(8), r(12))
+}
+
+fn set_window_long(c: &mut Ctx, hwnd: u32, idx: i32, v: u32) {
+    if let Some(w) = c.p.windows.get_mut(&hwnd) {
+        match idx {
+            -4 => w.wndproc = v,
+            -16 => w.style = v,
+            -20 => w.exstyle = v,
+            -21 => w.userdata = v,
+            -12 => w.id = v,
+            _ => {
+                w.longs.insert(idx, v);
+            }
+        }
+    }
 }
 
 fn get_window_long(c: &Ctx, hwnd: u32, idx: i32) -> u32 {
@@ -1844,15 +1896,16 @@ fn format_wsprintf(c: &Ctx, fmt: &str, mut args: u32) -> String {
         let width: usize = spec.trim_end_matches(|ch: char| ch.is_ascii_alphabetic()).trim_start_matches('-').trim_start_matches('0').parse().unwrap_or(0);
         let zero = spec.starts_with('0');
         let v = c.host.read_u32(args).unwrap_or(0);
+        let slot = c.ptr_size();
         let s = match conv {
-            'd' | 'i' => { args += 4; (v as i32).to_string() }
-            'u' => { args += 4; v.to_string() }
-            'x' => { args += 4; format!("{v:x}") }
-            'X' => { args += 4; format!("{v:X}") }
-            'c' => { args += 4; ((v as u8) as char).to_string() }
-            's' => { args += 4; if v == 0 { "(null)".into() } else { c.host.read_cstr_lossy(v) } }
+            'd' | 'i' => { args += slot; (v as i32).to_string() }
+            'u' => { args += slot; v.to_string() }
+            'x' => { args += slot; format!("{v:x}") }
+            'X' => { args += slot; format!("{v:X}") }
+            'c' => { args += slot; ((v as u8) as char).to_string() }
+            's' => { args += slot; if v == 0 { "(null)".into() } else { c.host.read_cstr_lossy(v) } }
             '%' => "%".into(),
-            _ => { args += 4; String::new() }
+            _ => { args += slot; String::new() }
         };
         if s.len() < width {
             let pad = if zero { "0" } else { " " }.repeat(width - s.len());
@@ -2468,7 +2521,8 @@ pub fn register_extra(r: &mut Registry) {
     r.add(u, "wsprintfW", |c| {
         // cdecl: (buf, fmt, ...); the narrow formatter over the wide format string
         let (buf, fmt) = (c.arg(0), c.host.read_wstr(c.arg(1)).unwrap_or_default());
-        let s = format_wsprintf(c, &fmt, c.regs.esp + 12);
+        let va_at = c.varargs(2);
+        let s = format_wsprintf(c, &fmt, va_at);
         let units: Vec<u16> = s.encode_utf16().chain([0]).collect();
         for (i, w) in units.iter().enumerate() {
             let _ = c.host.write_u16(buf + 2 * i as u32, *w);

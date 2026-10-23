@@ -7,7 +7,7 @@
 //! as if it timed out. Scheduling depends only on the virtual clock and guest
 //! behavior, so runs stay deterministic.
 
-use super::{ApiResult, Ctx, Registry, Ret};
+use super::{TebField, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
 use crate::process::{Handle, Process, Thread, ThreadCtx, ThreadState, THREAD_EXIT};
 
@@ -236,13 +236,33 @@ fn cs_owner(p: &Process, cs: u32) -> u32 {
     p.cs_owners.get(&cs).copied().unwrap_or(0)
 }
 
+/// CRITICAL_SECTION offsets of LockCount, RecursionCount and OwningThread.
+pub fn cs_fields(c: &Ctx) -> [u32; 3] {
+    if c.x64() { [8, 12, 16] } else { [4, 8, 12] }
+}
+
+/// The critical section a slim reader/writer lock is taken as (made at first use).
+fn srw_cs(c: &mut Ctx, srw: u32) -> u32 {
+    if let Some(&cs) = c.p.srw_locks.get(&srw) {
+        return cs;
+    }
+    let heap = c.p.process_heap;
+    let g: &mut dyn Guest = &mut *c.host;
+    let cs = c.p.heap_alloc(g, heap, 40, true);
+    let lock = cs_fields(c)[0];
+    let _ = c.host.write_u32(cs + lock, u32::MAX);
+    c.p.srw_locks.insert(srw, cs);
+    cs
+}
+
 fn cs_take(c: &mut Ctx, cs: u32, tid: u32) {
-    let rec = c.host.read_u32(cs + 8).unwrap_or(0);
+    let [lock, recursion, owner] = cs_fields(c);
+    let rec = c.host.read_u32(cs + recursion).unwrap_or(0);
     let rec = if cs_owner(c.p, cs) == tid { rec + 1 } else { 1 };
     c.p.cs_owners.insert(cs, tid);
-    let _ = c.host.write_u32(cs + 4, 0);
-    let _ = c.host.write_u32(cs + 8, rec);
-    let _ = c.host.write_u32(cs + 12, tid);
+    let _ = c.host.write_u32(cs + lock, 0);
+    let _ = c.host.write_u32(cs + recursion, rec);
+    let _ = c.host.write_u32(cs + owner, tid);
 }
 
 /// Hands critical sections to the threads that woke up waiting for them.
@@ -284,12 +304,13 @@ fn enter_cs(c: &mut Ctx, cs: u32, try_only: bool) -> bool {
 
 fn leave_cs(c: &mut Ctx, cs: u32) {
     take_pending(c);
-    let rec = c.host.read_u32(cs + 8).unwrap_or(1).saturating_sub(1);
-    let _ = c.host.write_u32(cs + 8, rec);
+    let [lock, recursion, owner] = cs_fields(c);
+    let rec = c.host.read_u32(cs + recursion).unwrap_or(1).saturating_sub(1);
+    let _ = c.host.write_u32(cs + recursion, rec);
     if rec == 0 {
         c.p.cs_owners.remove(&cs);
-        let _ = c.host.write_u32(cs + 12, 0);
-        let _ = c.host.write_u32(cs + 4, u32::MAX);
+        let _ = c.host.write_u32(cs + owner, 0);
+        let _ = c.host.write_u32(cs + lock, u32::MAX);
     }
 }
 
@@ -297,13 +318,15 @@ fn leave_cs(c: &mut Ctx, cs: u32) {
 
 /// Allocates a stack and a TEB (with the x87 state page below it) and prepares the
 /// registers that call `start(param)` returning to THREAD_EXIT.
-fn create_thread(c: &mut Ctx, start: u32, param: u32, stack_size: u32, suspended: bool) -> Result<(u32, u32), String> {
+fn create_thread(c: &mut Ctx, start: u32, param: u64, stack_size: u32, suspended: bool) -> Result<(u32, u32), String> {
     let stack_size = stack_size.max(0x10_0000).div_ceil(0x10000) * 0x10000;
     let stack = c.p.vm.alloc(0, stack_size, true, crate::mem::PAGE_READWRITE, false, "thread stack").ok_or("no memory for a thread stack")?;
     c.host.ensure_mapped(stack, stack_size).map_err(|e| e.to_string())?;
-    let state = c.p.vm.alloc(0, 0x2000, true, crate::mem::PAGE_READWRITE, false, "thread state").ok_or("no memory for a TEB")?;
-    c.host.ensure_mapped(state, 0x2000).map_err(|e| e.to_string())?;
-    let _ = c.host.fill(state, 0x2000, 0);
+    // (the x87 state's page, then the TEB: two pages in a 64-bit process)
+    let state_size = if c.x64() { 0x3000 } else { 0x2000 };
+    let state = c.p.vm.alloc(0, state_size, true, crate::mem::PAGE_READWRITE, false, "thread state").ok_or("no memory for a TEB")?;
+    c.host.ensure_mapped(state, state_size).map_err(|e| e.to_string())?;
+    let _ = c.host.fill(state, state_size, 0);
     let teb = state + 0x1000;
     let id = 0x1300 + 4 * c.p.threads.len() as u32;
     let top = stack + stack_size;
@@ -314,16 +337,18 @@ fn create_thread(c: &mut Ctx, start: u32, param: u32, stack_size: u32, suspended
     f.to_block(&mut block);
     let _ = c.host.write(teb - fpu::block::OFFSET, &block);
     let main_teb = c.p.threads[0].teb;
-    let peb = c.host.read_u32(main_teb + 0x30).unwrap_or(0);
-    for (off, v) in [(0x00, u32::MAX), (0x04, top), (0x08, stack), (0x18, teb), (0x20, 0x1234), (0x24, id), (0x30, peb)] {
-        let _ = c.host.write_u32(teb + off, v);
+    let peb = c.host.read_u32(main_teb + c.teb_off(TebField::Peb)).unwrap_or(0);
+    let x64 = c.x64();
+    for (f, v) in [(TebField::ExceptionList, if x64 { 0 } else { u32::MAX }), (TebField::StackBase, top), (TebField::StackLimit, stack), (TebField::Self_, teb), (TebField::ProcessId, 0x1234), (TebField::ThreadId, id), (TebField::Peb, peb)] {
+        let _ = c.host.write_u32(teb + f.offset(x64), v);
     }
     // static TLS: a copy of every module's template
     let templates: Vec<(u32, u32, u32)> = c.p.modules.iter().filter_map(|m| m.tls_template).collect();
     if !templates.is_empty() {
         let heap = c.p.process_heap;
         let g: &mut dyn Guest = &mut *c.host;
-        let array = c.p.heap_alloc(g, heap, 4 * 64, true);
+        let ps = if x64 { 8 } else { 4 };
+        let array = c.p.heap_alloc(g, heap, ps * 64, true);
         for (i, (s, e, zero)) in templates.into_iter().enumerate() {
             let len = e.saturating_sub(s);
             let g: &mut dyn Guest = &mut *c.host;
@@ -331,16 +356,26 @@ fn create_thread(c: &mut Ctx, start: u32, param: u32, stack_size: u32, suspended
             let mut buf = vec![0u8; len as usize];
             let _ = c.host.read(s, &mut buf);
             let _ = c.host.write(b, &buf);
-            let _ = c.host.write_u32(array + 4 * i as u32, b);
+            let _ = c.host.write_u32(array + ps * i as u32, b);
         }
-        let _ = c.host.write_u32(teb + 0x2C, array);
+        let _ = c.host.write_u32(teb + c.teb_off(TebField::TlsPointer), array);
     }
-    let esp = top - 16 - 8;
-    let _ = c.host.write_u32(esp, THREAD_EXIT);
-    let _ = c.host.write_u32(esp + 4, param);
-    let regs = super::Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp, ebp: 0, esi: 0, edi: 0, eip: start, fs_base: teb };
+    let regs = if x64 {
+        // Win64: the parameter in rcx, the return address below 32 bytes of shadow space
+        let rsp = top - 0x40 - 8;
+        let _ = c.host.write_u64(rsp, THREAD_EXIT as u64);
+        let mut r64 = [0u64; 16];
+        r64[1] = param;
+        r64[4] = rsp as u64;
+        super::Regs { ecx: param as u32, esp: rsp, eip: start, fs_base: teb, r64: Some(r64), ..Default::default() }
+    } else {
+        let esp = top - 16 - 8;
+        let _ = c.host.write_u32(esp, THREAD_EXIT);
+        let _ = c.host.write_u32(esp + 4, param as u32);
+        super::Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp, ebp: 0, esi: 0, edi: 0, eip: start, fs_base: teb, r64: None }
+    };
     let h = c.p.new_handle(Handle::Thread { id });
-    let ctx = ThreadCtx { regs, flags: [0; 7], xmm: [0; 8], mxcsr: 0x1F80 };
+    let ctx = ThreadCtx { regs, flags: [0; 7], xmm: [0; 16], mxcsr: 0x1F80 };
     c.p.threads.push(Thread {
         id,
         teb,
@@ -369,7 +404,7 @@ fn thread_index(p: &Process, h: u32) -> Option<usize> {
 pub fn register(r: &mut Registry) {
     let k = "kernel32.dll";
     r.add(k, "CreateThread", |c| {
-        let (stack, start, param, flags, pid) = (c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5));
+        let (stack, start, param, flags, pid) = (c.arg(1), c.arg(2), c.arg64(3), c.arg(4), c.arg(5));
         match create_thread(c, start, param, stack, flags & CREATE_SUSPENDED != 0) {
             Ok((h, id)) => {
                 if pid != 0 {
@@ -502,13 +537,13 @@ pub fn register(r: &mut Registry) {
     });
     r.add(k, "WaitForMultipleObjects", |c| {
         let (n, p, all, ms) = (c.arg(0), c.arg(1), c.arg(2) != 0, c.arg(3));
-        let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + 4 * i).unwrap_or(0)).collect();
+        let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + c.ptr_size() * i).unwrap_or(0)).collect();
         let r = wait(c, handles, all, ms);
         ok(4, r)
     });
     r.add(k, "WaitForMultipleObjectsEx", |c| {
         let (n, p, all, ms) = (c.arg(0), c.arg(1), c.arg(2) != 0, c.arg(3));
-        let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + 4 * i).unwrap_or(0)).collect();
+        let handles: Vec<u32> = (0..n.min(64)).map(|i| c.host.read_u32(p + c.ptr_size() * i).unwrap_or(0)).collect();
         let r = wait(c, handles, all, ms);
         ok(5, r)
     });
@@ -546,6 +581,54 @@ pub fn register(r: &mut Registry) {
         }
         enter_cs(c, cs, false);
         ok(3, 1)
+    });
+    // Slim reader/writer locks, shared or not, are taken as a critical section of their
+    // own (recursive for the owner, which a shared lock may be); the lock word says
+    // whether one is held.
+    r.add_on_demand(k, "InitializeSRWLock", |c| {
+        let _ = c.host.write_u32(c.arg(0), 0);
+        ok(1, 0)
+    });
+    for name in ["AcquireSRWLockExclusive", "AcquireSRWLockShared"] {
+        r.add_on_demand(k, name, |c| {
+            let srw = c.arg(0);
+            let cs = srw_cs(c, srw);
+            enter_cs(c, cs, false);
+            let _ = c.host.write_u32(srw, 1);
+            ok(1, 0)
+        });
+    }
+    for name in ["TryAcquireSRWLockExclusive", "TryAcquireSRWLockShared"] {
+        r.add_on_demand(k, name, |c| {
+            let srw = c.arg(0);
+            let cs = srw_cs(c, srw);
+            let got = enter_cs(c, cs, true);
+            if got {
+                let _ = c.host.write_u32(srw, 1);
+            }
+            ok(1, got as u32)
+        });
+    }
+    for name in ["ReleaseSRWLockExclusive", "ReleaseSRWLockShared"] {
+        r.add_on_demand(k, name, |c| {
+            let srw = c.arg(0);
+            let cs = srw_cs(c, srw);
+            leave_cs(c, cs);
+            if cs_owner(c.p, cs) == 0 {
+                let _ = c.host.write_u32(srw, 0);
+            }
+            ok(1, 0)
+        });
+    }
+    r.add_on_demand(k, "SleepConditionVariableSRW", |c| {
+        let (srw, ms) = (c.arg(1), c.arg(2));
+        let cs = srw_cs(c, srw);
+        leave_cs(c, cs);
+        if c.p.current == 0 {
+            sleep(c, ms.min(1));
+        }
+        enter_cs(c, cs, false);
+        ok(4, 1)
     });
     r.add(k, "WakeConditionVariable", |_c| ok(1, 0));
     r.add(k, "WakeAllConditionVariable", |_c| ok(1, 0));

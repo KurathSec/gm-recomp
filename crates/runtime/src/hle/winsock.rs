@@ -602,12 +602,18 @@ pub fn register(r: &mut Registry) {
         let Some(addr) = c.p.sockets.address_of(&name) else { return ok(4, WSAHOST_NOT_FOUND) };
         let (socktype, protocol) = if hints != 0 { (c.host.read_u32(hints + 8).unwrap_or(1), c.host.read_u32(hints + 12).unwrap_or(0)) } else { (1, 0) };
         // addrinfo {flags, family, socktype, protocol, addrlen, canonname, addr, next} + sockaddr_in
-        let p = galloc(c, 32 + 16);
-        for (i, v) in [0, 2, socktype, protocol, 16, 0, p + 32, 0].into_iter().enumerate() {
+        // (addrlen and the pointers 8 bytes from offset 16 in a 64-bit process)
+        let ps = c.ptr_size();
+        let size = 16 + 4 * ps;
+        let p = galloc(c, size + 16);
+        for (i, v) in [0, 2, socktype, protocol].into_iter().enumerate() {
             let _ = c.host.write_u32(p + 4 * i as u32, v);
         }
-        write_sockaddr(c, p + 32, 0, (addr, port));
-        let _ = c.host.write_u32(res, p);
+        for (i, v) in [16, 0, p + size, 0].into_iter().enumerate() {
+            c.write_ptr(p + 16 + ps * i as u32, v);
+        }
+        write_sockaddr(c, p + size, 0, (addr, port));
+        c.write_ptr(res, p);
         ok(4, 0)
     });
     r.add(w, "freeaddrinfo", |c| {

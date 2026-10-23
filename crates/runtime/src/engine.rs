@@ -254,6 +254,7 @@ pub trait Machine: Guest {
             edi: self.global(Global::Edi),
             eip: self.global(Global::Eip),
             fs_base: self.global(Global::FsBase),
+            r64: None,
         }
     }
     fn set_regs(&mut self, r: &Regs) {
@@ -326,11 +327,65 @@ pub trait Machine: Guest {
 // ---- registers ---------------------------------------------------------------------------
 
 pub fn read_regs<M: Machine + ?Sized>(m: &mut M) -> Regs {
-    m.regs()
+    if !m.engine_ref().x64 {
+        return m.regs();
+    }
+    let mut r64 = [0u64; 16];
+    for (v, g) in r64.iter_mut().zip(GPR64) {
+        *v = m.global64(g);
+    }
+    let low = |i: usize| r64[i] as u32;
+    Regs {
+        eax: low(0),
+        ecx: low(1),
+        edx: low(2),
+        ebx: low(3),
+        esp: low(4),
+        ebp: low(5),
+        esi: low(6),
+        edi: low(7),
+        eip: m.global(Global::Eip),
+        fs_base: m.global(Global::GsBase),
+        r64: Some(r64),
+    }
 }
 
+/// rax..r15 in encoding order.
+pub const GPR64: [Global; 16] = [
+    Global::Rax,
+    Global::Rcx,
+    Global::Rdx,
+    Global::Rbx,
+    Global::Rsp,
+    Global::Rbp,
+    Global::Rsi,
+    Global::Rdi,
+    Global::R8,
+    Global::R9,
+    Global::R10,
+    Global::R11,
+    Global::R12,
+    Global::R13,
+    Global::R14,
+    Global::R15,
+];
+
+/// In a 64-bit process, a 32-bit field that differs from its register's low half was
+/// written as a 32-bit register is (zero-extended).
 pub fn write_regs<M: Machine + ?Sized>(m: &mut M, r: &Regs) {
-    m.set_regs(r)
+    let Some(mut r64) = r.r64 else { return m.set_regs(r) };
+    for (i, v) in [r.eax, r.ecx, r.edx, r.ebx, r.esp, r.ebp, r.esi, r.edi].into_iter().enumerate() {
+        if r64[i] as u32 != v {
+            r64[i] = v as u64;
+        }
+    }
+    for (v, g) in r64.into_iter().zip(GPR64) {
+        m.set_global64(g, v);
+    }
+    m.set_global(Global::Eip, r.eip);
+    m.set_global(Global::GsBase, r.fs_base);
+    // (the x87 state block is found from FS, below the TEB)
+    m.set_global(Global::FsBase, r.fs_base);
 }
 
 /// Asks translated code to return to the dispatcher, which then stops with `msg`.
@@ -393,8 +448,30 @@ impl<M: Machine + ?Sized> fpu::Mem for FpuMem<'_, M> {
     }
 }
 
+/// Lays out a Win64 call of `addr` below `rsp`: arguments in rcx, rdx, r8, r9 and on the
+/// stack after 32 bytes of shadow space, the return address `marker`, RSP 8 off a
+/// 16-byte boundary as at any function entry. Returns the new rax..r15.
+fn win64_frame<M: Machine + ?Sized>(m: &mut M, mut r64: [u64; 16], rsp: u64, addr: u32, args: &[u64], marker: u32) -> Result<[u64; 16], String> {
+    let n = args.len().max(4) as u64;
+    let top = ((rsp - 0x80) & !0xF) - ((8 * n + 15) & !15);
+    for (i, a) in args.iter().enumerate() {
+        m.write_u64(top as u32 + 8 * i as u32, *a).map_err(|e| e.to_string())?;
+    }
+    m.write_u64(top as u32 - 8, marker as u64).map_err(|e| e.to_string())?;
+    for (k, reg) in [1, 2, 8, 9].into_iter().enumerate() {
+        r64[reg] = args.get(k).copied().unwrap_or(0);
+    }
+    r64[4] = top - 8;
+    m.set_global(Global::Eip, addr);
+    Ok(r64)
+}
+
 impl<M: Machine> Host for M {
     fn call_guest(&mut self, p: &mut Process, regs: &mut Regs, addr: u32, args: &[u32]) -> Result<u32, String> {
+        if regs.r64.is_some() {
+            let args: Vec<u64> = args.iter().map(|&a| a as u64).collect();
+            return call_guest64(self, p, regs, addr, &args).map(|v| v as u32);
+        }
         let depth = {
             let e = self.engine();
             e.depth += 1;
@@ -439,6 +516,18 @@ impl<M: Machine> Host for M {
         regs.edi = after.edi;
         regs.ebp = after.ebp;
         Ok(after.eax)
+    }
+
+    fn call_guest64(&mut self, p: &mut Process, regs: &mut Regs, addr: u32, args: &[u64]) -> Result<u64, String> {
+        call_guest64(self, p, regs, addr, args)
+    }
+
+    fn xmm_reg(&mut self, i: u32) -> u128 {
+        Machine::xmm(self, i)
+    }
+
+    fn set_xmm_reg(&mut self, i: u32, v: u128) {
+        Machine::set_xmm(self, i, v)
     }
 
     fn request_exit(&mut self, code: u32) {
@@ -544,6 +633,49 @@ impl<M: Machine> Host for M {
     }
 }
 
+/// `Host::call_guest` in a 64-bit process, with full 64-bit arguments; returns RAX.
+pub fn call_guest64<M: Machine>(m: &mut M, p: &mut Process, regs: &mut Regs, addr: u32, args: &[u64]) -> Result<u64, String> {
+    let depth = {
+        let e = m.engine();
+        e.depth += 1;
+        e.depth
+    };
+    let marker = RET_TO_HOST + 4 * depth;
+    let r64 = regs.r64.ok_or("call_guest64 in a 32-bit process")?;
+    let callee_r64 = win64_frame(m, r64, r64[4], addr, args, marker)?;
+    let callee = Regs { eax: callee_r64[0] as u32, ecx: callee_r64[1] as u32, edx: callee_r64[2] as u32, esp: callee_r64[4] as u32, eip: addr, r64: Some(callee_r64), ..*regs };
+    write_regs(m, &callee);
+    // Exception dispatch walks on past this call as the API's caller, whose registers
+    // are what they are at the API's return.
+    let mut caller = r64;
+    let api_rsp = caller[4];
+    let caller_rip = m.read_u64(api_rsp as u32).unwrap_or(0);
+    caller[4] = api_rsp + 8;
+    p.host_frames64.push((marker, caller, caller_rip));
+    p.nest += 1;
+    let owned = std::mem::replace(p, Process::empty());
+    m.engine().p = Some(Box::new(owned));
+    // A context continued above the callee's frame (an exception handler of an outer
+    // frame took over) unwinds this host frame too.
+    let r = run_until(m, addr, marker, Some(callee_r64[4] as u32 + 8));
+    {
+        let e = m.engine();
+        e.depth -= 1;
+        if let Some(back) = e.p.take() {
+            *p = *back;
+        }
+    }
+    p.nest -= 1;
+    p.host_frames64.pop();
+    r?;
+    let after = read_regs(m);
+    // Registers come back as the callee left them, except the API's own stack pointer.
+    let mut r64 = after.r64.unwrap_or(r64);
+    r64[4] = regs.r64.map_or(0, |r| r[4]);
+    *regs = Regs { esp: r64[4] as u32, eip: regs.eip, fs_base: regs.fs_base, r64: Some(r64), ..after };
+    Ok(r64[0])
+}
+
 /// Runs `f` with the process checked out of the engine and a `Ctx` built on it.
 pub fn with_ctx<M: Machine, R>(m: &mut M, regs: &mut Regs, id: ApiId, f: impl FnOnce(&mut Ctx) -> R) -> Result<R, String> {
     let mut p = m.engine().p.take().ok_or("process not available (nested host call without lending)")?;
@@ -557,15 +689,31 @@ pub fn with_ctx<M: Machine, R>(m: &mut M, regs: &mut Regs, id: ApiId, f: impl Fn
 
 // ---- API calls -----------------------------------------------------------------------------
 
-fn format_args<M: Machine>(m: &M, esp: u32, n: u32) -> String {
+fn format_args<M: Machine>(m: &M, regs: &Regs, n: u32) -> String {
     let mut s = String::new();
     for i in 0..n {
         if i > 0 {
             s.push_str(", ");
         }
-        s.push_str(&format!("{:#x}", m.read_u32(esp + 4 + 4 * i).unwrap_or(0)));
+        let v = match &regs.r64 {
+            Some(r) if i < 4 => r[[1, 2, 8, 9][i as usize]],
+            Some(r) => m.read_u64(r[4] as u32 + 0x28 + 8 * (i - 4)).unwrap_or(0),
+            None => m.read_u32(regs.esp + 4 + 4 * i).unwrap_or(0) as u64,
+        };
+        s.push_str(&format!("{v:#x}"));
     }
     s
+}
+
+/// RAX for a 32-bit result in a 64-bit process: zero-extended, except -4096..-1, which
+/// are handles and LRESULTs (INVALID_HANDLE_VALUE, the current-process handle) or
+/// values the caller reads as 32 bits anyway; nothing the runtime hands out lives there.
+pub fn rax_of(eax: u32, high: Option<u32>) -> u64 {
+    match high {
+        Some(h) => (h as u64) << 32 | eax as u64,
+        None if eax >= 0xFFFF_F000 => eax as i32 as i64 as u64,
+        None => eax as u64,
+    }
 }
 
 /// Runs the API behind a stub. Problems are reported through `ctl`.
@@ -596,10 +744,12 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
     if calls > max_calls {
         return stop(m, format!("API call budget exhausted ({max_calls})"));
     }
+    // (in a 64-bit process the low half of the return address: where it is, the key the
+    // caller's after-call check compares)
     let ra = m.read_u32(regs.esp).unwrap_or(0);
     if trace {
         let name = name_of(m);
-        let args = format_args(m, regs.esp, if nargs > 0 { nargs.min(8) } else { 4 });
+        let args = format_args(m, &regs, if nargs > 0 { nargs.min(8) } else { 4 });
         let line = format!("{:w$}{name}({args}) from {ra:#x}", "", w = (depth * 2) as usize);
         m.print(&line);
     }
@@ -621,6 +771,18 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
                 }
                 write_regs(m, &regs);
                 request(m, Ctl::Resume);
+            } else if let Some(r64) = regs.r64.as_mut() {
+                // Win64: the result in RAX; the caller removes the arguments.
+                r64[0] = rax_of(ret.eax, ret.edx);
+                r64[4] += 8;
+                regs.eax = ret.eax;
+                regs.esp = r64[4] as u32;
+                regs.eip = ra;
+                if trace {
+                    let line = format!("{:w$}  = {:#x}", "", r64[0], w = (depth * 2) as usize);
+                    m.print(&line);
+                }
+                write_regs(m, &regs);
             } else {
                 regs.eax = ret.eax;
                 if let Some(edx) = ret.edx {
@@ -648,6 +810,27 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
 
 /// Raises a fault through the guest's SEH chain with the current registers as context.
 pub fn raise_fault<M: Machine>(m: &mut M, code: u32, ip: u32) -> Result<(), String> {
+    if m.engine_ref().x64 {
+        let mut regs = read_regs(m);
+        let id = m.engine_ref().process().registry.lookup("kernel32.dll", "RaiseException").ok_or("RaiseException not registered")?;
+        let r = with_ctx(m, &mut regs, id, |c| {
+            let mut xmm = [0u128; 16];
+            for (i, v) in xmm.iter_mut().enumerate() {
+                *v = c.host.xmm_reg(i as u32);
+            }
+            let rip = c.full(ip);
+            let ctx = crate::hle::seh64::Context64 { r: c.regs.r64.unwrap_or_default(), rip, xmm, eflags: 0x202, mxcsr: c.host.mxcsr() };
+            crate::hle::seh64::dispatch(c, code, 0, &[], &ctx)
+        })?;
+        return match r {
+            Ok(ret) if ret.resume => {
+                write_regs(m, &regs);
+                Ok(())
+            }
+            Ok(_) => Err(format!("exception {code:#x} at {ip:#x}: handler returned without a context")),
+            Err(ApiError(msg)) => Err(msg),
+        };
+    }
     let mut regs = read_regs(m);
     regs.eip = ip;
     let id = m.engine_ref().process().registry.lookup("kernel32.dll", "RaiseException").ok_or("RaiseException not registered")?;
@@ -1465,8 +1648,9 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
 
 fn save_ctx<M: Machine + ?Sized>(m: &mut M) -> ThreadCtx {
     let flags = [Global::Cf, Global::Pf, Global::Af, Global::Zf, Global::Sf, Global::Of, Global::Df].map(|g| m.global(g));
-    let mut xmm = [0u128; 8];
-    for (i, x) in xmm.iter_mut().enumerate() {
+    let mut xmm = [0u128; 16];
+    let n = if m.engine_ref().x64 { 16 } else { 8 };
+    for (i, x) in xmm.iter_mut().enumerate().take(n) {
         *x = m.xmm(i as u32);
     }
     ThreadCtx { regs: read_regs(m), flags, xmm, mxcsr: m.global(Global::Mxcsr) }
@@ -1477,7 +1661,8 @@ fn restore_ctx<M: Machine + ?Sized>(m: &mut M, c: &ThreadCtx) {
     for (g, v) in [Global::Cf, Global::Pf, Global::Af, Global::Zf, Global::Sf, Global::Of, Global::Df].into_iter().zip(c.flags) {
         m.set_global(g, v);
     }
-    for (i, x) in c.xmm.iter().enumerate() {
+    let n = if c.regs.r64.is_some() { 16 } else { 8 };
+    for (i, x) in c.xmm.iter().enumerate().take(n) {
         m.set_xmm(i as u32, *x);
     }
     m.set_global(Global::Mxcsr, c.mxcsr);
@@ -1496,7 +1681,7 @@ fn run_slice<M: Machine>(m: &mut M) -> Result<SliceEnd, String> {
     let mut eip = m.global(Global::Eip);
     loop {
         if eip == crate::process::THREAD_EXIT {
-            return Ok(SliceEnd::Exited(m.global(Global::Eax)));
+            return Ok(SliceEnd::Exited(read_regs(m).eax));
         }
         if m.engine_ref().dispatches - start > SLICE_BUDGET {
             return Ok(SliceEnd::Preempted);
@@ -1540,7 +1725,11 @@ pub fn run_threads<M: Machine>(m: &mut M, p: &mut Process) {
         let Some(ctx) = p.threads[i].ctx.take() else { continue };
         restore_ctx(m, &ctx);
         if let Some(eax) = p.threads[i].resume_eax.take() {
-            m.set_global(Global::Eax, eax);
+            if m.engine_ref().x64 {
+                m.set_global64(Global::Rax, eax as u64);
+            } else {
+                m.set_global(Global::Eax, eax);
+            }
         }
         p.threads[i].state = crate::process::ThreadState::Running;
         p.current = i;
@@ -1578,8 +1767,26 @@ pub fn run_threads<M: Machine>(m: &mut M, p: &mut Process) {
     p.in_scheduler = false;
 }
 
-/// Calls `addr` with stdcall `args` from the host (DllMain, the entry point).
+/// Calls `addr` with stdcall `args` from the host (DllMain, the entry point); in a
+/// 64-bit process by the Win64 convention.
 pub fn call_from_host<M: Machine>(m: &mut M, addr: u32, args: &[u32]) -> Result<(), String> {
+    if m.engine_ref().x64 {
+        let regs = read_regs(m);
+        let r64 = regs.r64.unwrap_or_default();
+        let args: Vec<u64> = args.iter().map(|&a| a as u64).collect();
+        let callee = win64_frame(m, r64, r64[4], addr, &args, RET_TO_HOST)?;
+        write_regs(m, &Regs { eax: callee[0] as u32, ecx: callee[1] as u32, edx: callee[2] as u32, esp: callee[4] as u32, eip: addr, r64: Some(callee), ..regs });
+        let r = run_until(m, addr, RET_TO_HOST, None);
+        m.engine().ctl = None;
+        // The caller removes the arguments: the stack is back where it was.
+        let mut after = read_regs(m);
+        if let Some(a) = after.r64.as_mut() {
+            a[4] = r64[4];
+            after.esp = a[4] as u32;
+        }
+        write_regs(m, &after);
+        return r;
+    }
     let mut esp = m.global(Global::Esp);
     for a in args.iter().rev() {
         esp -= 4;
@@ -1652,6 +1859,10 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         if name.eq_ignore_ascii_case(exe) {
             entry = md.entry;
             image_base = md.base;
+            if md.pe64 {
+                p.x64 = true;
+                m.engine().x64 = true;
+            }
         } else if md.is_dll && md.entry != md.base {
             for cb in &md.tls_callbacks {
                 attach.push((md.base, *cb, format!("{name} tls")));
@@ -1668,7 +1879,14 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     m.ensure_mapped(abi::RESOLVE_CACHE, abi::RESOLVE_CACHE_SIZE + 0x1000 + 8 * abi::ENTRY_SLOTS).map_err(|_| "cannot map the resolve cache".to_string())?;
     m.set_global(Global::FsBase, teb);
     m.set_global(Global::Mxcsr, 0x1F80);
-    let regs = Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: stack_top - 0x100, ebp: 0, esi: 0, edi: 0, eip: entry, fs_base: teb };
+    let x64 = m.engine_ref().x64;
+    let esp = stack_top - 0x100;
+    let r64 = x64.then(|| {
+        let mut r = [0u64; 16];
+        r[4] = esp as u64;
+        r
+    });
+    let regs = Regs { eax: 0, ecx: 0, edx: 0, ebx: 0, esp, ebp: 0, esi: 0, edi: 0, eip: entry, fs_base: teb, r64 };
     write_regs(m, &regs);
     Ok(Started { entry, attach })
 }

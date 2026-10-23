@@ -24,6 +24,7 @@ pub mod msvcrt;
 pub mod nls;
 pub mod pads;
 pub mod profile;
+pub mod seh64;
 pub mod user32;
 pub mod winsock;
 
@@ -46,6 +47,10 @@ pub struct Regs {
     pub edi: u32,
     pub eip: u32,
     pub fs_base: u32,
+    /// A 64-bit process's rax..r15 (encoding order). The fields above are then views of
+    /// their low halves (`fs_base`: the GS base, the TEB), and writing one of them
+    /// changes the register as a 32-bit write does: zero-extended (`engine::write_regs`).
+    pub r64: Option<[u64; 16]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,7 +62,9 @@ pub struct Ret {
     /// continues there instead of returning to the caller: exception dispatch,
     /// `NtContinue`, thread switches.
     pub resume: bool,
-    /// High half of a 64-bit result.
+    /// High half of a 64-bit result: EDX, or in a 64-bit process the upper half of RAX
+    /// (without it, RAX is EAX zero-extended, or sign-extended for -4096..-1: handles
+    /// and LRESULTs such as INVALID_HANDLE_VALUE).
     pub edx: Option<u32>,
 }
 
@@ -70,6 +77,11 @@ impl Ret {
     }
     pub fn resume() -> Self {
         Ret { eax: 0, pop: 0, resume: true, edx: None }
+    }
+    /// A pointer-sized result: in a 64-bit process RAX gets the upper half too (an
+    /// address in a 64-bit image, `Ctx::full`).
+    pub fn ptr(nargs: u32, v: u64) -> Self {
+        Ret { eax: v as u32, pop: nargs * 4, resume: false, edx: (v >> 32 != 0).then_some((v >> 32) as u32) }
     }
 }
 
@@ -94,6 +106,8 @@ pub enum Ask<'a> {
 pub trait Host: Guest {
     /// Calls guest `addr` with stdcall `args`; returns EAX.
     fn call_guest(&mut self, p: &mut Process, regs: &mut Regs, addr: u32, args: &[u32]) -> Result<u32, String>;
+    /// Calls guest `addr` by the Win64 convention (a 64-bit process); returns RAX.
+    fn call_guest64(&mut self, p: &mut Process, regs: &mut Regs, addr: u32, args: &[u64]) -> Result<u64, String>;
     /// Ends execution of the guest (ExitProcess).
     fn request_exit(&mut self, code: u32);
     /// Pushes a value onto the x87 stack (FLD m64 semantics).
@@ -103,6 +117,9 @@ pub trait Host: Guest {
     /// The calling thread's x87 state, and writing it back (control/status words).
     fn fpu_state(&mut self) -> fpu::Fpu;
     fn set_fpu_state(&mut self, f: &fpu::Fpu);
+    /// XMM register `i` (0..16 in a 64-bit process), and writing it.
+    fn xmm_reg(&mut self, i: u32) -> u128;
+    fn set_xmm_reg(&mut self, i: u32, v: u128);
     /// SSE control/status register.
     fn mxcsr(&mut self) -> u32;
     fn set_mxcsr(&mut self, v: u32);
@@ -202,9 +219,82 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// Stdcall argument `i` (0-based) from the guest stack.
+    /// Argument `i` (0-based): stdcall from the guest stack, or in a 64-bit process the
+    /// low half of the Win64 argument (an address's low half is where it is in guest
+    /// memory).
     pub fn arg(&self, i: u32) -> u32 {
+        if self.regs.r64.is_some() {
+            return self.arg64(i) as u32;
+        }
         self.host.read_u32(self.regs.esp + 4 + 4 * i).unwrap_or(0)
+    }
+    /// Win64 argument `i`: rcx, rdx, r8, r9, then the stack above the return address and
+    /// the 32 bytes of shadow space. In a 32-bit process, the stdcall argument.
+    pub fn arg64(&self, i: u32) -> u64 {
+        match &self.regs.r64 {
+            Some(r) if i < 4 => r[[1, 2, 8, 9][i as usize]],
+            Some(r) => self.host.read_u64(r[4] as u32 + 0x28 + 8 * (i - 4)).unwrap_or(0),
+            None => self.arg(i) as u64,
+        }
+    }
+    /// Where the variadic arguments from argument `first` on are in guest memory: on the
+    /// stack (4-byte slots), or in a 64-bit process the home area, where the register
+    /// arguments are stored first as a variadic callee does, so all are 8-byte slots in
+    /// a row.
+    pub fn varargs(&mut self, first: u32) -> u32 {
+        let Some(r) = self.regs.r64 else { return self.regs.esp + 4 + 4 * first };
+        let rsp = r[4] as u32;
+        for (k, reg) in [1, 2, 8, 9].into_iter().enumerate() {
+            let _ = self.host.write_u64(rsp + 8 + 8 * k as u32, r[reg]);
+        }
+        rsp + 8 + 8 * first
+    }
+    /// A `float` argument `i`: in a 64-bit process the first four go in xmm0..3 by
+    /// position, not in the integer registers.
+    pub fn arg_f32(&mut self, i: u32) -> f32 {
+        if self.x64() && i < 4 {
+            return f32::from_bits(self.host.xmm_reg(i) as u32);
+        }
+        f32::from_bits(self.arg(i))
+    }
+    /// A 64-bit process: pointers, handles and `SIZE_T` are 8 bytes in structures.
+    pub fn x64(&self) -> bool {
+        self.regs.r64.is_some()
+    }
+    /// Size of a pointer in guest structures.
+    pub fn ptr_size(&self) -> u32 {
+        if self.x64() { 8 } else { 4 }
+    }
+    /// A pointer-sized field (its low half in a 64-bit process: where it points in guest
+    /// memory).
+    pub fn read_ptr(&self, addr: u32) -> u32 {
+        self.host.read_u32(addr).unwrap_or(0)
+    }
+    /// Writes a pointer-sized field (zero-extended in a 64-bit process).
+    pub fn write_ptr(&mut self, addr: u32, v: u32) {
+        if self.x64() {
+            let _ = self.host.write_u64(addr, v as u64);
+        } else {
+            let _ = self.host.write_u32(addr, v);
+        }
+    }
+    /// Writes a pointer-sized signed field (LONG_PTR, LRESULT: sign-extended).
+    pub fn write_iptr(&mut self, addr: u32, v: i32) {
+        if self.x64() {
+            let _ = self.host.write_u64(addr, v as i64 as u64);
+        } else {
+            let _ = self.host.write_u32(addr, v as u32);
+        }
+    }
+    /// An address as the guest sees it: in a 64-bit process, one inside a 64-bit image
+    /// gets its upper half back (APIs keep the low halves, where things are in guest
+    /// memory; nothing else lives at those low addresses).
+    pub fn full(&self, a: u32) -> u64 {
+        if self.x64() { self.p.full_addr(a) } else { a as u64 }
+    }
+    /// TEB field offsets that differ between the 32- and 64-bit layouts.
+    pub fn teb_off(&self, f: TebField) -> u32 {
+        f.offset(self.x64())
     }
     pub fn arg_i32(&self, i: u32) -> i32 {
         self.arg(i) as i32
@@ -219,7 +309,7 @@ impl Ctx<'_> {
     }
     pub fn set_last_error(&mut self, e: u32) {
         let teb = self.regs.fs_base;
-        let _ = self.host.write_u32(teb + 0x34, e);
+        let _ = self.host.write_u32(teb + self.teb_off(TebField::LastError), e);
         self.p.current_thread_mut().last_error = e;
     }
     pub fn name(&self) -> String {
@@ -233,6 +323,15 @@ impl Ctx<'_> {
     }
     pub fn call_guest(&mut self, addr: u32, args: &[u32]) -> Result<u32, ApiError> {
         self.host.call_guest(self.p, self.regs, addr, args).map_err(ApiError)
+    }
+    /// `call_guest` with pointer-sized arguments (full 64-bit ones in a 64-bit process,
+    /// where RAX comes back whole; truncated to 32 bits otherwise).
+    pub fn call_guest64(&mut self, addr: u32, args: &[u64]) -> Result<u64, ApiError> {
+        if !self.x64() {
+            let args: Vec<u32> = args.iter().map(|&a| a as u32).collect();
+            return self.call_guest(addr, &args).map(|v| v as u64);
+        }
+        self.host.call_guest64(self.p, self.regs, addr, args).map_err(ApiError)
     }
     /// Advances the virtual clock (sleeps, idle waits) and everything driven by it.
     pub fn advance_clock(&mut self, us: u64) {
@@ -278,6 +377,51 @@ impl Ctx<'_> {
     /// Declared argument count of the current API (for tables of uniform methods).
     pub fn nargs(&self) -> u32 {
         self.p.registry.entries.get(self.id.0 as usize).map(|e| e.nargs).unwrap_or(0)
+    }
+}
+
+/// TEB fields whose place differs between the 32- and 64-bit layouts.
+#[derive(Clone, Copy)]
+pub enum TebField {
+    ExceptionList,
+    StackBase,
+    StackLimit,
+    Self_,
+    ProcessId,
+    ThreadId,
+    TlsPointer,
+    Peb,
+    LastError,
+    TlsSlots,
+    TlsExpansion,
+}
+
+impl TebField {
+    pub fn offset(self, x64: bool) -> u32 {
+        use TebField::*;
+        match (self, x64) {
+            (ExceptionList, _) => 0,
+            (StackBase, false) => 0x04,
+            (StackBase, true) => 0x08,
+            (StackLimit, false) => 0x08,
+            (StackLimit, true) => 0x10,
+            (Self_, false) => 0x18,
+            (Self_, true) => 0x30,
+            (ProcessId, false) => 0x20,
+            (ProcessId, true) => 0x40,
+            (ThreadId, false) => 0x24,
+            (ThreadId, true) => 0x48,
+            (TlsPointer, false) => 0x2C,
+            (TlsPointer, true) => 0x58,
+            (Peb, false) => 0x30,
+            (Peb, true) => 0x60,
+            (LastError, false) => 0x34,
+            (LastError, true) => 0x68,
+            (TlsSlots, false) => 0xE10,
+            (TlsSlots, true) => 0x1480,
+            (TlsExpansion, false) => 0xF94,
+            (TlsExpansion, true) => 0x1780,
+        }
     }
 }
 
