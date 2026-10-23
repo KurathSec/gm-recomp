@@ -84,6 +84,28 @@ fn query_value(c: &mut Ctx, key: u32, name: &str, ptype: u32, data: u32, pcb: u3
     ERROR_SUCCESS
 }
 
+/// RegGetValue: a value of `key`'s subkey `sub`, without opening it first.
+fn get_value(c: &mut Ctx, key: u32, sub: &str, name: &str, ptype: u32, data: u32, pcb: u32) -> u32 {
+    let Some(base) = key_path(c, key) else { return super::ERROR_INVALID_HANDLE };
+    let sub = sub.trim_matches('\\');
+    let path = if sub.is_empty() { base } else { format!("{base}\\{sub}") };
+    let h = c.p.new_handle(Handle::Registry(path));
+    let e = query_value(c, h, name, ptype, data, pcb);
+    c.p.handles.remove(&h);
+    e
+}
+
+/// RegSetKeyValue: a value of `key`'s subkey `sub`, without opening it first.
+fn set_key_value(c: &mut Ctx, key: u32, sub: &str, name: &str, ty: u32, data: u32, cb: u32) -> u32 {
+    let Some(base) = key_path(c, key) else { return super::ERROR_INVALID_HANDLE };
+    let sub = sub.trim_matches('\\');
+    let path = if sub.is_empty() { base } else { format!("{base}\\{sub}") };
+    let h = c.p.new_handle(Handle::Registry(path));
+    let e = set_value(c, h, name, ty, data, cb);
+    c.p.handles.remove(&h);
+    e
+}
+
 fn set_value(c: &mut Ctx, key: u32, name: &str, ty: u32, data: u32, cb: u32) -> u32 {
     let Some(path) = key_path(c, key) else { return super::ERROR_INVALID_HANDLE };
     let full = format!("{path}\\{name}").to_lowercase();
@@ -492,6 +514,28 @@ fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
 
 /// APIs only newer runners import (GameMaker Studio 2's 64-bit ones), on demand.
 fn register_newer(r: &mut Registry) {
+    // RegGetValue(key, subkey, value, flags, pdwType, pvData, pcbData)
+    r.add_on_demand("advapi32.dll", "RegGetValueA", |c| {
+        let (sub, name) = (c.str_arg(1), c.str_arg(2));
+        let e = get_value(c, c.arg(0), &sub, &name, c.arg(4), c.arg(5), c.arg(6));
+        ok(7, e)
+    });
+    r.add_on_demand("advapi32.dll", "RegGetValueW", |c| {
+        let (sub, name) = (c.wstr_arg(1), c.wstr_arg(2));
+        let e = get_value(c, c.arg(0), &sub, &name, c.arg(4), c.arg(5), c.arg(6));
+        ok(7, e)
+    });
+    // RegSetKeyValue(key, subkey, value, type, data, size)
+    r.add_on_demand("advapi32.dll", "RegSetKeyValueA", |c| {
+        let (sub, name) = (c.str_arg(1), c.str_arg(2));
+        let e = set_key_value(c, c.arg(0), &sub, &name, c.arg(3), c.arg(4), c.arg(5));
+        ok(6, e)
+    });
+    r.add_on_demand("advapi32.dll", "RegSetKeyValueW", |c| {
+        let (sub, name) = (c.wstr_arg(1), c.wstr_arg(2));
+        let e = set_key_value(c, c.arg(0), &sub, &name, c.arg(3), c.arg(4), c.arg(5));
+        ok(6, e)
+    });
     // Trimming the working set (GM8's CleanMem.dll every few frames): nothing to page out.
     r.add_on_demand("psapi.dll", "EmptyWorkingSet", |_c| ok(1, 1));
     r.add_on_demand("kernel32.dll", "K32EmptyWorkingSet", |_c| ok(1, 1));
@@ -1791,6 +1835,96 @@ pub fn register(r: &mut Registry) {
         "FtpPutFileA" => (5, 0),
         "DeleteUrlCacheEntryA" => (1, 0),
         "DeleteUrlCacheEntry" => (1, 0),
+    });
+    // As on a computer without a connection: a session opens, every connection fails
+    // with ERROR_INTERNET_NAME_NOT_RESOLVED. A runner that cannot open a session issues
+    // no request and never reports one as failed (GameMaker Studio's http_get: a game
+    // waiting for the answer waits forever).
+    const ERROR_INTERNET_NAME_NOT_RESOLVED: u32 = 12007;
+    for name in ["InternetOpenA", "InternetOpenW"] {
+        r.add_n("wininet.dll", name, 5, |c| {
+            let h = c.p.new_handle(Handle::Dummy("internet session"));
+            ok(5, h)
+        });
+    }
+    for (name, n) in [("InternetConnectA", 8), ("InternetConnectW", 8), ("InternetOpenUrlA", 6), ("InternetOpenUrlW", 6), ("HttpOpenRequestA", 8), ("HttpOpenRequestW", 8), ("HttpSendRequestA", 5), ("HttpSendRequestW", 5), ("HttpSendRequestExA", 5)] {
+        r.add_n("wininet.dll", name, n, |c| {
+            c.set_last_error(ERROR_INTERNET_NAME_NOT_RESOLVED);
+            ok(c.nargs(), 0)
+        });
+    }
+    // InternetCanonicalizeUrlA(url, buffer, pLength, flags): the URL as it is.
+    r.add_n("wininet.dll", "InternetCanonicalizeUrlA", 4, |c| {
+        let (url, buf, plen) = (c.str_arg(0), c.arg(1), c.arg(2));
+        let cap = c.host.read_u32(plen).unwrap_or(0);
+        if (url.len() as u32) >= cap || buf == 0 {
+            let _ = c.host.write_u32(plen, url.len() as u32 + 1);
+            c.set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            return ok(4, 0);
+        }
+        let _ = c.host.write_cstr(buf, url.as_bytes());
+        let _ = c.host.write_u32(plen, url.len() as u32);
+        ok(4, 1)
+    });
+    // InternetCrackUrlA(url, length, flags, URL_COMPONENTSA*): scheme, host, port, user,
+    // password, path and extra info, into the caller's buffers or as pointers into the URL.
+    r.add_n("wininet.dll", "InternetCrackUrlA", 4, |c| {
+        let (url_p, len, comps) = (c.arg(0), c.arg(1), c.arg(3));
+        let url = if len == 0 { c.host.read_cstr_lossy(url_p) } else { let mut b = vec![0u8; len as usize]; let _ = c.host.read(url_p, &mut b); String::from_utf8_lossy(&b).into_owned() };
+        let Some((scheme, rest)) = url.split_once("://") else {
+            c.set_last_error(12006); // ERROR_INTERNET_UNRECOGNIZED_SCHEME
+            return ok(4, 0);
+        };
+        let (auth_host, path_all) = rest.find('/').map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
+        let (userinfo, hostport) = auth_host.rsplit_once('@').map_or(("", auth_host), |(u, h)| (u, h));
+        let (user, pass) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h, p.parse::<u16>().unwrap()),
+            _ => (hostport, if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 }),
+        };
+        let (path, extra) = path_all.find(['?', '#']).map_or((path_all, ""), |i| (&path_all[..i], &path_all[i..]));
+        let offset = |part: &str| part.as_ptr() as usize - url.as_ptr() as usize;
+        // URL_COMPONENTSA: dwStructSize, then pointer/length pairs (scheme, host, user,
+        // password, path, extra) with nScheme after the scheme's and nPort after the host's,
+        // each pointer aligned to its size
+        let ps = c.ptr_size();
+        let align = |x: u32| x.div_ceil(ps) * ps;
+        let (scheme_at, nscheme_at) = (ps, 2 * ps + 4);
+        let host_at = nscheme_at + 4;
+        let nport_at = host_at + ps + 4;
+        let user_at = align(nport_at + 2);
+        let pass_at = align(user_at + ps + 4);
+        let path_at = align(pass_at + ps + 4);
+        let extra_at = align(path_at + ps + 4);
+        let pairs = [(scheme_at, scheme), (host_at, host), (user_at, user), (pass_at, pass), (path_at, path), (extra_at, extra)];
+        for (at, part) in pairs {
+            let (pp, pl) = (comps + at, comps + at + ps);
+            let want = c.host.read_u32(pl).unwrap_or(0);
+            let dst = c.read_ptr(pp);
+            if want == 0 {
+                continue;
+            }
+            if dst != 0 {
+                if part.len() as u32 >= want {
+                    c.set_last_error(122);
+                    return ok(4, 0);
+                }
+                let _ = c.host.write_cstr(dst, part.as_bytes());
+            } else {
+                let into = if part.is_empty() { 0 } else { url_p + offset(part) as u32 };
+                c.write_ptr(pp, into);
+            }
+            let _ = c.host.write_u32(pl, part.len() as u32);
+        }
+        // nScheme: INTERNET_SCHEME_HTTP 3, HTTPS 4
+        let n = if scheme.eq_ignore_ascii_case("https") { 4 } else if scheme.eq_ignore_ascii_case("http") { 3 } else { 0 };
+        let _ = c.host.write_u32(comps + nscheme_at, n);
+        let _ = c.host.write_u16(comps + nport_at, port);
+        ok(4, 1)
+    });
+    r.add_n("wininet.dll", "InternetCloseHandle", 1, |c| {
+        c.p.handles.remove(&c.arg(0));
+        ok(1, 1)
     });
     const_apis!(r, "urlmon.dll", {
         "URLDownloadToFileA" => (5, E_FAIL),

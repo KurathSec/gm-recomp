@@ -137,6 +137,7 @@ fn can_yield(c: &Ctx) -> bool {
 /// Blocks the running secondary thread in `state` (the API returns, then the
 /// scheduler takes over).
 fn block(c: &mut Ctx, state: ThreadState) {
+    c.p.current_thread_mut().spin_polls = 0;
     c.p.current_thread_mut().state = state;
     c.host.yield_thread();
 }
@@ -156,6 +157,7 @@ fn main_wait(c: &mut Ctx, until: Option<u64>, mut done: impl FnMut(&mut Process)
             (Some(a), Some(b)) => a.min(b),
             (a, b) => a.or(b).unwrap_or(c.p.clock_us),
         };
+
         if next <= c.p.clock_us {
             if until.is_some_and(|u| u <= c.p.clock_us) {
                 return WAIT_TIMEOUT;
@@ -440,6 +442,7 @@ fn create_thread(c: &mut Ctx, start: u32, param: u64, stack_size: u32, suspended
         state: if suspended { ThreadState::Suspended(1) } else { ThreadState::Ready },
         ctx: Some(Box::new(ctx)),
         resume_eax: None,
+        spin_polls: 0,
     });
     c.p.log(format!("CreateThread(start={start:#x}, param={param:#x}) = thread {id:#x}"));
     Ok((h, id))

@@ -211,6 +211,8 @@ pub struct Thread {
     pub ctx: Option<Box<ThreadCtx>>,
     /// EAX when the thread resumes (the result of the wait it blocked in).
     pub resume_eax: Option<u32>,
+    /// Clock reads since the thread last blocked (`Ctx::poll_clock`).
+    pub spin_polls: u32,
 }
 
 /// What a guest thread is doing. Threads run one at a time: secondary threads are
@@ -331,6 +333,8 @@ pub struct Process {
     pub clock_us: u64,
     /// Consecutive clock reads without other API work (see `Ctx::poll_clock`).
     pub idle_streak: u32,
+    /// Clock reads of the running secondary thread since it last yielded.
+    pub slice_polls: u32,
     /// Winsock sockets and the names behind their stand-in addresses
     pub sockets: crate::hle::winsock::Sockets,
     /// http_dll_2_3.dll's buffers and sockets (hle::httpdll)
@@ -506,6 +510,7 @@ impl Process {
             ],
             clock_us: 0,
             idle_streak: 0,
+            slice_polls: 0,
             sockets: Default::default(),
             httpdll: Default::default(),
             dll_dir: None,
@@ -738,7 +743,7 @@ impl Process {
         let heap = self.create_heap(mem, 0x0100_0000)?;
         self.process_heap = heap;
         p(mem, 0x18, heap)?;
-        self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None });
+        self.threads.push(Thread { id: 0x1238, teb: TEB_BASE, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None, spin_polls: 0 });
         self.main_thread = 0x1238;
         Ok((TEB_BASE, stack_top))
     }
@@ -784,7 +789,7 @@ impl Process {
         let heap = self.create_heap(mem, 0x0100_0000)?;
         self.process_heap = heap;
         w(mem, PEB_BASE + 0x30, heap as u64)?;
-        self.threads.push(Thread { id: 0x1238, teb, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None });
+        self.threads.push(Thread { id: 0x1238, teb, last_error: 0, stack_base: stack_top, stack_limit: STACK_BASE, handle: 0, state: ThreadState::Running, ctx: None, resume_eax: None, spin_polls: 0 });
         self.main_thread = 0x1238;
         Ok((teb, stack_top))
     }

@@ -371,6 +371,27 @@ impl Ctx<'_> {
     /// every frame and measures the next frame from where the spin ended, so coarser
     /// steps slow it down (128 µs steps ran it at 49 fps).
     pub fn poll_clock(&mut self) {
+        // A secondary thread that keeps waiting on the clock without ever blocking (a loop
+        // of sleeps that spin, which on Windows runs beside the main thread on another
+        // core) no longer moves it, and every few reads sleeps a little while the others
+        // run: it is preempted only where it returns to the dispatcher, which such a loop
+        // never does. Time passes with the main thread. (Threads that read the clock and
+        // block now and then keep moving it as the main thread does.)
+        let spinning = self.p.current != 0 && Some(self.p.nest) == self.p.slice_nest && {
+            let t = self.p.current_thread_mut();
+            t.spin_polls = t.spin_polls.saturating_add(1);
+            t.spin_polls > SPINNER_POLLS
+        };
+        if spinning {
+            self.p.slice_polls += 1;
+            if self.p.slice_polls >= SPIN_POLLS {
+                self.p.slice_polls = 0;
+                let until = self.p.clock_us + SPIN_SLEEP_US;
+                self.p.current_thread_mut().state = crate::process::ThreadState::Sleeping(until);
+                self.host.yield_thread();
+            }
+            return;
+        }
         let step = 1u64 << self.p.idle_streak.min(2);
         self.p.idle_streak += 1;
         self.advance_clock(step);
@@ -425,6 +446,13 @@ impl TebField {
         }
     }
 }
+
+/// Clock reads a secondary thread makes before it sleeps, and for how long (µs)
+/// (`Ctx::poll_clock`).
+const SPIN_POLLS: u32 = 8;
+const SPIN_SLEEP_US: u64 = 500;
+/// Clock reads without blocking that make a secondary thread such a spinner.
+const SPINNER_POLLS: u32 = 1000;
 
 /// The time a wait must leave (ms) for a texture upload in it (a 2048x2048 page takes
 /// several ms in a browser).
