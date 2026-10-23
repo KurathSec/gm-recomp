@@ -265,8 +265,18 @@ impl Vm {
         let start = addr & !(PAGE - 1);
         let end = (addr + size).div_ceil(PAGE) * PAGE;
         let Some((&rb, r)) = self.regions.range(..=start).next_back() else { return false };
-        if rb + r.size < end {
+        if rb + r.size <= start {
             return false;
+        }
+        // within one reservation, whose earlier commits may have split it into pieces
+        // (Delphi 7's memory manager commits across them)
+        let ab = r.alloc_base;
+        let mut a = rb + r.size;
+        while a < end {
+            match self.regions.get(&a) {
+                Some(n) if n.alloc_base == ab => a += n.size,
+                _ => return false,
+            }
         }
         self.split(start);
         self.split(end);
@@ -372,6 +382,21 @@ mod tests {
         assert!(vm.alloc(0x1FFF_0000, 0x11000, true, PAGE_READWRITE, false, "t").is_some());
         assert!(!vm.last_fresh);
         assert_eq!(vm.used.len(), 2);
+    }
+
+    #[test]
+    fn commit_across_pieces() {
+        let mut vm = Vm::new();
+        let a = vm.alloc(0, 0x10_0000, false, PAGE_READWRITE, false, "t").unwrap();
+        assert!(vm.commit(a + 0xc000, 0x4000, PAGE_READWRITE));
+        assert!(vm.decommit(a + 0xc000, 0x4000));
+        // over the decommitted piece and the reserved rest after it
+        assert!(vm.commit(a + 0xc000, 0xc000, PAGE_READWRITE));
+        assert_eq!(vm.query(a + 0x14000).2, MEM_COMMIT);
+        // not past the reservation
+        assert!(!vm.commit(a + 0xf_c000, 0x8000, PAGE_READWRITE));
+        let b = vm.alloc(a + 0x10_0000, 0x1_0000, false, PAGE_READWRITE, false, "t").unwrap();
+        assert!(!vm.commit(b - 0x1000, 0x2000, PAGE_READWRITE));
     }
 
     #[test]
