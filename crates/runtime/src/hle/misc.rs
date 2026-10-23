@@ -492,6 +492,9 @@ fn image_directory(c: &mut Ctx, base: u32, dir: u32, psize: u32) -> u32 {
 
 /// APIs only newer runners import (GameMaker Studio 2's 64-bit ones), on demand.
 fn register_newer(r: &mut Registry) {
+    // Trimming the working set (GM8's CleanMem.dll every few frames): nothing to page out.
+    r.add_on_demand("psapi.dll", "EmptyWorkingSet", |_c| ok(1, 1));
+    r.add_on_demand("kernel32.dll", "K32EmptyWorkingSet", |_c| ok(1, 1));
     // No network adapters, and no notifications about them.
     let ip = "iphlpapi.dll";
     r.add_on_demand(ip, "GetAdaptersAddresses", |c| {
