@@ -21,7 +21,7 @@ export const MODS = [
     id: 'debug',
     name: 'Debug mode',
     about: "Turns on the game's debug switch (debugMode and the like), as patcher.rs does.",
-    applies: (e) => e?.kind === 'gms',
+    applies: (e) => e?.kind === 'gms' && (e.version?.[0] ?? 1) < 2,
     options: [{ key: 'noDeath', label: 'Also debugNoDeath (the player cannot die)', type: 'bool', default: false, applies: (e) => !e.yyc }],
     files: [],
   },
