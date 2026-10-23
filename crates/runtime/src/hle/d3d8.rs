@@ -1071,6 +1071,10 @@ const IDIRECT3DDEVICE8: &[Method] = &[
 
 fn res_get_device(c: &mut Ctx) -> ApiResult {
     let dev = c.p.d3d_objects.iter().find(|(_, o)| o.kind == "IDirect3DDevice8").map(|(&a, _)| a).unwrap_or(0);
+    // the caller owns a reference (FoxWriting releases it; without this the device was freed)
+    if let Some(o) = c.p.d3d_objects.get_mut(&dev) {
+        o.refcount += 1;
+    }
     out(c, c.arg(1), dev);
     ret(c, D3D_OK)
 }
