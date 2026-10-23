@@ -73,7 +73,11 @@ fn supply_system_dlls(files_dir: &Path, system: &Path, shaders: bool) -> Result<
     let mut supplied = Vec::new();
     while let Some(path) = queue.pop() {
         let Ok(bytes) = fs::read(&path) else { continue };
+        // (the system DLLs are 32-bit: a 64-bit module's imports go to the HLE)
         let Ok(pe) = pe::Pe::parse(&bytes) else { continue };
+        if pe.pe64 {
+            continue;
+        }
         let mut wanted: Vec<String> = pe.imports().unwrap_or_default().iter().map(|d| d.dll.to_lowercase()).collect();
         wanted.extend(dll_names_in(&bytes).into_iter().filter(|n| redistributable(n)));
         for name in wanted {

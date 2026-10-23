@@ -471,7 +471,11 @@ impl Game {
             if !(l.ends_with(".exe") || l.ends_with(".dll")) {
                 continue;
             }
+            // (the system DLLs are 32-bit: a 64-bit module's imports go to the HLE)
             let Ok(pe) = Pe::parse(d) else { continue };
+            if pe.pe64 {
+                continue;
+            }
             let mut wanted: Vec<String> = pe.imports().unwrap_or_default().iter().map(|i| i.dll.to_lowercase()).collect();
             wanted.extend(dll_names_in(d).into_iter().filter(|n| redistributable(n)));
             for name in wanted {

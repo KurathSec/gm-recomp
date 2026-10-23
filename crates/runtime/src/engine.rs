@@ -1823,7 +1823,8 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     };
     {
         let r = |name: &str| read(m, name);
-        collect_order(exe, &r, &mut seen, &mut order)?;
+        let x64 = r(exe).and_then(|b| pe::Pe::parse(&b).ok().map(|pe| pe.pe64)).unwrap_or(false);
+        collect_order(exe, x64, &r, &mut seen, &mut order)?;
     }
     // Windows maps the exe before its DLLs: keep its preferred range free for it (an
     // exe without relocations cannot go anywhere else).
@@ -1891,15 +1892,21 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     Ok(Started { entry, attach })
 }
 
-fn collect_order(name: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>, seen: &mut HashSet<String>, order: &mut Vec<String>) -> Result<(), String> {
+/// The exe and the DLLs it imports that are files, dependencies first. A DLL of the
+/// other bitness (the importer's 32-bit system DLLs next to a 64-bit runner) is left
+/// out: its imports go to the HLE instead.
+fn collect_order(name: &str, x64: bool, read: &dyn Fn(&str) -> Option<Vec<u8>>, seen: &mut HashSet<String>, order: &mut Vec<String>) -> Result<(), String> {
     if !seen.insert(name.to_lowercase()) {
         return Ok(());
     }
     let bytes = read(name).ok_or_else(|| format!("reading {name}"))?;
     let pe = pe::Pe::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
+    if pe.pe64 != x64 {
+        return Ok(());
+    }
     for d in pe.imports().map_err(|e| e.to_string())? {
         if read(&d.dll).is_some() {
-            collect_order(&d.dll, read, seen, order)?;
+            collect_order(&d.dll, x64, read, seen, order)?;
         }
     }
     order.push(name.to_string());
