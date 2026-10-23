@@ -554,6 +554,46 @@ pub fn register(r: &mut Registry) {
             }
         }
     });
+    // The C runtime's threads are CreateThread's (a _beginthread routine is cdecl: the
+    // argument stays on the stack the thread ends with).
+    let crt = "msvcrt.dll";
+    r.add_on_demand(crt, "_beginthreadex", |c| {
+        let (stack, start, arg, flags, pid) = (c.arg(1), c.arg(2), c.arg64(3), c.arg(4), c.arg(5));
+        match create_thread(c, start, arg, stack, flags & CREATE_SUSPENDED != 0) {
+            Ok((h, id)) => {
+                if pid != 0 {
+                    let _ = c.host.write_u32(pid, id);
+                }
+                Ok(Ret::cdecl(h))
+            }
+            Err(e) => {
+                c.p.log(format!("_beginthreadex failed: {e}"));
+                Ok(Ret::cdecl(0))
+            }
+        }
+    });
+    r.add_on_demand(crt, "_beginthread", |c| {
+        let (start, stack, arg) = (c.arg(0), c.arg(1), c.arg64(2));
+        match create_thread(c, start, arg, stack, false) {
+            Ok((h, _)) => Ok(Ret::cdecl(h)),
+            Err(e) => {
+                c.p.log(format!("_beginthread failed: {e}"));
+                Ok(Ret::cdecl(u32::MAX))
+            }
+        }
+    });
+    for name in ["_endthreadex", "_endthread"] {
+        r.add_on_demand(crt, name, |c| {
+            let code = if c.name().ends_with("ex") { c.arg(0) } else { 0 };
+            if c.p.current == 0 {
+                c.p.exit_code = Some(code);
+                c.host.request_exit(code);
+            } else {
+                block(c, ThreadState::Exited(code));
+            }
+            Ok(Ret::cdecl(0))
+        });
+    }
     r.add(k, "ExitThread", |c| {
         let code = c.arg(0);
         if c.p.current == 0 {

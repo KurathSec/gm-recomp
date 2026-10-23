@@ -505,6 +505,10 @@ pub fn register(r: &mut Registry) {
     };
     r.add(d, "DirectSoundEnumerateA", enumerate);
     r.add(d, "DirectSoundEnumerateW", enumerate);
+    // imported by ordinal: DirectSoundCreate is #1, DirectSoundEnumerateA #2, DirectSoundCreate8 #11
+    r.add_on_demand(d, "#1", |c| create_device(c, 3));
+    r.add_on_demand(d, "#2", enumerate);
+    r.add_on_demand(d, "#11", |c| create_device(c, 3));
     for ifc in DEVICE_CLASS.iter().chain(BUFFER_CLASS.iter()) {
         com::register_interface(r, ifc);
     }
