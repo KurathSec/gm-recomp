@@ -209,8 +209,13 @@ function toRGBA(fmt, src, w, h, pitch) {
   return out;
 }
 
-/** The canvas's WebGL2 context attributes (a page may create the context early with them). */
-export const GL_OPTIONS = { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, desynchronized: true, preserveDrawingBuffer: false };
+/**
+ * The canvas's WebGL2 context attributes (a page may create the context early with them).
+ * Not `desynchronized`: Chromium on Windows takes it as low-latency canvas, presenting past
+ * the compositor, and there the screen now and then flashed a frame from a few frames
+ * before (Edge on Windows 11; Linux Chromium and Firefox ignore the hint).
+ */
+export const GL_OPTIONS = { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false };
 
 export class D3DGL {
   /**
