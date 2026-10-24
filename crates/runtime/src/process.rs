@@ -720,6 +720,12 @@ impl Process {
         id
     }
 
+    /// The exe's image (GetModuleHandle(NULL)): the DLLs it imports are mapped before it,
+    /// a game's own among them.
+    pub fn exe_module(&self) -> Option<&LoadedModule> {
+        self.modules.iter().find(|m| m.path.eq_ignore_ascii_case(&self.exe_path)).or_else(|| self.modules.iter().find(|m| !m.is_dll)).or(self.modules.first())
+    }
+
     pub fn module_by_name(&self, name: &str) -> Option<&LoadedModule> {
         let n = name.to_lowercase();
         let stem = n.trim_end_matches(".exe").trim_end_matches(".dll");
@@ -947,10 +953,20 @@ impl Process {
         }
     }
 
+    /// The images with implicit TLS, in the order of their indices: the exe's first, as
+    /// Windows numbers them in load order with the exe at its head (Delphi's exe startup
+    /// sets its own index to 0), then the DLLs as they were mapped. (index variable, template)
+    pub fn static_tls_modules(&self) -> Vec<(u32, (u32, u32, u32))> {
+        let exe = self.exe_module().map(|m| m.base);
+        let first = self.modules.iter().filter(|m| Some(m.base) == exe);
+        let rest = self.modules.iter().filter(|m| Some(m.base) != exe);
+        first.chain(rest).filter_map(|m| m.tls_template.map(|t| (m.tls_index_va, t))).collect()
+    }
+
     /// Implicit TLS of statically loaded images: each module with a TLS directory
     /// gets an index and a copy of its template in the TEB's ThreadLocalStoragePointer array.
     pub fn setup_static_tls(&mut self, mem: &mut dyn Guest) -> Result<(), String> {
-        let templates: Vec<(u32, (u32, u32, u32))> = self.modules.iter().filter_map(|m| m.tls_template.map(|t| (m.tls_index_va, t))).collect();
+        let templates = self.static_tls_modules();
         if templates.is_empty() {
             return Ok(());
         }

@@ -1639,7 +1639,7 @@ fn dll_stem(name: &str) -> String {
 
 fn module_handle(c: &mut Ctx, name: &str) -> u32 {
     if name.is_empty() {
-        return c.p.modules.first().map(|m| m.base).unwrap_or(0x40_0000);
+        return c.p.exe_module().map(|m| m.base).unwrap_or(0x40_0000);
     }
     if let Some(m) = c.p.module_by_name(name.rsplit(['\\', '/']).next().unwrap_or(name)) {
         return m.base;
@@ -2695,7 +2695,7 @@ fn res_match(id: &pe::ResId, a: &ResArg) -> bool {
 
 /// Locates a resource in a mapped image: (guest address, size).
 pub fn find_resource(c: &mut Ctx, hmod: u32, kind: &ResArg, name: &ResArg) -> Option<(u32, u32)> {
-    let base = if hmod == 0 { c.p.modules.first().map(|m| m.base).unwrap_or(0) } else { hmod };
+    let base = if hmod == 0 { c.p.exe_module().map(|m| m.base).unwrap_or(0) } else { hmod };
     // Delphi programs load resource strings all the time (number formatting): the
     // directory is parsed once per module.
     let res = match c.p.resources.get(&base) {

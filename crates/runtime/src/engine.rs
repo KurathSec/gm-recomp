@@ -207,6 +207,9 @@ pub struct Engine {
     /// a load waited so far (`crate::state`).
     pub state_op: Option<StateOp>,
     pub state_tries: u32,
+    /// Addresses where a translated invalid instruction was found changed and translated
+    /// again (`rt_trap`).
+    pub ud2_retried: HashSet<u32>,
 }
 
 impl Engine {
@@ -272,6 +275,7 @@ impl Engine {
             monitor: false,
             state_op: None,
             state_tries: 0,
+            ud2_retried: HashSet::default(),
         }
     }
 
@@ -1008,6 +1012,20 @@ pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
         }
         trap::DIVIDE_ERROR => request(m, Ctl::Fault { code: 0xC000_0094, ip: arg }),
         trap::UD2 => {
+            // Code that changed since it was translated (a protector decrypting it in
+            // place) decodes to a real instruction now: its translations go, and the
+            // guest goes on there (once per address: an instruction the translator still
+            // rejects faults as before).
+            if code_changed_at(m, arg) && m.engine().ud2_retried.insert(arg) {
+                let e = m.engine();
+                if let Some(p) = e.p.as_mut() {
+                    p.code_written.push((arg, arg + 1));
+                }
+                note_code_written(m);
+                m.set_global(Global::Eip, arg);
+                request(m, Ctl::Resume);
+                return;
+            }
             // GMR_UD2_DEBUG: what memory holds there now (code changed since it was
             // translated decodes differently)
             if std::env::var_os("GMR_UD2_DEBUG").is_some() {
@@ -1855,6 +1873,17 @@ fn note_code_written<M: Machine>(m: &mut M) {
         }
         Err(err) => m.print(&format!("code written: redirects rejected: {err}")),
     }
+}
+
+/// The bytes at `addr` decode to an instruction a CPU runs (not an invalid or UD one).
+fn code_changed_at<M: Machine>(m: &mut M, addr: u32) -> bool {
+    let mut bytes = [0u8; 16];
+    if m.read(addr, &mut bytes).is_err() {
+        return false;
+    }
+    let bitness = if m.engine_ref().x64 { 64 } else { 32 };
+    let i = iced_x86::Decoder::with_ip(bitness, &bytes, addr as u64, iced_x86::DecoderOptions::NONE).decode();
+    !i.is_invalid() && !matches!(i.mnemonic(), iced_x86::Mnemonic::Ud0 | iced_x86::Mnemonic::Ud1 | iced_x86::Mnemonic::Ud2)
 }
 
 /// Forgets a resolve cache entry (the function at `addr` is translated anew).

@@ -479,7 +479,7 @@ fn create_thread(c: &mut Ctx, start: u32, param: u64, stack_size: u32, suspended
         let _ = c.host.write_u32(teb + f.offset(x64), v);
     }
     // static TLS: a copy of every module's template
-    let templates: Vec<(u32, u32, u32)> = c.p.modules.iter().filter_map(|m| m.tls_template).collect();
+    let templates: Vec<(u32, u32, u32)> = c.p.static_tls_modules().into_iter().map(|(_, t)| t).collect();
     if !templates.is_empty() {
         let heap = c.p.process_heap;
         let g: &mut dyn Guest = &mut *c.host;
