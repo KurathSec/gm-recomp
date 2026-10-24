@@ -1819,8 +1819,151 @@ fn edit_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> u32 {
         }
         0x00B8 => 0, // EM_GETMODIFY
         0x00CE => 0, // EM_GETFIRSTVISIBLELINE
+        0x0449 => {
+            // EM_STREAMIN: the text the EDITSTREAM callback hands over (RTF as plain text)
+            let (cookie, callback) = (c.host.read_u32(lp).unwrap_or(0), c.host.read_u32(lp + 8).unwrap_or(0));
+            let buf = c.p.heap_alloc(c.host, 0, 4096 + 4, true);
+            let mut data = Vec::new();
+            while callback != 0 && data.len() < 1 << 22 {
+                let _ = c.host.write_u32(buf + 4096, 0);
+                let r = c.call_guest(callback, &[cookie, buf, 4096, buf + 4096]).unwrap_or(1);
+                let n = c.host.read_u32(buf + 4096).unwrap_or(0).min(4096);
+                if r != 0 || n == 0 {
+                    break;
+                }
+                let mut chunk = vec![0u8; n as usize];
+                let _ = c.host.read(buf, &mut chunk);
+                data.extend(chunk);
+            }
+            c.p.heap_free(buf);
+            let t = if wp & 2 != 0 { rtf_text(&data) } else { super::kernel32::decode_cp(1252, &data) };
+            let ins: Vec<char> = t.chars().collect();
+            let (a, b) = if wp & 0x8000 != 0 { (s0.min(len) as usize, s1.min(len) as usize) } else { (0, len as usize) };
+            let mut nt: Vec<char> = text[..a].to_vec();
+            nt.extend(&ins);
+            nt.extend(&text[b..]);
+            if let Some(w) = c.p.windows.get_mut(&hwnd) {
+                w.title = nt.into_iter().collect();
+                let caret = (a + ins.len()) as u32;
+                w.sel = (caret, caret);
+            }
+            ins.len() as u32
+        }
         _ => 0,
     }
+}
+
+/// The text of an RTF document: control words dropped (\par and \line as line breaks,
+/// \tab, \uN and \'hh in its \ansicpg code page kept), and the groups that are not
+/// text (font and colour tables, \* destinations, pictures...).
+fn rtf_text(rtf: &[u8]) -> String {
+    const SKIP: [&str; 9] = ["fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer", "listtable", "listoverridetable"];
+    let mut out = String::new();
+    let mut bytes = Vec::new();
+    let mut cp = 1252;
+    let mut uc = 1usize;
+    let mut skip_chars = 0usize;
+    // per group: whether its text is skipped
+    let mut stack = vec![false];
+    let mut i = 0;
+    let flush = |out: &mut String, bytes: &mut Vec<u8>, cp: u32| {
+        if !bytes.is_empty() {
+            out.push_str(&super::kernel32::decode_cp(cp, bytes));
+            bytes.clear();
+        }
+    };
+    while i < rtf.len() {
+        let skipping = *stack.last().unwrap_or(&false);
+        match rtf[i] {
+            b'{' => {
+                stack.push(skipping);
+                i += 1;
+            }
+            b'}' => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            b'\\' => {
+                i += 1;
+                let Some(&ch) = rtf.get(i) else { break };
+                if ch.is_ascii_alphabetic() {
+                    let st = i;
+                    while i < rtf.len() && rtf[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    let word = std::str::from_utf8(&rtf[st..i]).unwrap_or("");
+                    let pst = i;
+                    if i < rtf.len() && (rtf[i] == b'-' || rtf[i].is_ascii_digit()) {
+                        i += 1;
+                        while i < rtf.len() && rtf[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                    let param: Option<i32> = std::str::from_utf8(&rtf[pst..i]).ok().and_then(|p| p.parse().ok());
+                    if rtf.get(i) == Some(&b' ') {
+                        i += 1;
+                    }
+                    if SKIP.contains(&word) {
+                        *stack.last_mut().unwrap() = true;
+                        continue;
+                    }
+                    match word {
+                        "ansicpg" => cp = param.unwrap_or(1252) as u32,
+                        "uc" => uc = param.unwrap_or(1).max(0) as usize,
+                        _ if skipping => {}
+                        "par" | "line" => {
+                            flush(&mut out, &mut bytes, cp);
+                            out.push_str("\r\n");
+                        }
+                        "tab" => {
+                            flush(&mut out, &mut bytes, cp);
+                            out.push('\t');
+                        }
+                        "u" => {
+                            flush(&mut out, &mut bytes, cp);
+                            if let Some(ch) = param.and_then(|n| char::from_u32(n as u16 as u32)) {
+                                out.push(ch);
+                            }
+                            skip_chars = uc;
+                        }
+                        _ => {}
+                    }
+                } else if ch == b'\'' {
+                    let hex = rtf.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+                    i += 3;
+                    if let Some(b) = hex.filter(|_| !skipping) {
+                        if skip_chars > 0 {
+                            skip_chars -= 1;
+                        } else {
+                            bytes.push(b);
+                        }
+                    }
+                } else {
+                    i += 1;
+                    if ch == b'*' {
+                        *stack.last_mut().unwrap() = true;
+                    } else if !skipping && matches!(ch, b'\\' | b'{' | b'}') {
+                        bytes.push(ch);
+                    }
+                }
+            }
+            b'\r' | b'\n' => i += 1,
+            b => {
+                i += 1;
+                if !skipping {
+                    if skip_chars > 0 {
+                        skip_chars -= 1;
+                    } else {
+                        bytes.push(b);
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut out, &mut bytes, cp);
+    out
 }
 
 fn def_window_proc(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp_: u32) -> u32 {
@@ -1861,7 +2004,7 @@ fn def_window_proc(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp_: u32) -> u32 {
             let wide = c.name().ends_with('W');
             c.p.windows.get(&hwnd).map(|w| if wide { w.title.encode_utf16().count() } else { w.title.len() } as u32).unwrap_or(0)
         }
-        0x00B0..=0x00D9 | 0x0434 | 0x0437 => edit_message(c, hwnd, msg, wp, lp_),
+        0x00B0..=0x00D9 | 0x0434 | 0x0437 | 0x0449 => edit_message(c, hwnd, msg, wp, lp_),
         0x0084 => 1, // WM_NCHITTEST -> HTCLIENT
         0x0021 => 3, // WM_MOUSEACTIVATE -> MA_ACTIVATE
         0x0087 => 0, // WM_GETDLGCODE
@@ -2073,6 +2216,9 @@ const DIALOG_FORM: &str = "TMessageForm";
 /// GameMaker 8's runtime error form ("Error Messages": the message in a memo, Ignore and
 /// Abort buttons). Left unanswered, the game waits in it with nothing on screen.
 const ERROR_FORM: &str = "TErrorForm";
+/// GameMaker 8's game information (a rich edit), shown at the start by some games: as a
+/// message, then closed.
+const HELP_FORM: &str = "THelpForm";
 
 /// GameMaker 8's dialogs are VCL forms the browser never shows: when the game waits in such a
 /// form's modal loop (WaitMessage), the player is asked instead (`Host::prompt`), the answer
@@ -2081,10 +2227,11 @@ const ERROR_FORM: &str = "TErrorForm";
 /// or after a few waits without.
 fn answer_dialog(c: &mut Ctx) -> bool {
     use super::Ask;
-    let Some(form) = c.p.windows.iter().filter(|(_, w)| (w.class == DIALOG_FORM || w.class == ERROR_FORM) && w.visible && w.enabled).map(|(&h, _)| h).max() else {
+    let Some(form) = c.p.windows.iter().filter(|(_, w)| (w.class == DIALOG_FORM || w.class == ERROR_FORM || w.class == HELP_FORM) && w.visible && w.enabled).map(|(&h, _)| h).max() else {
         return false;
     };
     let error = c.p.windows[&form].class == ERROR_FORM;
+    let help = c.p.windows[&form].class == HELP_FORM;
     if c.p.dialog.0 != form {
         c.p.dialog = (form, 0, false);
     }
@@ -2098,7 +2245,7 @@ fn answer_dialog(c: &mut Ctx) -> bool {
         return false;
     }
     // (the error form's message is in its memo, nothing painted to wait for)
-    if !error && !c.p.dialog_text.contains_key(&form) && waits < 20 {
+    if !error && !help && !c.p.dialog_text.contains_key(&form) && waits < 20 {
         return false;
     }
     c.p.dialog = (form, 0, true);
@@ -2110,13 +2257,21 @@ fn answer_dialog(c: &mut Ctx) -> bool {
         if !w.visible {
             continue;
         }
-        if w.class.ends_with("Memo") {
+        if w.class.ends_with("Memo") || (help && w.class.ends_with("RichEdit")) {
             memo = w.title.clone();
         } else if w.class.ends_with("Edit") {
             edit = Some(k);
         } else if w.class.ends_with("Button") || w.class.ends_with("BitBtn") {
             buttons.push((k, w.title.replace('&', "")));
         }
+    }
+    if help {
+        let title = c.p.windows[&form].title.clone();
+        let text = memo.trim().replace("\r\n", "\n");
+        c.p.log(format!("dialog [{title}]: {text:?} (Information)"));
+        c.host.prompt(Ask::Message, &title, &text);
+        post(c, form, WM_CLOSE, 0, 0);
+        return true;
     }
     if error {
         let title = c.p.windows[&form].title.clone();
