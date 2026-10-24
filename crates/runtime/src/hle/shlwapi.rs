@@ -121,6 +121,14 @@ fn file_spec(s: &[u16]) -> usize {
     spec
 }
 
+/// PathIsRoot: `\`, `X:\`, `\\server` or `\\server\share`.
+fn is_root(s: &[u16]) -> bool {
+    if is_unc(s) {
+        return s[2..].iter().filter(|&&u| u == BACKSLASH).count() <= 1;
+    }
+    s == [BACKSLASH] || (s.len() == 3 && s[1] == b':' as u16 && s[2] == BACKSLASH)
+}
+
 /// `.` and `..` components resolved (PathCanonicalize); the root stays.
 fn canonical(s: &[u16]) -> Vec<u16> {
     let root = if is_unc(s) {
@@ -215,6 +223,21 @@ pub fn register(r: &mut Registry) {
             }
             put(c, c.arg(0), &s[..cut]);
             ok(1, 1)
+        });
+        // (as Wine: the file spec removed until a root is left)
+        add(r, &format!("PathStripToRoot{s}"), |c| {
+            let Some(mut s) = units(c, c.arg(0)) else { return ok(1, 0) };
+            let mut rooted = true;
+            while !is_root(&s) {
+                let cut = file_spec(&s);
+                if cut >= s.len() {
+                    rooted = false;
+                    break;
+                }
+                s.truncate(cut);
+            }
+            put(c, c.arg(0), &s);
+            ok(1, rooted as u32)
         });
         add(r, &format!("PathStripPath{s}"), |c| {
             if let Some(s) = units(c, c.arg(0)) {
@@ -368,5 +391,7 @@ mod tests {
         assert_eq!(combine(Some(&u("C:\\game")), Some(&u("D:\\other"))), Some(u("D:\\other")));
         assert!(matches(&u("*.ogg"), &u("Music.OGG")));
         assert!(!matches(&u("*.ogg"), &u("music.wav")));
+        assert!(is_root(&u("C:\\")) && is_root(&u("\\")) && is_root(&u("\\\\server\\share")));
+        assert!(!is_root(&u("C:\\game")) && !is_root(&u("\\\\server\\share\\x")) && !is_root(&u("C:")));
     }
 }

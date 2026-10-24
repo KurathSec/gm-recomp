@@ -1838,6 +1838,17 @@ pub fn register_more(r: &mut Registry) {
         c.p.crt_fds.push(h);
         ok(2 + c.p.crt_fds.len() as u32)
     });
+    r.add_on_demand(m, "_fdopen", |c| {
+        let fd = c.arg(0);
+        let Some(&h) = fd.checked_sub(3).and_then(|i| c.p.crt_fds.get(i as usize)) else {
+            set_errno(c, 9); // EBADF
+            return ok(0);
+        };
+        let f = alloc(c, 32, true);
+        let _ = c.host.write_u32(f + 16, fd);
+        c.p.crt_files.insert(f, h);
+        ok(f)
+    });
     r.add_on_demand(m, "_get_osfhandle", |c| {
         let fd = c.arg(0);
         let h = match fd {
