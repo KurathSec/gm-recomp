@@ -1548,7 +1548,7 @@ fn module_handle(c: &mut Ctx, name: &str) -> u32 {
     }
     let stem = dll_stem(name);
     if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.fake_modules.contains_key(&format!("{stem}.dll")) {
-        return c.p.fake_module(&stem);
+        return c.p.fake_module(&mut *c.host, &stem);
     }
     0
 }
@@ -1572,7 +1572,7 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
     }
     let stem = dll_stem(name);
     if CORE_DLLS.contains(&stem.as_str()) {
-        return Ok(c.p.fake_module(&stem));
+        return Ok(c.p.fake_module(&mut *c.host, &stem));
     }
     // A DLL the game ships (or extracted at run time) is loaded and recompiled.
     let with_ext = if name.to_lowercase().ends_with(".dll") || name.contains('.') { name.to_string() } else { format!("{name}.dll") };
@@ -1582,7 +1582,7 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
         if let Some(bytes) = c.p.fs.read_all(&key) {
             // a game I wanna play online converted: its http_dll_2_3.dll is the port
             if bytes == super::httpdll::MARKER {
-                return Ok(c.p.fake_module("http_dll_2_3"));
+                return Ok(c.p.fake_module(&mut *c.host, "http_dll_2_3"));
             }
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
             return load_image(c, &base_name, &guest_path, bytes, true);
@@ -1603,7 +1603,7 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
         }
     }
     if HLE_DLLS.contains(&stem.as_str()) || FALLBACK_DLLS.contains(&stem.as_str()) {
-        return Ok(c.p.fake_module(&stem));
+        return Ok(c.p.fake_module(&mut *c.host, &stem));
     }
     // Then the player's own system DLLs (the importer could not know this one was needed).
     if !with_ext.contains(['\\', '/']) {

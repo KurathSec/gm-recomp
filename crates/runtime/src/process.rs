@@ -654,14 +654,29 @@ impl Process {
     }
 
     /// Fake module handle for DLLs implemented by HLE.
-    pub fn fake_module(&mut self, dll: &str) -> u32 {
+    /// The handle of an emulated DLL: a page of its own holding PE headers with an empty
+    /// export directory (code that reads a module's exports itself, as Petite's unpacker
+    /// does, finds none and asks GetProcAddress); the next 1 MB slot from 0x7C000000 that
+    /// is free.
+    pub fn fake_module(&mut self, mem: &mut dyn Guest, dll: &str) -> u32 {
         let key = dll.to_lowercase();
         let key = if key.ends_with(".dll") || key.ends_with(".drv") { key } else { format!("{key}.dll") };
         if let Some(&b) = self.fake_modules.get(&key) {
             return b;
         }
-        let base = 0x7C00_0000 + self.fake_modules.len() as u32 * 0x0010_0000;
-        self.vm.alloc(base, 0x1000, true, PAGE_READWRITE, false, "fake module");
+        let mut k = self.fake_modules.len() as u32;
+        let base = loop {
+            let base = 0x7C00_0000 + k * 0x0010_0000;
+            if base >= self.vm.max_addr {
+                break self.vm.alloc(0, 0x1000, true, PAGE_READWRITE, true, "fake module").unwrap_or(0x7C00_0000);
+            }
+            if self.vm.alloc(base, 0x1000, true, PAGE_READWRITE, false, "fake module").is_some() {
+                break base;
+            }
+            k += 1;
+        };
+        let _ = mem.ensure_mapped(base, 0x1000);
+        let _ = mem.write(base, &fake_module_headers(base, &key, self.x64));
         self.fake_modules.insert(key, base);
         base
     }
@@ -924,3 +939,41 @@ impl Process {
     }
 }
 
+/// An emulated DLL's page: DOS and PE headers (PE32+ in a 64-bit process), no sections,
+/// and an export directory at 0x200 with the DLL's name and no exports.
+fn fake_module_headers(base: u32, name: &str, x64: bool) -> Vec<u8> {
+    let mut d = vec![0u8; 0x300];
+    let put16 = |d: &mut Vec<u8>, at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    let put32 = |d: &mut Vec<u8>, at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    d[..2].copy_from_slice(b"MZ");
+    put32(&mut d, 0x3c, 0x40);
+    d[0x40..0x44].copy_from_slice(b"PE\0\0");
+    put16(&mut d, 0x44, if x64 { 0x8664 } else { 0x14c });
+    put16(&mut d, 0x54, if x64 { 0xF0 } else { 0xE0 });
+    put16(&mut d, 0x56, 0x2102); // DLL, executable (32-bit machine)
+    let opt = 0x58;
+    put16(&mut d, opt, if x64 { 0x20b } else { 0x10b });
+    if x64 {
+        d[opt + 24..opt + 32].copy_from_slice(&(base as u64).to_le_bytes());
+    } else {
+        put32(&mut d, opt + 28, base);
+    }
+    put32(&mut d, opt + 32, 0x1000); // SectionAlignment
+    put32(&mut d, opt + 36, 0x200); // FileAlignment
+    put32(&mut d, opt + 56, 0x1000); // SizeOfImage
+    put32(&mut d, opt + 60, 0x200); // SizeOfHeaders
+    let dirs = opt + if x64 { 112 } else { 96 };
+    put32(&mut d, dirs - 4, 16); // NumberOfRvaAndSizes
+    put32(&mut d, dirs, 0x200);
+    put32(&mut d, dirs + 4, 40 + 0x40);
+    // IMAGE_EXPORT_DIRECTORY: Name, Base 1, no functions or names
+    put32(&mut d, 0x200 + 12, 0x240);
+    put32(&mut d, 0x200 + 16, 1);
+    for f in [28, 32, 36] {
+        put32(&mut d, 0x200 + f, 0x2C0);
+    }
+    let n = name.as_bytes();
+    let n = &n[..n.len().min(0x7F)];
+    d[0x240..0x240 + n.len()].copy_from_slice(n);
+    d
+}
