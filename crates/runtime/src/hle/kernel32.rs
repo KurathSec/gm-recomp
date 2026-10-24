@@ -476,6 +476,21 @@ pub fn register(r: &mut Registry) {
         });
     }
     r.add_on_demand(k, "SetThreadPreferredUILanguages", |_c| ok(3, 1));
+    // Vectored exception handlers (Rust's runtime installs one for stack overflows):
+    // registered as a handle; exceptions go through the SEH chain only.
+    for name in ["AddVectoredExceptionHandler", "AddVectoredContinueHandler"] {
+        r.add_on_demand(k, name, |c| {
+            let h = c.p.new_handle(Handle::Dummy("vectored handler"));
+            ok(2, h)
+        });
+    }
+    for name in ["RemoveVectoredExceptionHandler", "RemoveVectoredContinueHandler"] {
+        r.add_on_demand(k, name, |_c| ok(1, 1));
+    }
+    r.add_on_demand(k, "SetThreadStackGuarantee", |c| {
+        write_out(c, c.arg(0), 0);
+        ok(1, 1)
+    });
     // Activation contexts (side-by-side assemblies): none apply here; one created is a
     // handle that changes nothing, and lookups find nothing.
     for name in ["CreateActCtxA", "CreateActCtxW"] {
@@ -1260,7 +1275,8 @@ pub fn register(r: &mut Registry) {
         let size = file_size(c, h).unwrap_or(0);
         let p = c.arg(1);
         let _ = c.host.fill(p, 52, 0);
-        let _ = c.host.write_u32(p, 0x80);
+        // (a folder opened as a file: Rust's create_dir_all checks what is there)
+        let _ = c.host.write_u32(p, if is_dir_handle(c, h) { 0x10 } else { 0x80 });
         let _ = c.host.write_u32(p + 32, (size >> 32) as u32);
         let _ = c.host.write_u32(p + 36, size as u32);
         let _ = c.host.write_u32(p + 40, 1);
@@ -1926,6 +1942,11 @@ pub(crate) fn create_file(c: &mut Ctx, path: &str, access: u32, disposition: u32
         return c.p.new_handle(Handle::Dummy("directory"));
     }
     c.p.new_handle(Handle::File(FileHandle { path: path.to_string(), key, pos: 0, writable }))
+}
+
+/// A folder CreateFile opened (FILE_FLAG_BACKUP_SEMANTICS).
+fn is_dir_handle(c: &Ctx, h: u32) -> bool {
+    matches!(c.p.handles.get(&h), Some(Handle::Dummy("directory")))
 }
 
 fn with_file<T>(c: &mut Ctx, h: u32, f: impl FnOnce(&mut FileHandle) -> T) -> Option<T> {
@@ -3260,7 +3281,8 @@ fn register_x64(r: &mut Registry) {
     });
     r.add_on_demand(k, "GetFileInformationByHandleEx", |c| {
         let (h, class, p, size) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
-        let Some(len) = file_size(c, h) else {
+        let dir = is_dir_handle(c, h);
+        let Some(len) = file_size(c, h).or(dir.then_some(0)) else {
             c.set_last_error(6);
             return ok(4, 0);
         };
@@ -3271,13 +3293,14 @@ fn register_x64(r: &mut Registry) {
                 for i in 0..4 {
                     let _ = c.host.write_u64(p + 8 * i, 0x01DC_5A6B_0000_0000);
                 }
-                let _ = c.host.write_u32(p + 32, 0x80);
+                let _ = c.host.write_u32(p + 32, if dir { 0x10 } else { 0x80 });
             }
             // FILE_STANDARD_INFO: AllocationSize, EndOfFile, NumberOfLinks, DeletePending, Directory
             1 if size >= 22 => {
                 let _ = c.host.write_u64(p, len.div_ceil(4096) * 4096);
                 let _ = c.host.write_u64(p + 8, len);
                 let _ = c.host.write_u32(p + 16, 1);
+                let _ = c.host.write_u8(p + 21, dir as u8);
             }
             _ => {
                 c.set_last_error(87);
