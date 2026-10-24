@@ -168,6 +168,13 @@ pub fn register(r: &mut Registry) {
         ok(3, h)
     });
     r.add(k, "FreeLibrary", |_c| ok(1, 1));
+    // A .NET DLL (C# with exported functions, entry point _CorDllMain) needs a CLR there is
+    // none of: it fails to load as on a machine without .NET, and the game carries on
+    // without its functions.
+    r.add_on_demand("mscoree.dll", "_CorDllMain", |c| {
+        c.p.log("mscoree _CorDllMain: no .NET runtime".to_string());
+        ok(3, 0)
+    });
     r.add(k, "GetProcAddress", |c| {
         let base = c.arg(0);
         let name_arg = c.arg(1);
@@ -1731,7 +1738,9 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
         if entry != base {
             let r = c.call_guest(entry, &[base, 1, 0])?;
             if r == 0 {
+                // unloaded again: another LoadLibrary of it fails too
                 c.p.log(format!("{base_name}: DllMain returned FALSE"));
+                c.p.modules.retain(|m| m.base != base);
                 c.set_last_error(1114);
                 return Ok(0);
             }
