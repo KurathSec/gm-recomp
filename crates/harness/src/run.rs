@@ -128,6 +128,9 @@ struct Hd {
     frame_mark: (u64, u64, u64, u64, usize, u64, u64),
     /// The guest's network connections (GMR_NET).
     net: crate::net::Net,
+    /// GMR_PROFILE=<ms>: translated functions sampled every <ms> ms (from the wasm stack
+    /// at epoch ticks), as the innermost one and as anywhere on the stack.
+    samples: Option<(std::collections::HashMap<String, u64>, std::collections::HashMap<String, u64>)>,
 }
 
 /// Store and Caller both give direct access to their data.
@@ -396,12 +399,20 @@ pub fn run(opts: RunOpts) -> Result<()> {
     }
     cfg.epoch_interruption(true);
     let wt_engine = wasmtime::Engine::new(&cfg).map_err(|e| anyhow!("{e:?}"))?;
+    let profile_ms: Option<u64> = std::env::var("GMR_PROFILE").ok().and_then(|v| v.parse().ok());
     {
         let wt_engine = wt_engine.clone();
         let secs = opts.seconds;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            wt_engine.increment_epoch();
+        std::thread::spawn(move || match profile_ms {
+            // (the ticks sample; the deadline callback keeps the wall-clock limit)
+            Some(ms) => loop {
+                std::thread::sleep(std::time::Duration::from_millis(ms.max(1)));
+                wt_engine.increment_epoch();
+            },
+            None => {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                wt_engine.increment_epoch();
+            }
         });
     }
 
@@ -476,9 +487,31 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0), net: Default::default() });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0), net: Default::default(), samples: profile_ms.map(|_| Default::default()) });
     store.set_epoch_deadline(1);
-    store.epoch_deadline_trap();
+    if profile_ms.is_some() {
+        let secs = opts.seconds;
+        store.epoch_deadline_callback(move |ctx| {
+            if ctx.data().t0.elapsed().as_secs() >= secs {
+                return Err(wasmtime::Trap::Interrupt.into());
+            }
+            let bt = wasmtime::WasmBacktrace::capture(&ctx);
+            let names: Vec<String> = bt.frames().iter().filter_map(|f| f.func_name()).filter(|n| n.starts_with("f_")).map(str::to_owned).collect();
+            let mut ctx = ctx;
+            if let Some((own, total)) = ctx.data_mut().samples.as_mut() {
+                *own.entry(names.first().cloned().unwrap_or_else(|| "(host)".into())).or_default() += 1;
+                let mut seen = std::collections::HashSet::new();
+                for n in names {
+                    if seen.insert(n.clone()) {
+                        *total.entry(n).or_default() += 1;
+                    }
+                }
+            }
+            Ok(wasmtime::UpdateDeadline::Continue(1))
+        });
+    } else {
+        store.epoch_deadline_trap();
+    }
     let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_MAX_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;
     let table = Table::new(&mut store, TableType::new(RefType::FUNCREF, 0, None), Ref::Func(None)).map_err(|e| anyhow!("{e:?}"))?;
     let mut globals = Vec::new();
@@ -562,6 +595,15 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let e = m.engine_ref();
     let p = e.p.as_ref();
     eprintln!("---- run finished in {elapsed:.2}s ----");
+    if let Some((own, total)) = &m.cx.hd_ref().samples {
+        let top = |h: &std::collections::HashMap<String, u64>, n: usize| {
+            let mut v: Vec<(&String, &u64)> = h.iter().collect();
+            v.sort_unstable_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            v.iter().take(n).map(|(k, c)| format!("{k}:{c}")).collect::<Vec<_>>().join(" ")
+        };
+        eprintln!("profile, innermost ({} samples): {}", own.values().sum::<u64>(), top(own, 25));
+        eprintln!("profile, on the stack: {}", top(total, 25));
+    }
     match &outcome {
         Ok(()) => match e.exit {
             _ if p.is_some_and(|p| p.frames_presented >= p.frame_limit) => {
