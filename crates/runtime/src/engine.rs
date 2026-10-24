@@ -1035,10 +1035,24 @@ pub fn rt_trap<M: Machine>(m: &mut M, kind: i32, arg: u32) {
             }
             request(m, Ctl::Fault { code: 0xC000_001D, ip: arg })
         }
+        trap::PRIVILEGED => request(m, Ctl::Fault { code: 0xC000_0096, ip: arg }),
         trap::INT => stop(m, format!("int {arg:#x} at {ip:#x}")),
         trap::HLT => stop(m, format!("hlt at {arg:#x}")),
         trap::NO_TARGET => stop(m, format!("branch to an unresolvable target at {arg:#x}")),
-        trap::UNIMPLEMENTED => stop(m, format!("unimplemented instruction at {arg:#x}")),
+        trap::UNIMPLEMENTED => {
+            // (code written since it was translated, as at a UD2: translated again once)
+            if m.engine().ud2_retried.insert(arg) {
+                let e = m.engine();
+                if let Some(p) = e.p.as_mut() {
+                    p.code_written.push((arg, arg + 1));
+                }
+                note_code_written(m);
+                m.set_global(Global::Eip, arg);
+                request(m, Ctl::Resume);
+                return;
+            }
+            stop(m, format!("unimplemented instruction at {arg:#x}"))
+        }
         _ => stop(m, format!("trap {kind} at {arg:#x}")),
     }
 }

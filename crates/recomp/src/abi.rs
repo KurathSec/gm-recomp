@@ -234,6 +234,9 @@ pub mod trap {
     /// kind's bits above the low byte the batch (`FuncInfo::tag`) it was translated in.
     /// The code then jumps to `arg` through the dispatcher, which translates it anew.
     pub const STALE: i32 = 10;
+    /// An instruction user mode may not run (port I/O, cli/sti): Windows raises
+    /// STATUS_PRIVILEGED_INSTRUCTION, which anti-debugging and VM checks catch.
+    pub const PRIVILEGED: i32 = 11;
 }
 
 /// Type indices inside every generated module.

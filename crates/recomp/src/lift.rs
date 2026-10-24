@@ -433,6 +433,11 @@ impl<'a> FuncEmit<'a> {
     }
 
     pub(crate) fn unimplemented(&mut self, instr: &Instruction) {
+        use Mnemonic::*;
+        if matches!(instr.mnemonic(), In | Out | Insb | Insw | Insd | Outsb | Outsw | Outsd | Cli | Sti | Clts | Invd | Wbinvd | Rdmsr | Wrmsr | Lgdt | Lidt | Lldt | Ltr | Lmsw) {
+            self.trap(trap::PRIVILEGED, self.ip);
+            return;
+        }
         let mut text = String::new();
         iced_x86::FastFormatter::new().format(instr, &mut text);
         self.unimplemented.push((self.ip, text));
