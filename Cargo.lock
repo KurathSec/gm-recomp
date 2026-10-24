@@ -2197,6 +2197,7 @@ dependencies = [
  "delharc",
  "encoding_rs",
  "flate2",
+ "lzma-rust2 0.23.0",
  "lzxd",
  "pe",
  "rars",

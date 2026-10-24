@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 delharc = "0.8"
 encoding_rs = "0.8.42"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "optimization"] }
 lzxd = "0.2"
 pe = { version = "0.1.0", path = "../pe" }
 runtime = { version = "0.1.0", path = "../runtime" }

@@ -144,6 +144,7 @@ pub fn read_zip(z: &[u8]) -> Result<(Vec<(Vec<String>, bool, Vec<u8>)>, Vec<Stri
                 flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).map(|_| v).map_err(|e| format!("{name}: {e}"))
             }
             9 => nsis::inflate_with(raw, false, true).map_err(|e| format!("{name}: Deflate64: {e}")),
+            14 => lzma(raw, size).map_err(|e| format!("{name}: LZMA: {e}")),
             m => return Err(format!("{name}: compression method {m} is not supported")),
         };
         match data {
@@ -155,6 +156,18 @@ pub fn read_zip(z: &[u8]) -> Result<(Vec<(Vec<String>, bool, Vec<u8>)>, Vec<Stri
         }
     }
     Ok((out, damaged))
+}
+
+/// A zip entry's LZMA data: version (2 bytes), properties size (2), the properties (lc/lp/pb
+/// byte, dictionary size) and the raw stream, `size` bytes when decoded.
+fn lzma(raw: &[u8], size: u64) -> Result<Vec<u8>, String> {
+    let n = raw.get(2..4).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or("truncated")?;
+    let props = raw.get(4..4 + n).filter(|p| p.len() >= 5).ok_or("truncated")?;
+    let dict = u32::from_le_bytes([props[1], props[2], props[3], props[4]]);
+    let mut r = lzma_rust2::LzmaReader::new_with_props(&raw[4 + n..], size, props[0], dict, None).map_err(|e| e.to_string())?;
+    let mut v = Vec::with_capacity(size as usize);
+    r.read_to_end(&mut v).map_err(|e| e.to_string())?;
+    Ok(v)
 }
 
 /// A 7z archive's files and folders, as `read_zip` gives them.
