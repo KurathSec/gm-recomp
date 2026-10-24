@@ -1737,7 +1737,8 @@ fn host_system_dll(c: &mut Ctx, file: &str) -> Option<Vec<u8>> {
     if c.p.system_dll_missing.contains(&key) {
         return None;
     }
-    let bytes = c.host.system_dll(&key);
+    // (only a PE file: a web host may answer a missing file with an HTML page)
+    let bytes = c.host.system_dll(&key).filter(|b| b.starts_with(b"MZ"));
     match &bytes {
         Some(b) => c.p.log(format!("{key}: the player's copy ({} KB)", b.len() / 1024)),
         None => {
@@ -1750,6 +1751,13 @@ fn host_system_dll(c: &mut Ctx, file: &str) -> Option<Vec<u8>> {
 /// Maps a PE image, binds its imports, runs TLS callbacks and DllMain. Shared by
 /// LoadLibrary and the harness's static-import preloading.
 pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>, attach: bool, deps_dir: Option<&str>) -> Result<u32, ApiError> {
+    // Not an image at all (a file of that name that is something else): LoadLibrary
+    // fails, as on Windows.
+    if !bytes.starts_with(b"MZ") {
+        c.p.log(format!("LoadLibrary({base_name:?}): not a PE file"));
+        c.set_last_error(193); // ERROR_BAD_EXE_FORMAT
+        return Ok(0);
+    }
     // A process runs images of its own bitness only (games ship 32-bit extensions their
     // 64-bit runner cannot load, and expect LoadLibrary to fail).
     if pe::Pe::parse(&bytes).is_ok_and(|pe| pe.pe64 != c.x64()) {

@@ -403,7 +403,10 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         x.responseType = 'arraybuffer';
         x.send();
         if (x.status !== 200) return -1;
-        systemDll = new Uint8Array(x.response);
+        // (a site that answers a missing file with its page, status 200: not a DLL)
+        const bytes = new Uint8Array(x.response);
+        if (bytes.length < 2 || bytes[0] !== 0x4d || bytes[1] !== 0x5a) return -1;
+        systemDll = bytes;
         return systemDll.length;
       } catch {
         return -1;
