@@ -444,6 +444,42 @@ pub fn register(r: &mut Registry) {
         let n = copy_str_out(c, c.arg(0), c.arg(1), b"C:\\Windows");
         ok(2, n)
     });
+    r.add_on_demand(k, "GetSystemDirectoryW", |c| {
+        let n = copy_wstr_out(c, c.arg(0), c.arg(1), "C:\\Windows\\system32");
+        ok(2, n)
+    });
+    r.add_on_demand(k, "GetWindowsDirectoryW", |c| {
+        let n = copy_wstr_out(c, c.arg(0), c.arg(1), "C:\\Windows");
+        ok(2, n)
+    });
+    // QueryDosDevice(name, buf, cap): the one drive's device (a list of strings ending with
+    // an empty one); no name lists the devices
+    for name in ["QueryDosDeviceW", "QueryDosDeviceA"] {
+        r.add_on_demand(k, name, |c| {
+            let wide = c.name().ends_with('W');
+            let p = c.arg(0);
+            let device = if p == 0 { Some("C:") } else if wide { c.host.read_wstr(p).ok().filter(|d| d.eq_ignore_ascii_case("C:")).map(|_| "C:") } else { c.host.read_cstr(p).ok().filter(|d| d.eq_ignore_ascii_case(b"C:")).map(|_| "C:") };
+            let Some(device) = device else {
+                c.set_last_error(ERROR_FILE_NOT_FOUND);
+                return ok(3, 0);
+            };
+            let list = if p == 0 { format!("{device}\0\0") } else { "\\Device\\HarddiskVolume1\0\0".to_string() };
+            let units: Vec<u16> = list.encode_utf16().collect();
+            let (buf, cap) = (c.arg(1), c.arg(2) as usize);
+            if units.len() > cap {
+                c.set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+                return ok(3, 0);
+            }
+            for (i, &u) in units.iter().enumerate() {
+                let _ = if wide { c.host.write_u16(buf + 2 * i as u32, u) } else { c.host.write(buf + i as u32, &[u as u8]) };
+            }
+            ok(3, units.len() as u32)
+        });
+    }
+    r.add_on_demand(k, "GetSystemWindowsDirectoryW", |c| {
+        let n = copy_wstr_out(c, c.arg(0), c.arg(1), "C:\\Windows");
+        ok(2, n)
+    });
     r.add(k, "GetTempPathA", |c| {
         let n = copy_str_out(c, c.arg(1), c.arg(0), format!("{}\\", crate::process::TEMP_DIR).as_bytes());
         ok(2, n)
@@ -1334,6 +1370,22 @@ pub fn register(r: &mut Registry) {
         ok(4, 1)
     });
     r.add(k, "GetLogicalDrives", |_c| ok(0, 0x4));
+    // GetLogicalDriveStrings(cap, buf): "C:\" and the empty string after it; the length
+    // without the last NUL, or the size needed
+    for name in ["GetLogicalDriveStringsW", "GetLogicalDriveStringsA"] {
+        r.add_on_demand(k, name, |c| {
+            let wide = c.name().ends_with('W');
+            let (cap, buf) = (c.arg(0) as usize, c.arg(1));
+            let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0, 0];
+            if cap < units.len() || buf == 0 {
+                return ok(2, units.len() as u32);
+            }
+            for (i, &u) in units.iter().enumerate() {
+                let _ = if wide { c.host.write_u16(buf + 2 * i as u32, u) } else { c.host.write(buf + i as u32, &[u as u8]) };
+            }
+            ok(2, units.len() as u32 - 1)
+        });
+    }
     r.add(k, "GetVolumeInformationA", |c| {
         copy_str_out(c, c.arg(1), c.arg(2), b"GAME");
         write_out(c, c.arg(3), 0x1234_5678);
@@ -1462,6 +1514,29 @@ pub fn register(r: &mut Registry) {
         ok(2, (secs <= u32::MAX as u64) as u32)
     });
     r.add(n, "NtQueryInformationFile", |_c| ok(5, 0xC000_0003)); // STATUS_INVALID_INFO_CLASS
+    // UNICODE_STRING {Length, MaximumLength, Buffer} (the pointer aligned: at 8 in 64 bits)
+    r.add_on_demand(n, "RtlFormatCurrentUserKeyPath", |c| {
+        let out = c.arg(0);
+        let units: Vec<u16> = "\\REGISTRY\\USER\\S-1-5-21-0-0-0-1000".encode_utf16().collect();
+        let buf = c.p.heap_alloc(c.host, 0, 2 * units.len() as u32 + 2, true);
+        for (i, &u) in units.iter().enumerate() {
+            let _ = c.host.write_u16(buf + 2 * i as u32, u);
+        }
+        let _ = c.host.write_u16(out, 2 * units.len() as u16);
+        let _ = c.host.write_u16(out + 2, 2 * units.len() as u16 + 2);
+        c.write_ptr(out + c.ptr_size(), buf);
+        ok(1, 0)
+    });
+    r.add_on_demand(n, "RtlFreeUnicodeString", |c| {
+        let s = c.arg(0);
+        let buf = c.read_ptr(s + c.ptr_size());
+        if buf != 0 {
+            c.p.heap_free(buf);
+            c.write_ptr(s + c.ptr_size(), 0);
+            let _ = c.host.write_u32(s, 0);
+        }
+        ok(1, 0)
+    });
     // Bitmaps: RTL_BITMAP {SizeOfBitMap, Buffer}
     r.add(n, "RtlInitializeBitMap", |c| {
         let (bm, buf, size) = (c.arg(0), c.arg(1), c.arg(2));

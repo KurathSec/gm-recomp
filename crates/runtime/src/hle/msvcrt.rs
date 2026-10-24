@@ -1838,6 +1838,9 @@ pub fn register_more(r: &mut Registry) {
         c.p.crt_fds.push(h);
         ok(2 + c.p.crt_fds.len() as u32)
     });
+    // (streams are unbuffered: a buffer the caller hands over is never used)
+    r.add_on_demand(m, "setbuf", |_c| ok(0));
+    r.add_on_demand(m, "setvbuf", |_c| ok(0));
     r.add_on_demand(m, "_fdopen", |c| {
         let fd = c.arg(0);
         let Some(&h) = fd.checked_sub(3).and_then(|i| c.p.crt_fds.get(i as usize)) else {

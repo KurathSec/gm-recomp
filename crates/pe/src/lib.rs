@@ -80,6 +80,13 @@ impl Section {
     pub fn contains_rva(&self, rva: u32) -> bool {
         rva >= self.virtual_address && rva - self.virtual_address < self.mapped_size().max(self.raw_size)
     }
+
+    /// Whether `rva` is in the pages the section is mapped to (its virtual size): raw data
+    /// past them is not mapped (Enigma Virtual Box keeps its files there, behind a
+    /// one-page section, where the next sections' RVAs are).
+    pub fn maps_rva(&self, rva: u32) -> bool {
+        rva >= self.virtual_address && rva - self.virtual_address < self.mapped_size().div_ceil(0x1000) * 0x1000
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -282,7 +289,7 @@ impl<'a> Pe<'a> {
     }
 
     pub fn section_of(&self, rva: u32) -> Option<&Section> {
-        self.sections.iter().find(|s| s.contains_rva(rva))
+        self.sections.iter().find(|s| s.maps_rva(rva)).or_else(|| self.sections.iter().find(|s| s.contains_rva(rva)))
     }
 
     /// File offset backing `rva`, or None when the RVA is zero-fill / unmapped.

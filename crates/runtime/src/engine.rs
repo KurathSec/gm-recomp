@@ -2079,6 +2079,7 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let exe_range = read(m, exe).and_then(|b| pe::Pe::parse(&b).ok().map(|pe| (pe.image_base, pe.size_of_image.div_ceil(0x1000) * 0x1000)));
     let mut reserved = exe_range.and_then(|(base, size)| m.engine().p.as_mut()?.vm.alloc(base, size, false, crate::mem::PAGE_NOACCESS, false, "exe"));
     let mut attach = Vec::new();
+    let mut exe_tls = Vec::new();
     let (mut entry, mut image_base) = (0, 0);
     for name in order {
         let bytes = read(m, &name).ok_or_else(|| format!("reading {name}"))?;
@@ -2108,6 +2109,7 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         if name.eq_ignore_ascii_case(exe) {
             entry = md.entry;
             image_base = md.base;
+            exe_tls = md.tls_callbacks.iter().map(|&cb| (md.base, cb, format!("{name} tls"))).collect();
             if md.pe64 {
                 p.x64 = true;
                 m.engine().x64 = true;
@@ -2121,6 +2123,9 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         p.modules.push(md);
         m.engine().p = Some(p);
     }
+    // the exe's TLS callbacks run after the DLLs' initialization, just before its entry
+    // point (Enigma Virtual Box fills the import table in one)
+    attach.extend(exe_tls);
     let mut p = m.engine().p.take().ok_or("process not available")?;
     let r = p.setup_main_thread(m, image_base).and_then(|r| p.setup_static_tls(m).map(|_| r));
     m.engine().p = Some(p);
