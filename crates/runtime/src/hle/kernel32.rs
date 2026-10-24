@@ -1658,6 +1658,10 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
                 if let Some(bytes) = host_system_dll(c, &file) {
                     load_image(c, &file, &format!("C:\\Windows\\system32\\{file}"), bytes, true)?;
                 }
+            } else {
+                // emulated: loaded as far as GetModuleHandle goes (a packed DLL's stub
+                // asks it for the DLLs its import table had loaded)
+                c.p.fake_module(&mut *c.host, &stem);
             }
         }
     }
