@@ -305,6 +305,17 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
             repaired.push(path.clone());
         }
     }
+    // a launcher that unpacks the game and runs it as another process: what it unpacks
+    let launchers: Vec<(String, Vec<(String, Vec<u8>)>)> = files.iter().filter_map(|(p, d)| launcher_files(d).map(|f| (p.clone(), f))).collect();
+    for (path, inner) in launchers {
+        let dir = path.rsplit_once('/').map_or(String::new(), |(d, _)| format!("{d}/"));
+        files.retain(|(p, _)| *p != path);
+        for (name, data) in inner {
+            let p = format!("{dir}{}", name.replace('\\', "/"));
+            files.retain(|(q, _)| !q.eq_ignore_ascii_case(&p));
+            files.push((p, data));
+        }
+    }
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
     let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs, neshta: repaired };
@@ -715,6 +726,42 @@ fn neshta(exe: &[u8]) -> Option<Result<Vec<u8>, ()>> {
     out.extend_from_slice(&exe[tail + NESHTA_KEPT..]);
     out.extend_from_slice(&exe[NESHTA..tail]);
     Some(Ok(out))
+}
+
+/// The files a game's launcher (a Rust program, "src/runner.rs") unpacks before it runs
+/// the game as another process: the payload at the end of its exe (its size in the last 4
+/// bytes) names the exe to run, then holds each file as name length, name, size, data.
+/// The exe to run comes first. None unless the whole payload reads that way.
+fn launcher_files(exe: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    if !exe.starts_with(b"MZ") || !exe[..pe_image_end(exe).min(exe.len())].windows(13).any(|w| w == b"src/runner.rs") {
+        return None;
+    }
+    let end = exe.len().checked_sub(4)?;
+    let len = u32_at(exe, end)? as usize;
+    let mut p = end.checked_sub(len)?;
+    let name = |p: &mut usize| -> Option<String> {
+        let n = *exe.get(*p)? as usize;
+        let s = exe.get(*p + 1..*p + 1 + n)?;
+        *p += 1 + n;
+        let s = String::from_utf8(s.to_vec()).ok()?;
+        (!s.is_empty() && safe_parts(&s.replace('\\', "/")).is_some()).then_some(s)
+    };
+    let run = name(&mut p)?;
+    let mut files = Vec::new();
+    while p < end {
+        let n = name(&mut p)?;
+        let size = u32_at(exe, p)? as usize;
+        let data = exe.get(p + 4..p + 4 + size)?;
+        p += 4 + size;
+        files.push((n, data.to_vec()));
+    }
+    if p != end {
+        return None;
+    }
+    let at = files.iter().position(|(n, _)| n.eq_ignore_ascii_case(&run))?;
+    let first = files.remove(at);
+    files.insert(0, first);
+    Some(files)
 }
 
 /// A PE32+ (64-bit) image: optional header magic 0x20b.
