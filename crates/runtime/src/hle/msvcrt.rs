@@ -734,6 +734,10 @@ pub fn register(r: &mut Registry) {
         let Some(h) = file_handle(c, f) else { return ok(0) };
         let total = size.saturating_mul(count);
         let got = super::kernel32::read_file(c, h, buf, total).unwrap_or(0);
+        if got < total {
+            let flag = c.host.read_u32(f + 12).unwrap_or(0);
+            let _ = c.host.write_u32(f + 12, flag | IOEOF);
+        }
         ok(if size == 0 { 0 } else { got / size })
     });
     r.add(m, "fwrite", |c| {
@@ -1952,4 +1956,81 @@ pub fn register_late(r: &mut Registry) {
         }
         ok(0)
     });
+    // (unbuffered: a read character comes from the file, and ungetc steps back over it,
+    // the one read last)
+    for name in ["fgetc", "getc"] {
+        r.add_on_demand(m, name, |c| {
+            let f = c.arg(0);
+            ok(stream_getc(c, f))
+        });
+    }
+    r.add_on_demand(m, "ungetc", |c| {
+        let (ch, f) = (c.arg(0), c.arg(1));
+        let Some(h) = file_handle(c, f).filter(|_| ch != EOF) else { return ok(EOF) };
+        super::kernel32::seek_file(c, h, -1, 1);
+        let flag = c.host.read_u32(f + 12).unwrap_or(0);
+        let _ = c.host.write_u32(f + 12, flag & !IOEOF);
+        ok(ch & 0xFF)
+    });
+    r.add_on_demand(m, "fgets", |c| {
+        let (buf, n, f) = (c.arg(0), c.arg_i32(1), c.arg(2));
+        let mut line = Vec::new();
+        while (line.len() as i32) < n - 1 {
+            let ch = stream_getc(c, f);
+            if ch == EOF {
+                break;
+            }
+            line.push(ch as u8);
+            if ch == b'\n' as u32 {
+                break;
+            }
+        }
+        if line.is_empty() && n > 1 {
+            return ok(0);
+        }
+        line.push(0);
+        let _ = c.host.write(buf, &line);
+        ok(buf)
+    });
+    r.add_on_demand(m, "feof", |c| {
+        let f = c.arg(0);
+        ok((c.host.read_u32(f + 12).unwrap_or(0) & IOEOF != 0) as u32)
+    });
+    r.add_on_demand(m, "remove", |c| {
+        let p = c.str_arg(0);
+        if super::kernel32::delete_path(c, &p, false) {
+            return ok(0);
+        }
+        set_errno(c, 2); // ENOENT
+        ok(u32::MAX)
+    });
+    r.add_on_demand(m, "rename", |c| {
+        let (from, to) = (c.str_arg(0), c.str_arg(1));
+        if super::kernel32::move_file(c, &from, &to, false) {
+            return ok(0);
+        }
+        set_errno(c, if c.p.fs.exists(&c.p.vpath(&to)) { 13 } else { 2 }); // EACCES, ENOENT
+        ok(u32::MAX)
+    });
+    r.add_on_demand(m, "_assert", |c| {
+        let (msg, file, line) = (c.str_arg(0), c.str_arg(1), c.arg(2));
+        Err(ApiError(format!("msvcrt assertion failed: {msg} ({file}:{line})")))
+    });
+}
+
+const EOF: u32 = 0xFFFF_FFFF;
+/// FILE::_flag's end-of-file bit.
+const IOEOF: u32 = 0x10;
+
+/// fgetc: the next byte, or EOF (and the stream's end-of-file flag set).
+fn stream_getc(c: &mut Ctx, f: u32) -> u32 {
+    let Some(h) = file_handle(c, f) else { return EOF };
+    match super::kernel32::read_file_data(c, h, 1).as_deref() {
+        Some([b]) => *b as u32,
+        _ => {
+            let flag = c.host.read_u32(f + 12).unwrap_or(0);
+            let _ = c.host.write_u32(f + 12, flag | IOEOF);
+            EOF
+        }
+    }
 }

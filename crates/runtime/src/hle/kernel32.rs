@@ -1988,12 +1988,19 @@ fn with_file<T>(c: &mut Ctx, h: u32, f: impl FnOnce(&mut FileHandle) -> T) -> Op
 }
 
 pub(crate) fn read_file(c: &mut Ctx, h: u32, buf: u32, n: u32) -> Option<u32> {
+    let data = read_file_data(c, h, n)?;
+    let _ = c.host.write(buf, &data);
+    Some(data.len() as u32)
+}
+
+/// Up to `n` bytes from the file's position on, which moves past them.
+pub(crate) fn read_file_data(c: &mut Ctx, h: u32, n: u32) -> Option<Vec<u8>> {
     let (key, pos) = with_file(c, h, |fh| (fh.key.clone(), fh.pos))?;
     let mut data = vec![0u8; n as usize];
     let got = c.p.fs.read_at(&key, pos, &mut data)?;
-    let _ = c.host.write(buf, &data[..got]);
+    data.truncate(got);
     with_file(c, h, |fh| fh.pos += got as u64);
-    Some(got as u32)
+    Some(data)
 }
 
 pub(crate) fn write_file(c: &mut Ctx, h: u32, data: &[u8]) -> u32 {
@@ -2630,7 +2637,7 @@ fn copy_file(c: &mut Ctx, src: &str, dst: &str, fail_if_exists: bool) -> bool {
     r
 }
 
-fn move_file(c: &mut Ctx, src: &str, dst: &str, replace: bool) -> bool {
+pub(crate) fn move_file(c: &mut Ctx, src: &str, dst: &str, replace: bool) -> bool {
     let (a, b) = (c.p.vpath(src), c.p.vpath(dst));
     if c.p.fs.exists(&b) {
         if !replace {
@@ -2646,7 +2653,7 @@ fn move_file(c: &mut Ctx, src: &str, dst: &str, replace: bool) -> bool {
     r
 }
 
-fn delete_path(c: &mut Ctx, guest: &str, dir: bool) -> bool {
+pub(crate) fn delete_path(c: &mut Ctx, guest: &str, dir: bool) -> bool {
     let key = c.p.vpath(guest);
     let ok_ = if dir { c.p.fs.is_dir(&key) } else { c.p.fs.is_file(&key) };
     let r = ok_ && c.p.fs.remove(&key);
