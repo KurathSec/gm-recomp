@@ -688,10 +688,16 @@ pub fn call_guest64<M: Machine>(m: &mut M, p: &mut Process, regs: &mut Regs, add
     write_regs(m, &callee);
     // Exception dispatch walks on past this call as the API's caller, whose registers
     // are what they are at the API's return.
-    let mut caller = r64;
-    let api_rsp = caller[4];
-    let caller_rip = m.read_u64(api_rsp as u32).unwrap_or(0);
-    caller[4] = api_rsp + 8;
+    let (caller, caller_rip) = match p.host_frame_caller.take() {
+        Some(given) => given,
+        None => {
+            let mut caller = r64;
+            let api_rsp = caller[4];
+            let caller_rip = m.read_u64(api_rsp as u32).unwrap_or(0);
+            caller[4] = api_rsp + 8;
+            (caller, caller_rip)
+        }
+    };
     p.host_frames64.push((marker, caller, caller_rip));
     p.nest += 1;
     let owned = std::mem::replace(p, Process::empty());

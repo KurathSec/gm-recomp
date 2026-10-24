@@ -349,6 +349,9 @@ pub fn dispatch(c: &mut Ctx, code: u32, flags: u32, params: &[u64], ctx: &Contex
         if let Some(h) = u.handler {
             walk.write(c, work_at);
             write_dispatch(c, disp_at, pc, entry, u.frame, 0, work_at, h);
+            // (a walk out of the handler goes on at the exception, not at the records
+            // `scratch` put below the stack)
+            c.p.host_frame_caller = Some((ctx.r, ctx.rip));
             let r = c.call_guest64(h.0 as u32, &[rec_at as u64, u.frame, ctx_at as u64, disp_at as u64])?;
             if r as u32 as u64 == EXCEPTION_CONTINUE_EXECUTION {
                 if flags & EH_NONCONTINUABLE != 0 {
@@ -401,6 +404,7 @@ pub fn unwind_ex(c: &mut Ctx) -> ApiResult {
             let _ = c.host.write_u32(rec + 4, flags);
             cur.write(c, ctx_at);
             write_dispatch(c, disp_at, pc, entry, u.frame, target_ip, ctx_at, h);
+            c.p.host_frame_caller = Some((cur.r, cur.rip));
             let r = c.call_guest64(h.0 as u32, &[rec as u64, u.frame, ctx_at as u64, disp_at as u64])?;
             if r as u32 as u64 == EXCEPTION_COLLIDED_UNWIND {
                 return Err(ApiError("RtlUnwindEx: collided unwind".into()));
@@ -418,6 +422,7 @@ pub fn unwind_ex(c: &mut Ctx) -> ApiResult {
     let code = c.host.read_u32(rec).unwrap_or(0);
     if code == STATUS_UNWIND_CONSOLIDATE && c.host.read_u32(rec + 24).unwrap_or(0) >= 1 {
         let callback = c.host.read_u64(rec + 32).unwrap_or(0);
+        c.p.host_frame_caller = Some((cur.r, cur.rip));
         cur.rip = c.call_guest64(callback as u32, &[rec as u64])?;
     }
     c.trace(format!("(frame {target_frame:#x}) -> {:#x}", cur.rip));

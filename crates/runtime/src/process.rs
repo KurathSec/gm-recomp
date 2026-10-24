@@ -320,6 +320,9 @@ pub struct Process {
     /// and the API caller's registers and return address, for exception dispatch to
     /// walk on past them (hle::seh64).
     pub host_frames64: Vec<(u32, [u64; 16], u64)>,
+    /// The context the next `call_guest64` host frame unwinds to, when it is not the
+    /// API's caller (exception dispatch: the handlers run below records it put on the stack).
+    pub host_frame_caller: Option<([u64; 16], u64)>,
     /// The condition variable the main thread sleeps in, and whether a wake reached it.
     pub main_cv: Option<(u32, bool)>,
     /// Slim reader/writer locks: the critical section (in guest memory) each one is
@@ -511,6 +514,7 @@ impl Process {
             cs_pending: Vec::new(),
             srw_locks: HashMap::default(),
             host_frames64: Vec::new(),
+            host_frame_caller: None,
             main_cv: None,
             cmdline: cmdline.to_string(),
             exe_path: exe_path.to_string(),
