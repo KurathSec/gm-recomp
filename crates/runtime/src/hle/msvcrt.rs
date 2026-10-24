@@ -1978,6 +1978,18 @@ pub fn register_late(r: &mut Registry) {
             ok(stream_getc(c, f))
         });
     }
+    // The getc and putc macros' calls when the FILE's buffer is empty or full: with
+    // its counts at zero, every time.
+    r.add_on_demand(m, "_filbuf", |c| {
+        let f = c.arg(0);
+        ok(stream_getc(c, f))
+    });
+    r.add_on_demand(m, "_flsbuf", |c| {
+        let (ch, f) = (c.arg(0), c.arg(1));
+        let Some(h) = file_handle(c, f) else { return ok(EOF) };
+        let n = super::kernel32::write_file(c, h, &[ch as u8]);
+        ok(if n == 1 { ch & 0xFF } else { EOF })
+    });
     r.add_on_demand(m, "ungetc", |c| {
         let (ch, f) = (c.arg(0), c.arg(1));
         let Some(h) = file_handle(c, f).filter(|_| ch != EOF) else { return ok(EOF) };

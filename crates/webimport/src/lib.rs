@@ -133,7 +133,11 @@ pub fn read_zip(z: &[u8]) -> Result<(Vec<(Vec<String>, bool, Vec<u8>)>, Vec<Stri
         }
         let l = local as usize;
         if u32le(z, l)? != 0x0403_4b50 {
-            return Err(format!("bad local header for {name}"));
+            if name.to_lowercase().ends_with(".exe") {
+                return Err(format!("bad local header for {name}"));
+            }
+            damaged.push(parts.join("/"));
+            continue;
         }
         let start = l + 30 + u16le(z, l + 26)? as usize + u16le(z, l + 28)? as usize;
         let raw = z.get(start..start + csize as usize).ok_or("truncated zip")?;
@@ -168,6 +172,65 @@ fn lzma(raw: &[u8], size: u64) -> Result<Vec<u8>, String> {
     let mut v = Vec::with_capacity(size as usize);
     r.read_to_end(&mut v).map_err(|e| e.to_string())?;
     Ok(v)
+}
+
+/// A zip read from its local headers in order, as `read_zip` gives it; None when there is
+/// no entry. An entry the archive ends in (truncated) counts as damaged.
+fn read_zip_local(z: &[u8]) -> Option<(Vec<(Vec<String>, bool, Vec<u8>)>, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut damaged = Vec::new();
+    let mut p = z.windows(4).position(|w| w == b"PK\x03\x04")?;
+    while u32le(z, p) == Ok(0x0403_4b50) {
+        let flags = u16le(z, p + 6).ok()?;
+        let method = u16le(z, p + 8).ok()?;
+        let csize = u32le(z, p + 18).ok()? as usize;
+        let (n, e) = (u16le(z, p + 26).ok()? as usize, u16le(z, p + 28).ok()? as usize);
+        let name = decode_name(z.get(p + 30..p + 30 + n)?, flags & 0x800 != 0);
+        let start = p + 30 + n + e;
+        let Some(parts) = safe_parts(&name) else { break };
+        // a data descriptor after the data: the size is only known by inflating it
+        let streamed = flags & 8 != 0 && csize == 0;
+        let (data, end) = if streamed && method == 8 {
+            let mut d = flate2::bufread::DeflateDecoder::new(z.get(start..)?);
+            let mut v = Vec::new();
+            match d.read_to_end(&mut v) {
+                Ok(_) => {
+                    let left = d.get_ref().len();
+                    (Some(v), z.len() - left)
+                }
+                Err(_) => (None, z.len()),
+            }
+        } else {
+            match z.get(start..start + csize) {
+                Some(raw) => {
+                    let data = match method {
+                        0 => Some(raw.to_vec()),
+                        8 => {
+                            let mut v = Vec::new();
+                            flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).ok().map(|_| v)
+                        }
+                        _ => None,
+                    };
+                    (data, start + csize)
+                }
+                None => (None, z.len()),
+            }
+        };
+        let is_dir = name.ends_with('/') || name.ends_with('\\');
+        if !parts.is_empty() {
+            match data {
+                _ if is_dir => out.push((parts, true, Vec::new())),
+                Some(d) => out.push((parts, false, d)),
+                None => damaged.push(parts.join("/")),
+            }
+        }
+        p = end;
+        if flags & 8 != 0 {
+            // (the descriptor: crc, sizes, with or without its signature)
+            p += if u32le(z, p) == Ok(0x0807_4b50) { 16 } else { 12 };
+        }
+    }
+    (!out.is_empty()).then_some((out, damaged))
 }
 
 /// A 7z archive's files and folders, as `read_zip` gives them.
@@ -310,10 +373,14 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     } else {
         // (bytes in front of a zip, as an HTTP header an upload kept: its offsets count from
         // its first entry)
-        let (entries, d) = read_zip(archive).or_else(|e| match archive.windows(4).position(|w| w == b"PK\x03\x04") {
-            Some(at) if at > 0 => read_zip(&archive[at..]).map_err(|_| e),
-            _ => Err(e),
-        })?;
+        let (entries, d) = read_zip(archive)
+            .or_else(|e| match archive.windows(4).position(|w| w == b"PK\x03\x04") {
+                Some(at) if at > 0 => read_zip(&archive[at..]).map_err(|_| e),
+                _ => Err(e),
+            })
+            // (a central directory missing, a truncated upload, or not matching the
+            // entries, two archives spliced: the entries as they follow each other)
+            .or_else(|e| read_zip_local(archive).filter(|(entries, _)| entries.iter().any(|(_, dir, _)| !dir)).ok_or(e))?;
         damaged = d;
         entries
     };
