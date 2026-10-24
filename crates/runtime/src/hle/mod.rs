@@ -2,6 +2,7 @@
 //! stdcall arguments from the guest stack and returns the value for EAX plus how
 //! many argument bytes the callee pops.
 
+pub mod acm;
 pub mod audio;
 pub mod com;
 pub mod d3d8;
@@ -538,6 +539,7 @@ impl Registry {
         kernel32::register_more(&mut r);
         kernel32::register_paths(&mut r);
         kernel32::register_extra(&mut r);
+        acm::register(&mut r);
         d3d11::register(&mut r);
         for (dll, name) in [
             ("kernel32.dll", "QueryPerformanceCounter"),
