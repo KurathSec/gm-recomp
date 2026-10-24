@@ -892,9 +892,17 @@ impl Process {
         let a = match h.alloc(size) {
             Some(a) => a,
             None => {
-                // Grow: a new region at least as large as the heap so far.
-                let grow = (h.total().max(size.saturating_add(0x10000))).div_ceil(0x10_0000) * 0x10_0000;
-                let Some(base) = self.vm.alloc(0, grow, true, PAGE_READWRITE, false, "heap") else { return 0 };
+                // Grow: a new region as large as the heap so far, up to 64 MB a step (a
+                // heap of 1 GB found no second gigabyte free, and failed small requests
+                // too), else just large enough for this block.
+                let need = size.saturating_add(0x10000);
+                let step = h.total().min(0x400_0000).max(need).div_ceil(0x10_0000) * 0x10_0000;
+                let Some((base, grow)) = [step, need.div_ceil(0x1_0000) * 0x1_0000]
+                    .into_iter()
+                    .find_map(|g| self.vm.alloc(0, g, true, PAGE_READWRITE, false, "heap").map(|b| (b, g)))
+                else {
+                    return 0;
+                };
                 if mem.ensure_mapped(base, grow).is_err() {
                     return 0;
                 }
