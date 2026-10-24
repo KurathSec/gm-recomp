@@ -1132,6 +1132,10 @@ fn tex_lock_rect(c: &mut Ctx) -> ApiResult {
     let out_rect = c.arg(2);
     let rect = c.arg(3);
     let (pitch, bits) = level_bits(c, t, level);
+    // (no storage: the address space ran out; better a failed lock than writes at 0)
+    if bits == 0 {
+        return ret(c, super::misc::E_OUTOFMEMORY);
+    }
     let mut p = bits;
     if rect != 0 {
         let l = c.host.read_u32(rect).unwrap_or(0);
@@ -1203,6 +1207,10 @@ fn surf_lock_rect(c: &mut Ctx) -> ApiResult {
     let out_rect = c.arg(1);
     let rect = c.arg(2);
     let (pitch, bits) = level_bits(c, t, 0);
+    // (no storage: the address space ran out; better a failed lock than writes at 0)
+    if bits == 0 {
+        return ret(c, super::misc::E_OUTOFMEMORY);
+    }
     let mut p = bits;
     if rect != 0 {
         let l = c.host.read_u32(rect).unwrap_or(0);

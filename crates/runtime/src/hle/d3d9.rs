@@ -1371,6 +1371,10 @@ fn dev_get_render_target_data(c: &mut Ctx) -> ApiResult {
 /// Copies a system-memory surface's or texture level's bytes into another and marks
 /// the destination for upload.
 fn copy_bits(c: &mut Ctx, src: (u32, u32), dst: (u32, u32), rows: u32) {
+    // (a texture without storage: the address space ran out)
+    if src.1 == 0 || dst.1 == 0 {
+        return;
+    }
     let n = src.0.min(dst.0);
     // (equal pitches: one copy of the whole image)
     let (count, step) = if src.0 == dst.0 { (1, n * rows) } else { (rows, n) };
@@ -1845,6 +1849,10 @@ fn write_locked(c: &mut Ctx, out_rect: u32, pitch: u32, bits: u32, rect: u32, fm
 fn tex_lock_rect(c: &mut Ctx) -> ApiResult {
     let (t, level, out_rect, rect) = (this(c), c.arg(1), c.arg(2), c.arg(3));
     let (pitch, bits) = level_bits(c, t, level);
+    // (no storage: the address space ran out; better a failed lock than writes at 0)
+    if bits == 0 {
+        return ret(c, super::misc::E_OUTOFMEMORY);
+    }
     let fmt = field(c, t, "fmt");
     write_locked(c, out_rect, pitch, bits, rect, fmt);
     ret(c, D3D_OK)
@@ -1917,6 +1925,10 @@ fn surf_get_desc(c: &mut Ctx) -> ApiResult {
 fn surf_lock_rect(c: &mut Ctx) -> ApiResult {
     let (s, out_rect, rect) = (this(c), c.arg(1), c.arg(2));
     let (pitch, bits) = surface_bits(c, s);
+    // (no storage: the address space ran out; better a failed lock than writes at 0)
+    if bits == 0 {
+        return ret(c, super::misc::E_OUTOFMEMORY);
+    }
     let fmt = field(c, s, "fmt");
     write_locked(c, out_rect, pitch, bits, rect, fmt);
     ret(c, D3D_OK)
