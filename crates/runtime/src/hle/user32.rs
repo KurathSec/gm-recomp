@@ -1289,9 +1289,13 @@ fn show_window(c: &mut Ctx, hwnd: u32, show: bool) -> Result<bool, super::ApiErr
             c.p.shown.push(hwnd);
             // A dialog form shown again (GameMaker 8 keeps one for every get_string and
             // show_message) is a new dialog for `answer_dialog`.
-            if c.p.windows.get(&hwnd).is_some_and(|w| w.class == DIALOG_FORM || w.class == ERROR_FORM) {
+            if bridged(c, hwnd) {
                 c.p.dialog = (0, 0, false);
                 c.p.dialog_text.remove(&hwnd);
+            }
+            // (it waits in a loop of its own, not in WaitMessage)
+            if c.p.windows.get(&hwnd).is_some_and(|w| w.class == LITE_AD) {
+                post(c, hwnd, WM_CLOSE, 0, 0);
             }
             let (w, h) = c.p.windows.get(&hwnd).map(|w| (w.w, w.h)).unwrap_or((0, 0));
             c.p.active = hwnd;
@@ -2187,7 +2191,7 @@ fn draw_text(c: &mut Ctx, wide: bool, ex: bool) -> ApiResult {
         _ => 0,
     };
     // (painted: not a measurement, which the label also makes of its caption before it shows)
-    if flags & 0x400 == 0 && c.p.windows.get(&hwnd).is_some_and(|w| w.class == DIALOG_FORM && w.visible) && n > 0 {
+    if flags & 0x400 == 0 && bridged(c, hwnd) && c.p.windows.get(&hwnd).is_some_and(|w| w.visible) && n > 0 {
         let text = if wide {
             let mut b = vec![0u8; n * 2];
             let _ = c.host.read(s, &mut b);
@@ -2219,6 +2223,25 @@ const ERROR_FORM: &str = "TErrorForm";
 /// GameMaker 8's game information (a rich edit), shown at the start by some games: as a
 /// message, then closed.
 const HELP_FORM: &str = "THelpForm";
+/// GameMaker 8's high score table: as a message of what it painted, then closed.
+const SCORE_FORM: &str = "TScoreForm";
+/// GameMaker 8 Lite's ad as a game ends: closed.
+const LITE_AD: &str = "TLiteExitAd";
+
+/// A form `answer_dialog` answers: GameMaker 8's dialogs, its error, game information, high
+/// score and exit-ad forms, and Delphi's InputQuery (a plain TForm with an edit box and
+/// buttons: GameMaker 8.0's get_string).
+fn bridged(c: &Ctx, hwnd: u32) -> bool {
+    let Some(w) = c.p.windows.get(&hwnd) else { return false };
+    match w.class.as_str() {
+        DIALOG_FORM | ERROR_FORM | HELP_FORM | SCORE_FORM | LITE_AD => true,
+        "TForm" => {
+            let has = |kind: &str| w.children.iter().any(|k| c.p.windows.get(k).is_some_and(|k| k.class.ends_with(kind)));
+            has("Edit") && has("Button")
+        }
+        _ => false,
+    }
+}
 
 /// GameMaker 8's dialogs are VCL forms the browser never shows: when the game waits in such a
 /// form's modal loop (WaitMessage), the player is asked instead (`Host::prompt`), the answer
@@ -2227,11 +2250,15 @@ const HELP_FORM: &str = "THelpForm";
 /// or after a few waits without.
 fn answer_dialog(c: &mut Ctx) -> bool {
     use super::Ask;
-    let Some(form) = c.p.windows.iter().filter(|(_, w)| (w.class == DIALOG_FORM || w.class == ERROR_FORM || w.class == HELP_FORM) && w.visible && w.enabled).map(|(&h, _)| h).max() else {
+    let Some(form) = c.p.windows.iter().filter(|(h, w)| w.visible && w.enabled && bridged(c, **h)).map(|(&h, _)| h).max() else {
         return false;
     };
-    let error = c.p.windows[&form].class == ERROR_FORM;
-    let help = c.p.windows[&form].class == HELP_FORM;
+    let class = c.p.windows[&form].class.clone();
+    let error = class == ERROR_FORM;
+    let help = class == HELP_FORM;
+    if class == LITE_AD {
+        return false;
+    }
     if c.p.dialog.0 != form {
         c.p.dialog = (form, 0, false);
     }
@@ -2265,9 +2292,9 @@ fn answer_dialog(c: &mut Ctx) -> bool {
             buttons.push((k, w.title.replace('&', "")));
         }
     }
-    if help {
+    if help || class == SCORE_FORM {
         let title = c.p.windows[&form].title.clone();
-        let text = memo.trim().replace("\r\n", "\n");
+        let text = if help { memo.trim().replace("\r\n", "\n") } else { c.p.dialog_text.remove(&form).unwrap_or_default().join("\n") };
         c.p.log(format!("dialog [{title}]: {text:?} (Information)"));
         c.host.prompt(Ask::Message, &title, &text);
         post(c, form, WM_CLOSE, 0, 0);
