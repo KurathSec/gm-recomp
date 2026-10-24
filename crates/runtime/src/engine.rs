@@ -2063,10 +2063,16 @@ pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
         let fs = &m.engine_ref().process().fs;
         fs.read_all(name).or_else(|| if name.contains('\\') { None } else { fs.read_all(&format!("{}\\{name}", crate::hle::kernel32::SYSTEM_DIR)) })
     };
-    {
+    let laa = {
         let r = |name: &str| read(m, name);
         let x64 = r(exe).and_then(|b| pe::Pe::parse(&b).ok().map(|pe| pe.pe64)).unwrap_or(false);
         collect_order(exe, x64, &r, &mut seen, &mut order)?;
+        r(exe).and_then(|b| pe::Pe::parse(&b).ok().map(|pe| !pe.pe64 && pe.characteristics & 0x20 != 0)).unwrap_or(false)
+    };
+    // a large-address-aware 32-bit exe (IMAGE_FILE_LARGE_ADDRESS_AWARE) has the space up
+    // to 4 GB as well
+    if let Some(p) = m.engine().p.as_mut().filter(|_| laa) {
+        p.vm.high_max = crate::mem::HIGH_MAX;
     }
     // Windows maps the exe before its DLLs: keep its preferred range free for it (an
     // exe without relocations cannot go anywhere else).

@@ -128,6 +128,10 @@ pub trait Guest {
 
 pub const PAGE: u32 = 0x1000;
 pub const GRANULARITY: u32 = 0x10000;
+/// Where the address space a large-address-aware exe has beyond 2 GB starts.
+pub const HIGH_BASE: u32 = 0x8000_0000;
+/// Its top (Windows on 64 bits gives such an exe all but the last 64 KB of 4 GB).
+pub const HIGH_MAX: u32 = 0xFFFE_0000;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -161,6 +165,10 @@ pub struct Vm {
     pub min_addr: u32,
     /// Highest usable address + 1 (user space top).
     pub max_addr: u32,
+    /// The top of the space above 2 GB a large-address-aware 32-bit exe has as well (0:
+    /// none). It is handed out once the space below is full, as Windows gives out low
+    /// addresses first (and the guest's memory grows past 2 GB only then).
+    pub high_max: u32,
     /// Every range ever handed out (disjoint, merged): memory outside them was never
     /// anyone's, so it still holds the zeros it was mapped with.
     pub used: BTreeMap<u32, u64>,
@@ -170,7 +178,7 @@ pub struct Vm {
 
 impl Vm {
     pub fn new() -> Self {
-        Vm { regions: BTreeMap::new(), min_addr: 0x0001_0000, max_addr: 0x7FFE_0000, used: BTreeMap::new(), last_fresh: false }
+        Vm { regions: BTreeMap::new(), min_addr: 0x0001_0000, max_addr: 0x7FFE_0000, high_max: 0, used: BTreeMap::new(), last_fresh: false }
     }
 
     /// Whether any of [start, end) was handed out before.
@@ -208,9 +216,16 @@ impl Vm {
 
     /// Finds a free range of `size` bytes aligned to the allocation granularity.
     pub fn find_free(&self, size: u32, top_down: bool, min: u32) -> Option<u32> {
+        self.find_free_below(size, top_down, min, self.max_addr).or_else(|| {
+            // (from the bottom up there too: memory grows to what is used)
+            (self.high_max != 0).then(|| self.find_free_below(size, false, min.max(HIGH_BASE), self.high_max)).flatten()
+        })
+    }
+
+    fn find_free_below(&self, size: u32, top_down: bool, min: u32, max: u32) -> Option<u32> {
         let size = size.div_ceil(PAGE) * PAGE;
         if top_down {
-            let mut end = self.max_addr & !(GRANULARITY - 1);
+            let mut end = max & !(GRANULARITY - 1);
             loop {
                 let base = end.checked_sub(size)? & !(GRANULARITY - 1);
                 if base < min.max(self.min_addr) {
@@ -226,7 +241,7 @@ impl Vm {
         } else {
             let mut base = min.max(self.min_addr).div_ceil(GRANULARITY) * GRANULARITY;
             loop {
-                if base.saturating_add(size) > self.max_addr {
+                if base.saturating_add(size) > max {
                     return None;
                 }
                 match self.regions.range(..base + size).next_back() {
@@ -248,7 +263,8 @@ impl Vm {
         } else {
             let b = base & !(GRANULARITY - 1);
             // (a 64-bit DLL's preferred base above 4 GB can land past the guest's memory)
-            if self.overlaps(b, size) || b < self.min_addr || b as u64 + size as u64 > self.max_addr as u64 {
+            let top = if b >= HIGH_BASE && self.high_max != 0 { self.high_max } else { self.max_addr };
+            if self.overlaps(b, size) || b < self.min_addr || b as u64 + size as u64 > top as u64 {
                 return None;
             }
             b
@@ -355,7 +371,8 @@ impl Vm {
             }
         }
         // free: extends to the next region
-        let next = self.regions.range(page..).next().map(|(&b, _)| b).unwrap_or(self.max_addr);
+        let top = if page >= HIGH_BASE && self.high_max != 0 { self.high_max } else { self.max_addr };
+        let next = self.regions.range(page..).next().map(|(&b, _)| b).unwrap_or(top);
         (page, next - page, MEM_FREE, PAGE_NOACCESS, 0)
     }
 }

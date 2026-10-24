@@ -17,6 +17,8 @@ use wasmtime::{
 
 /// 2 GiB of guest address space: everything the runtime places lives below 0x8000_0000.
 const MEM_PAGES: u64 = 32768;
+/// What it can grow to: a large-address-aware exe's 4 GiB.
+const MEM_MAX_PAGES: u64 = 65536;
 
 pub struct RunOpts {
     pub game_dir: PathBuf,
@@ -477,7 +479,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
     let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0), net: Default::default() });
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
-    let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;
+    let memory = Memory::new(&mut store, MemoryType::new(MEM_PAGES as u32, Some(MEM_MAX_PAGES as u32))).map_err(|e| anyhow!("{e:?}"))?;
     let table = Table::new(&mut store, TableType::new(RefType::FUNCREF, 0, None), Ref::Func(None)).map_err(|e| anyhow!("{e:?}"))?;
     let mut globals = Vec::new();
     for (_, _, ty) in GLOBALS {
@@ -596,6 +598,17 @@ pub fn run(opts: RunOpts) -> Result<()> {
             p.now_ms()
         );
         eprintln!("x87 instructions via rt.fpu: {}", e.fpu_ops);
+        if std::env::var_os("GMR_VM_STATS").is_some() {
+            let mut t: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+            for r in p.vm.regions.values() {
+                let e = t.entry(r.tag).or_default();
+                e.0 += r.size as u64;
+                e.1 += 1;
+            }
+            for (tag, (sz, n)) in t {
+                eprintln!("vm {tag}: {} MB in {n}", sz >> 20);
+            }
+        }
         if let Some(h) = &e.api_hist {
             let mut v: Vec<(u64, usize)> = h.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| (*n, i)).collect();
             v.sort_unstable_by(|a, b| b.cmp(a));

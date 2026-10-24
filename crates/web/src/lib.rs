@@ -180,8 +180,11 @@ impl runtime::hle::gpu::Gpu for FrameGpu {
     }
 }
 
-/// Guest address space limit (the stub and marker pages sit just below 2 GiB).
-const GUEST_MAX_PAGES: u64 = 32768;
+/// Guest address space limit: 4 GiB for a large-address-aware exe (the others stay below
+/// 2 GiB, where the stub and marker pages sit).
+const GUEST_MAX_PAGES: u64 = 65536;
+/// The state hash covers the first 2 GiB, as the harness's.
+const HASHED_PAGES: u64 = 32768;
 
 #[derive(Clone, Copy)]
 struct Glue {
@@ -843,7 +846,7 @@ pub extern "C" fn run() -> i32 {
     let t0 = m.now_us();
     let r = engine::run_process(&mut m, &started);
     let dt = (m.now_us() - t0) as f64 / 1e6;
-    let (hash, chunks) = engine::state_hash(&mut m, (GUEST_MAX_PAGES * 65536 - 65536) as u32);
+    let (hash, chunks) = engine::state_hash(&mut m, (HASHED_PAGES * 65536 - 65536) as u32);
     let e = m.engine_ref();
     let p = e.process();
     let mut lines = vec![

@@ -197,7 +197,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   const gpuImports = {
     gpu_resize: (w, h) => gpu?.resize(w, h),
     gpu_texture_create: (id, w, h, levels, fmt, rt) => gpu?.textureCreate(id, w, h, levels, fmt, rt),
-    gpu_texture_upload: (id, level, w, h, fmt, pitch, bits) => gpu?.textureUpload(id, level, w, h, fmt, pitch, bits),
+    // (guest addresses come as signed i32: a large-address-aware game's reach past 2 GB)
+    gpu_texture_upload: (id, level, w, h, fmt, pitch, bits) => gpu?.textureUpload(id, level, w, h, fmt, pitch, bits >>> 0),
     gpu_texture_delete: (id) => gpu?.textureDelete(id),
     gpu_set_target: (id, w, h) => gpu?.setTarget(id, w, h),
     gpu_clear: (flags, color, z, stencil, x, y, w, h) => gpu?.clear(flags, color >>> 0, z, stencil, x, y, w, h),
@@ -214,7 +215,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_shader_create: (id, vertex, ptr, len) => gpu?.shaderCreate(id, !!vertex, dec.decode(mem().subarray(ptr, ptr + len))),
     gpu_shader_delete: (id) => gpu?.shaderDelete(id),
     gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
-    gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst, pitch),
+    gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst >>> 0, pitch),
     gpu_pace: () => {},
     gpu_slack: () => 0,
     gpu_present: (clockMs, x, y, w, h, dw, dh) => {
