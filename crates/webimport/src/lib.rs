@@ -25,6 +25,8 @@ pub struct Game {
     /// Folders the archive has with no files in them ('/' separated, parents first): games
     /// write into a folder they ship empty (a save folder), as extracting leaves it.
     pub dirs: Vec<String>,
+    /// Exes damaged by the Neshta virus that were put back together (`neshta`).
+    pub neshta: Vec<String>,
 }
 
 fn u16le(d: &[u8], o: usize) -> Result<u16, String> {
@@ -296,14 +298,16 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
         files.retain(|(p, _): &(String, Vec<u8>)| !p.eq_ignore_ascii_case(&path));
         files.push((path, data));
     }
-    for (_, data) in &mut files {
+    let mut repaired = Vec::new();
+    for (path, data) in &mut files {
         if let Some(Ok(original)) = neshta(data) {
             *data = original;
+            repaired.push(path.clone());
         }
     }
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
-    let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs };
+    let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs, neshta: repaired };
     // (the game's folder first: an IExpress package in a folder unwraps from there)
     game.reroot();
     game.iexpress = unwrap_iexpress(&mut game.files)?;
@@ -640,7 +644,7 @@ impl Game {
             let stem = self.source.rsplit(['/', '\\']).next().unwrap_or_default();
             slug = slugify(stem.rsplit_once('.').map_or(stem, |(s, _)| s));
         }
-        json!({
+        let mut m = json!({
             "slug": slug,
             "title": self.title,
             "source": self.source,
@@ -650,7 +654,11 @@ impl Game {
             "iexpress": self.iexpress.as_ref().map(|(stub, run, title)| json!({ "stub": stub, "run_program": run, "title": title })),
             "files": self.files.iter().map(|(p, d)| json!({ "path": p, "size": d.len() })).collect::<Vec<_>>(),
             "dirs": self.dirs,
-        })
+        });
+        if !self.neshta.is_empty() {
+            m["neshta"] = json!(self.neshta);
+        }
+        m
     }
 }
 
