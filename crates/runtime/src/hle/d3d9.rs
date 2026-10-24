@@ -1520,9 +1520,7 @@ const IDIRECT3DDEVICE9: &[Method] = &[
         ret(c, D3D_OK)
     }),
     ("GetRasterStatus", 3, |c| {
-        let p = c.arg(2);
-        let _ = c.host.write_u32(p, 0);
-        let _ = c.host.write_u32(p + 4, 0);
+        super::d3d8::write_raster_status(c, c.arg(2));
         ret(c, D3D_OK)
     }),
     ("SetDialogBoxMode", 2, okn),
@@ -2102,8 +2100,7 @@ static IDIRECT3DSWAPCHAIN9: &[Method] = &[
         ret(c, D3D_OK)
     }),
     ("GetRasterStatus", 2, |c| {
-        let p = c.arg(1);
-        let _ = c.host.fill(p, 8, 0);
+        super::d3d8::write_raster_status(c, c.arg(1));
         ret(c, D3D_OK)
     }),
     ("GetDisplayMode", 2, |c| {

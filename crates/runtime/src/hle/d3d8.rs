@@ -922,9 +922,19 @@ fn dev_get_dword(c: &mut Ctx) -> ApiResult {
 }
 
 fn dev_get_raster_status(c: &mut Ctx) -> ApiResult {
-    let p = c.arg(1);
-    let _ = c.host.write_u64(p, 0);
+    write_raster_status(c, c.arg(1));
     ret(c, D3D_OK)
+}
+
+/// D3DRASTER_STATUS by the clock: the beam of the 1920x1080 60 Hz display the adapter
+/// reports (1125 lines a frame, 45 of them blanking). A read lets time pass, as a read of
+/// the clock: a game waiting for the vertical blank this way gets there.
+pub(super) fn write_raster_status(c: &mut Ctx, p: u32) {
+    c.poll_clock();
+    let line = (c.p.clock_us * 60 % 1_000_000) * 1125 / 1_000_000;
+    let vblank = line >= 1080;
+    let _ = c.host.write_u32(p, vblank as u32);
+    let _ = c.host.write_u32(p + 4, if vblank { 0 } else { line as u32 });
 }
 
 fn dev_get_gamma_ramp(c: &mut Ctx) -> ApiResult {
