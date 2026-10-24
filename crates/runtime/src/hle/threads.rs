@@ -195,6 +195,10 @@ fn sleep(c: &mut Ctx, ms: u32) {
     if c.p.current == 0 {
         if ms == 0 {
             c.host.run_threads(c.p);
+            // a little time passes too, as for a read of the clock: a thread sleeping
+            // meanwhile wakes (supersound spins in Sleep(0) until its stream thread,
+            // between sleeps of its own, sees it should stop)
+            c.poll_clock();
             return;
         }
         let target = c.p.clock_us + ms as u64 * 1000;
