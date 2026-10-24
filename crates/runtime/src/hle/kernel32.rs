@@ -145,25 +145,25 @@ pub fn register(r: &mut Registry) {
     }
     r.add(k, "LoadLibraryA", |c| {
         let name = c.str_arg(0);
-        let h = load_library(c, &name)?;
+        let h = load_library(c, &name, 0)?;
         c.trace(format!("({name:?}) = {h:#x}"));
         ok(1, h)
     });
     r.add(k, "LoadLibraryW", |c| {
         let name = c.wstr_arg(0);
-        let h = load_library(c, &name)?;
+        let h = load_library(c, &name, 0)?;
         c.trace(format!("({name:?}) = {h:#x}"));
         ok(1, h)
     });
     r.add(k, "LoadLibraryExA", |c| {
         let name = c.str_arg(0);
-        let h = load_library(c, &name)?;
+        let h = load_library(c, &name, c.arg(2))?;
         c.trace(format!("({name:?}) = {h:#x}"));
         ok(3, h)
     });
     r.add(k, "LoadLibraryExW", |c| {
         let name = c.wstr_arg(0);
-        let h = load_library(c, &name)?;
+        let h = load_library(c, &name, c.arg(2))?;
         c.trace(format!("({name:?}) = {h:#x}"));
         ok(3, h)
     });
@@ -1582,7 +1582,24 @@ fn module_path(c: &mut Ctx, base: u32) -> String {
     c.p.exe_path.clone()
 }
 
-fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
+/// Whether a Windows installation has this DLL (Wine's set, plus the VC/VB runtimes
+/// Wine leaves out). Only a dependency that is neither such a DLL nor a file makes a
+/// load fail; a missing system DLL is stubbed.
+fn windows_dll(stem: &str) -> bool {
+    stem.starts_with("api-ms-") || stem.starts_with("ext-ms-") || include_str!("windows_dlls.txt").lines().any(|l| l == stem)
+}
+
+/// LoadLibraryEx flags that make a DLL's dependencies load from its own folder too
+/// (LOAD_WITH_ALTERED_SEARCH_PATH, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR).
+const DEPS_FROM_DLL_DIR: u32 = 0x8 | 0x100;
+
+fn load_library(c: &mut Ctx, name: &str, flags: u32) -> Result<u32, ApiError> {
+    let own_dir = (flags & DEPS_FROM_DLL_DIR != 0).then(|| name.rsplit_once(['\\', '/']).map(|(d, _)| d.to_string())).flatten();
+    load_library_in(c, name, own_dir.as_deref())
+}
+
+/// LoadLibrary; `deps_dir` is a further folder its dependencies may come from.
+fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u32, ApiError> {
     if let Some(m) = c.p.module_by_name(name.rsplit(['\\', '/']).next().unwrap_or(name)) {
         return Ok(m.base);
     }
@@ -1601,21 +1618,21 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
                 return Ok(c.p.fake_module(&mut *c.host, "http_dll_2_3"));
             }
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
-            return load_image(c, &base_name, &guest_path, bytes, true);
+            return load_image(c, &base_name, &guest_path, bytes, true, deps_dir);
         }
     }
     // Then SetDllDirectory's folder.
     if let Some(dir) = c.p.dll_dir.clone().filter(|_| !with_ext.contains(['\\', '/'])) {
         let path = format!("{}\\{base_name}", dir.trim_end_matches('\\'));
         if let Some(bytes) = c.p.fs.read_all(&c.p.vpath(&path)) {
-            return load_image(c, &base_name, &path, bytes, true);
+            return load_image(c, &base_name, &path, bytes, true, deps_dir);
         }
     }
     // Then the system directory (runtime DLLs the importer supplied).
     let sys = format!("{SYSTEM_DIR}\\{base_name}");
     if !with_ext.contains(['\\', '/']) && c.p.fs.is_file(&sys) {
         if let Some(bytes) = c.p.fs.read_all(&sys) {
-            return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true);
+            return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true, deps_dir);
         }
     }
     if HLE_DLLS.contains(&stem.as_str()) || FALLBACK_DLLS.contains(&stem.as_str()) {
@@ -1624,7 +1641,7 @@ fn load_library(c: &mut Ctx, name: &str) -> Result<u32, ApiError> {
     // Then the player's own system DLLs (the importer could not know this one was needed).
     if !with_ext.contains(['\\', '/']) {
         if let Some(bytes) = host_system_dll(c, &base_name) {
-            return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true);
+            return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true, deps_dir);
         }
     }
     c.p.log(format!("LoadLibrary({name:?}): not found"));
@@ -1650,7 +1667,7 @@ fn host_system_dll(c: &mut Ctx, file: &str) -> Option<Vec<u8>> {
 
 /// Maps a PE image, binds its imports, runs TLS callbacks and DllMain. Shared by
 /// LoadLibrary and the harness's static-import preloading.
-pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>, attach: bool) -> Result<u32, ApiError> {
+pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>, attach: bool, deps_dir: Option<&str>) -> Result<u32, ApiError> {
     // A process runs images of its own bitness only (games ship 32-bit extensions their
     // 64-bit runner cannot load, and expect LoadLibrary to fail).
     if pe::Pe::parse(&bytes).is_ok_and(|pe| pe.pe64 != c.x64()) {
@@ -1658,8 +1675,13 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
         c.set_last_error(193); // ERROR_BAD_EXE_FORMAT
         return Ok(0);
     }
-    // DLLs it imports that are files (the game's or the system directory's) load first.
+    // DLLs it imports load first, from where Windows looks for them: `deps_dir`, the
+    // exe's folder, the current one, SetDllDirectory's, the system directory. One found
+    // nowhere fails the load as on Windows (games unpack GMFMODSimple.dll and fmodex.dll
+    // to a temp folder, and on LoadLibrary failing copy fmodex.dll next to the exe), unless
+    // it is a system DLL nobody supplied.
     if let Ok(pe) = pe::Pe::parse(&bytes) {
+        let exe_dir = c.p.exe_path.rsplit_once('\\').map(|(d, _)| d.to_string());
         for d in pe.imports().unwrap_or_default() {
             let stem = dll_stem(crate::api_set(&d.dll).unwrap_or(&d.dll));
             let file = format!("{stem}.dll");
@@ -1667,17 +1689,26 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
             if CORE_DLLS.contains(&stem.as_str()) || HLE_DLLS.contains(&stem.as_str()) || c.p.module_by_name(&d.dll).is_some() || c.p.module_by_name(&file).is_some() {
                 continue;
             }
-            let in_dll_dir = c.p.dll_dir.as_ref().is_some_and(|d| c.p.fs.is_file(&c.p.vpath(&format!("{}\\{file}", d.trim_end_matches('\\')))));
-            if c.p.fs.is_file(&c.p.vpath(&file)) || in_dll_dir || c.p.fs.is_file(&format!("{SYSTEM_DIR}\\{file}")) {
-                load_library(c, &file)?;
-            } else if !FALLBACK_DLLS.contains(&stem.as_str()) {
-                if let Some(bytes) = host_system_dll(c, &file) {
-                    load_image(c, &file, &format!("C:\\Windows\\system32\\{file}"), bytes, true)?;
-                }
-            } else {
+            let dirs = [deps_dir.map(str::to_string), exe_dir.clone(), Some(c.p.cwd.clone()), c.p.dll_dir.clone(), Some("C:\\Windows\\system32".to_string())];
+            let found = dirs.into_iter().flatten().map(|d| format!("{}\\{file}", d.trim_end_matches('\\'))).find(|p| c.p.fs.is_file(&c.p.vpath(p)));
+            let base = if let Some(path) = found {
+                load_library_in(c, &path, deps_dir)?
+            } else if FALLBACK_DLLS.contains(&stem.as_str()) {
                 // emulated: loaded as far as GetModuleHandle goes (a packed DLL's stub
                 // asks it for the DLLs its import table had loaded)
                 c.p.fake_module(&mut *c.host, &stem);
+                continue;
+            } else if let Some(bytes) = host_system_dll(c, &file) {
+                load_image(c, &file, &format!("C:\\Windows\\system32\\{file}"), bytes, true, deps_dir)?
+            } else if windows_dll(&stem) {
+                continue; // its imports are stubs
+            } else {
+                c.p.log(format!("LoadLibrary({base_name:?}): {file} not found"));
+                c.set_last_error(ERROR_MOD_NOT_FOUND);
+                return Ok(0);
+            };
+            if base == 0 {
+                return Ok(0);
             }
         }
     }
