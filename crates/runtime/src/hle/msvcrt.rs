@@ -589,6 +589,64 @@ pub fn register(r: &mut Registry) {
         let b = c.host.read_cstr(c.arg(1)).unwrap_or_default().to_ascii_lowercase();
         ok(a.cmp(&b) as i32 as u32)
     });
+    r.add_on_demand(m, "strstr", |c| {
+        let (h, n) = (c.arg(0), c.arg(1));
+        let (hay, needle) = (c.host.read_cstr(h).unwrap_or_default(), c.host.read_cstr(n).unwrap_or_default());
+        if needle.is_empty() {
+            return ok(h);
+        }
+        ok(hay.windows(needle.len()).position(|w| w == needle.as_slice()).map_or(0, |i| h + i as u32))
+    });
+    r.add_on_demand(m, "strncat", |c| {
+        let (d, s, n) = (c.arg(0), c.arg(1), c.arg(2) as usize);
+        let mut v = c.host.read_cstr(d).unwrap_or_default();
+        let add = c.host.read_cstr(s).unwrap_or_default();
+        v.extend_from_slice(&add[..add.len().min(n)]);
+        let _ = c.host.write_cstr(d, &v);
+        ok(d)
+    });
+    // strpbrk: the first of a set; strspn / strcspn: how many in / not in it lead
+    r.add_on_demand(m, "strpbrk", |c| {
+        let (p, set) = (c.arg(0), c.host.read_cstr(c.arg(1)).unwrap_or_default());
+        let s = c.host.read_cstr(p).unwrap_or_default();
+        ok(s.iter().position(|b| set.contains(b)).map_or(0, |i| p + i as u32))
+    });
+    r.add_on_demand(m, "strspn", |c| {
+        let (s, set) = (c.host.read_cstr(c.arg(0)).unwrap_or_default(), c.host.read_cstr(c.arg(1)).unwrap_or_default());
+        ok(s.iter().take_while(|b| set.contains(b)).count() as u32)
+    });
+    r.add_on_demand(m, "strcspn", |c| {
+        let (s, set) = (c.host.read_cstr(c.arg(0)).unwrap_or_default(), c.host.read_cstr(c.arg(1)).unwrap_or_default());
+        ok(s.iter().take_while(|b| !set.contains(b)).count() as u32)
+    });
+    r.add_on_demand(m, "_strnicmp", |c| {
+        let n = c.arg(2) as usize;
+        let key = |v: Vec<u8>| v.into_iter().take(n).map(|b| b.to_ascii_lowercase()).collect::<Vec<u8>>();
+        let (a, b) = (key(c.host.read_cstr(c.arg(0)).unwrap_or_default()), key(c.host.read_cstr(c.arg(1)).unwrap_or_default()));
+        ok(a.cmp(&b) as i32 as u32)
+    });
+    // wide: as UTF-16 units
+    r.add_on_demand(m, "wcsstr", |c| {
+        let read = |c: &Ctx, p: u32| -> Vec<u16> { (0..).map_while(|i| c.host.read_u16(p + 2 * i).ok().filter(|&u| u != 0)).take(1 << 20).collect() };
+        let (h, n) = (c.arg(0), c.arg(1));
+        let (hay, needle) = (read(c, h), read(c, n));
+        if needle.is_empty() {
+            return ok(h);
+        }
+        ok(hay.windows(needle.len()).position(|w| w == needle.as_slice()).map_or(0, |i| h + 2 * i as u32))
+    });
+    for name in ["wcschr", "wcsrchr"] {
+        r.add_on_demand(m, name, |c| {
+            let read = |c: &Ctx, p: u32| -> Vec<u16> { (0..).map_while(|i| c.host.read_u16(p + 2 * i).ok().filter(|&u| u != 0)).take(1 << 20).collect() };
+            let (p, ch) = (c.arg(0), c.arg(1) as u16);
+            let s = read(c, p);
+            if ch == 0 {
+                return ok(p + 2 * s.len() as u32);
+            }
+            let found = if c.name().ends_with("rchr") { s.iter().rposition(|&u| u == ch) } else { s.iter().position(|&u| u == ch) };
+            ok(found.map_or(0, |i| p + 2 * i as u32))
+        });
+    }
     r.add(m, "strchr", |c| {
         let (p, ch) = (c.arg(0), c.arg(1) as u8);
         let s = c.host.read_cstr(p).unwrap_or_default();
