@@ -348,8 +348,26 @@ fn is_lzh(data: &[u8]) -> bool {
 /// Unpacks an archive (zip, 7z, RAR or LZH, by content: renamed ones are common; or a bare exe)
 /// into a game:
 /// files with a single shared top folder stripped (its name is the title then), an
-/// IExpress package unwrapped.
+/// IExpress package unwrapped. An archive holding no exe but one archive (a zip of the
+/// game's zip) is that archive.
 pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
+    let mut game = import_one(archive, name)?;
+    for _ in 0..2 {
+        if game.files.iter().any(|(p, _)| game_exe(p)) {
+            break;
+        }
+        let inner: Vec<&(String, Vec<u8>)> = game.files.iter().filter(|(_, d)| is_archive(d)).collect();
+        let [(path, data)] = inner[..] else { break };
+        game = import_one(data, path)?;
+    }
+    Ok(game)
+}
+
+fn is_archive(data: &[u8]) -> bool {
+    data.starts_with(b"PK\x03\x04") || data.starts_with(b"7z\xbc\xaf\x27\x1c") || data.starts_with(b"Rar!") || is_lzh(data)
+}
+
+fn import_one(archive: &[u8], name: &str) -> Result<Game, String> {
     let mut damaged = Vec::new();
     let entries = if archive.starts_with(b"7z\xbc\xaf\x27\x1c") {
         read_7z(archive)?

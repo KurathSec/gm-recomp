@@ -3924,6 +3924,18 @@ pub fn register_extra(r: &mut Registry) {
         }
         Ok(Ret { edx: Some((mask >> 32) as u32), ..Ret::stdcall(4, mask as u32) })
     });
+    // CopyFileEx(src, dst, progress, data, cancel, flags): at once, without progress
+    // reports (COPY_FILE_FAIL_IF_EXISTS = 1)
+    r.add_on_demand(k, "CopyFileExW", |c| {
+        let (src, dst, flags) = (wstr(c, c.arg(0)), wstr(c, c.arg(1)), c.arg(5));
+        let r = copy_file(c, &src, &dst, flags & 1 != 0);
+        ok(6, r as u32)
+    });
+    r.add_on_demand(k, "CopyFileExA", |c| {
+        let (src, dst, flags) = (c.str_arg(0), c.str_arg(1), c.arg(5));
+        let r = copy_file(c, &src, &dst, flags & 1 != 0);
+        ok(6, r as u32)
+    });
     r.add_on_demand(k, "VerifyVersionInfoW", |c| verify_version_info(c, 276));
     r.add_on_demand(k, "VerifyVersionInfoA", |c| verify_version_info(c, 148));
     r.add_on_demand("ole32.dll", "PropVariantClear", |c| {
