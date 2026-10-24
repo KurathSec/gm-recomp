@@ -349,6 +349,8 @@ pub struct Process {
     pub sockets: crate::hle::winsock::Sockets,
     /// Audio Compression Manager streams.
     pub acm: crate::hle::acm::Streams,
+    /// The C runtime's file descriptors from 3 up (_open_osfhandle): their OS handles.
+    pub crt_fds: Vec<u32>,
     /// I/O completion ports (their handles are manual-reset events, set while packets
     /// wait): queued (bytes, key, OVERLAPPED*).
     pub ports: HashMap<u32, std::collections::VecDeque<(u32, u64, u64)>>,
@@ -539,6 +541,7 @@ impl Process {
             slice_polls: 0,
             sockets: Default::default(),
             acm: Default::default(),
+            crt_fds: Vec::new(),
             ports: HashMap::default(),
             httpdll: Default::default(),
             gdiplus: Default::default(),

@@ -1828,6 +1828,23 @@ pub fn register_more(r: &mut Registry) {
         ok(c.host.read_u32(f + 16).unwrap_or(u32::MAX))
     });
     r.add(m, "_isatty", |_c| ok(0));
+    // descriptors for OS handles (a networking DLL wraps its sockets): from 3 up
+    r.add_on_demand(m, "_open_osfhandle", |c| {
+        let h = c.arg(0);
+        c.p.crt_fds.push(h);
+        ok(2 + c.p.crt_fds.len() as u32)
+    });
+    r.add_on_demand(m, "_get_osfhandle", |c| {
+        let fd = c.arg(0);
+        let h = match fd {
+            0..=2 => [0xFFFF_FFF6u32, 0xFFFF_FFF5, 0xFFFF_FFF4][fd as usize],
+            _ => c.p.crt_fds.get(fd as usize - 3).copied().unwrap_or(u32::MAX),
+        };
+        if h == u32::MAX {
+            set_errno(c, 9); // EBADF
+        }
+        ok(h)
+    });
     r.add(m, "_write", |c| {
         let (fd, buf, n) = (c.arg(0), c.arg(1), c.arg(2));
         if fd == 1 || fd == 2 {
