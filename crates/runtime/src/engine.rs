@@ -90,6 +90,8 @@ pub struct Engine {
     /// functions of one module call each other directly, so a stale one takes its module.
     pub batch_of: HashMap<u32, u32, AddrHash>,
     pub batch_entries: HashMap<u32, Vec<u32>, AddrHash>,
+    /// API id -> table index of its wasm version (`recomp::intrinsics`), once made.
+    pub intrinsics: Option<HashMap<u32, u32, AddrHash>>,
     /// Table index of a function that does nothing (returned after an API call).
     pub nop_index: u32,
     /// The same for 64-bit code (`nop_module64`).
@@ -200,6 +202,7 @@ impl Engine {
             code_ranges: HashMap::default(),
             batch_of: HashMap::default(),
             batch_entries: HashMap::default(),
+            intrinsics: None,
             nop_index: 0,
             nop_index64: 0,
             x64: false,
@@ -1502,9 +1505,42 @@ pub fn translate_all<M: Machine>(m: &mut M, chunk: usize) -> Result<usize, Strin
     Ok(failed)
 }
 
+/// The table index of the wasm version of API `id`, if it has one (32-bit processes, not
+/// while tracing API calls; GMR_NO_INTRINSICS turns them off).
+fn intrinsic<M: Machine>(m: &mut M, id: u32) -> Option<u32> {
+    let e = m.engine_ref();
+    if e.trace || e.x64 {
+        return None;
+    }
+    if e.intrinsics.is_none() {
+        let mut map: HashMap<u32, u32, AddrHash> = HashMap::default();
+        if std::env::var_os("GMR_NO_INTRINSICS").is_none() {
+            let (wasm, names) = recomp::intrinsics(e.shared_memory);
+            let exports: Vec<String> = names.iter().map(|(_, x)| x.clone()).collect();
+            match m.instantiate(&wasm, &exports) {
+                Ok(ix) => {
+                    for ((api, _), i) in names.iter().zip(ix) {
+                        if let Some(id) = m.engine_ref().p.as_ref().and_then(|p| p.registry.lookup("msvcrt.dll", api)) {
+                            map.insert(id.0, i);
+                        }
+                    }
+                }
+                Err(err) => m.print(&format!("intrinsics rejected: {err}")),
+            }
+        }
+        m.engine().intrinsics = Some(map);
+    }
+    m.engine_ref().intrinsics.as_ref().and_then(|map| map.get(&id).copied())
+}
+
 pub fn resolve_addr<M: Machine>(m: &mut M, addr: u32) -> Result<u32, String> {
     // (API stubs first: most calls that get here are API calls)
     if let Some(id) = Process::stub_id(addr) {
+        // one done in wasm: the resolve cache keeps it, and the next calls stay in wasm
+        if let Some(i) = intrinsic(m, id.0) {
+            cache_resolved(m, addr, i);
+            return Ok(i);
+        }
         call_api(m, id);
         return Ok(nop_of(m.engine_ref()));
     }

@@ -162,6 +162,171 @@ pub fn redirects(entries: &[u32], shared_memory: bool) -> Output {
     Output { wasm: module.finish(), functions: out_funcs, unimplemented: Vec::new(), ranges: Vec::new() }
 }
 
+/// C runtime functions done in wasm instead of through the runtime (an extension that
+/// calls `abs` for every pixel spent most of its time getting there and back): each
+/// takes its cdecl arguments from the guest stack, leaves its result in eax and returns
+/// as an API call does (eip the return address, esp past it). A range that is not all
+/// in memory is left alone. Returns the module and (API name, export name) pairs.
+pub fn intrinsics(shared_memory: bool) -> (Vec<u8>, Vec<(&'static str, String)>) {
+    use wasm_encoder::{BlockType, Function, Instruction as W, MemArg};
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32; 8], [ValType::I32; 8]); // FUNC
+    let mut imports = ImportSection::new();
+    imports.import(
+        abi::CPU_MODULE,
+        abi::MEMORY_NAME,
+        EntityType::Memory(MemoryType { minimum: 0, maximum: if shared_memory { Some(65536) } else { None }, memory64: false, shared: shared_memory, page_size_log2: None }),
+    );
+    let eip = GLOBALS.iter().find(|g| matches!(g.0, abi::Global::Eip)).expect("eip");
+    imports.import(abi::CPU_MODULE, eip.1, EntityType::Global(GlobalType { val_type: ValType::I32, mutable: true, shared: false }));
+    let at = |off: u32| MemArg { offset: off as u64, align: 0, memory_index: 0 };
+    const ESP: u32 = 4;
+    const A: u32 = 8; // first argument, then B, C
+    const B: u32 = 9;
+    const C: u32 = 10;
+    // (args into A.., the body, then eax = local `ret`, the return)
+    let arg = |f: &mut Function, k: u32, to: u32| {
+        f.instruction(&W::LocalGet(ESP));
+        f.instruction(&W::I32Load(at(4 + 4 * k)));
+        f.instruction(&W::LocalSet(to));
+    };
+    // whether [a, a + n) lies in memory (i64: no wrapping)
+    let in_memory = |f: &mut Function, a: u32, n: u32| {
+        f.instruction(&W::LocalGet(a));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::LocalGet(n));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::I64Add);
+        f.instruction(&W::MemorySize(0));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::I64Const(16));
+        f.instruction(&W::I64Shl);
+        f.instruction(&W::I64LeU);
+    };
+    let finish = |f: &mut Function, ret: u32| {
+        f.instruction(&W::LocalGet(ret));
+        f.instruction(&W::LocalSet(0));
+        f.instruction(&W::LocalGet(ESP));
+        f.instruction(&W::I32Load(at(0)));
+        f.instruction(&W::GlobalSet(0));
+        f.instruction(&W::LocalGet(ESP));
+        f.instruction(&W::I32Const(4));
+        f.instruction(&W::I32Add);
+        f.instruction(&W::LocalSet(ESP));
+        for r in 0..8 {
+            f.instruction(&W::LocalGet(r));
+        }
+        f.instruction(&W::End);
+    };
+    let mut bodies: Vec<(&'static str, Function)> = Vec::new();
+    for name in ["abs", "labs"] {
+        let mut f = Function::new([(4, ValType::I32)]);
+        arg(&mut f, 0, A);
+        // (x ^ x >> 31) - (x >> 31)
+        f.instruction(&W::LocalGet(A));
+        f.instruction(&W::I32Const(31));
+        f.instruction(&W::I32ShrS);
+        f.instruction(&W::LocalSet(B));
+        f.instruction(&W::LocalGet(A));
+        f.instruction(&W::LocalGet(B));
+        f.instruction(&W::I32Xor);
+        f.instruction(&W::LocalGet(B));
+        f.instruction(&W::I32Sub);
+        f.instruction(&W::LocalSet(C));
+        finish(&mut f, C);
+        bodies.push((name, f));
+    }
+    {
+        // memset(d, v, n) -> d
+        let mut f = Function::new([(4, ValType::I32)]);
+        arg(&mut f, 0, A);
+        arg(&mut f, 1, B);
+        arg(&mut f, 2, C);
+        in_memory(&mut f, A, C);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(A));
+        f.instruction(&W::LocalGet(B));
+        f.instruction(&W::LocalGet(C));
+        f.instruction(&W::MemoryFill(0));
+        f.instruction(&W::End);
+        finish(&mut f, A);
+        bodies.push(("memset", f));
+    }
+    for name in ["memcpy", "memmove"] {
+        // (d, s, n) -> d
+        let mut f = Function::new([(4, ValType::I32)]);
+        arg(&mut f, 0, A);
+        arg(&mut f, 1, B);
+        arg(&mut f, 2, C);
+        in_memory(&mut f, A, C);
+        in_memory(&mut f, B, C);
+        f.instruction(&W::I32And);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(A));
+        f.instruction(&W::LocalGet(B));
+        f.instruction(&W::LocalGet(C));
+        f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        f.instruction(&W::End);
+        finish(&mut f, A);
+        bodies.push((name, f));
+    }
+    {
+        // strlen(s) -> the length (to the end of memory at most)
+        let mut f = Function::new([(4, ValType::I32)]);
+        arg(&mut f, 0, A);
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::LocalSet(C));
+        f.instruction(&W::MemorySize(0));
+        f.instruction(&W::I32Const(16));
+        f.instruction(&W::I32Shl);
+        f.instruction(&W::LocalSet(B)); // (the memory's end; 0 for 4 GB, never reached)
+        f.instruction(&W::Block(BlockType::Empty));
+        f.instruction(&W::Loop(BlockType::Empty));
+        f.instruction(&W::LocalGet(A));
+        f.instruction(&W::LocalGet(C));
+        f.instruction(&W::I32Add);
+        f.instruction(&W::LocalTee(A + 3));
+        f.instruction(&W::LocalGet(B));
+        f.instruction(&W::I32GeU);
+        f.instruction(&W::LocalGet(B));
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::I32Ne);
+        f.instruction(&W::I32And);
+        f.instruction(&W::BrIf(1));
+        f.instruction(&W::LocalGet(A + 3));
+        f.instruction(&W::I32Load8U(at(0)));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::BrIf(1));
+        f.instruction(&W::LocalGet(C));
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32Add);
+        f.instruction(&W::LocalSet(C));
+        f.instruction(&W::Br(0));
+        f.instruction(&W::End);
+        f.instruction(&W::End);
+        finish(&mut f, C);
+        bodies.push(("strlen", f));
+    }
+    let mut functions = FunctionSection::new();
+    let mut exports = ExportSection::new();
+    let mut code = CodeSection::new();
+    let mut names = Vec::new();
+    for (i, (name, f)) in bodies.iter().enumerate() {
+        functions.function(0);
+        let export = format!("crt_{name}");
+        exports.export(&export, ExportKind::Func, i as u32);
+        code.function(f);
+        names.push((*name, export));
+    }
+    let mut module = Module::new();
+    module.section(&types);
+    module.section(&imports);
+    module.section(&functions);
+    module.section(&exports);
+    module.section(&code);
+    (module.finish(), names)
+}
+
 impl<'m> Translator<'m> {
     pub fn new(mem: &'m dyn GuestMem, opts: Options) -> Self {
         Translator { mem, opts, cfgs: BTreeMap::new(), unimplemented: Vec::new(), cache: Default::default() }
