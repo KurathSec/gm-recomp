@@ -351,6 +351,11 @@ pub struct Process {
     pub acm: crate::hle::acm::Streams,
     /// The C runtime's file descriptors from 3 up (_open_osfhandle): their OS handles.
     pub crt_fds: Vec<u32>,
+    /// Open multimedia files (mmioOpen), and the next handle's number.
+    pub mmio: HashMap<u32, crate::hle::mmio::File>,
+    pub mmio_next: u32,
+    /// The DIB sections (CreateDIBSection), each with its color table.
+    pub dib_colors: HashMap<u32, Vec<u32>>,
     /// I/O completion ports (their handles are manual-reset events, set while packets
     /// wait): queued (bytes, key, OVERLAPPED*).
     pub ports: HashMap<u32, std::collections::VecDeque<(u32, u64, u64)>>,
@@ -542,6 +547,9 @@ impl Process {
             sockets: Default::default(),
             acm: Default::default(),
             crt_fds: Vec::new(),
+            dib_colors: HashMap::default(),
+            mmio: HashMap::default(),
+            mmio_next: 1,
             ports: HashMap::default(),
             httpdll: Default::default(),
             gdiplus: Default::default(),

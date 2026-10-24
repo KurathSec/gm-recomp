@@ -155,13 +155,48 @@ fn read_logfont(c: &Ctx, p: u32, wide: bool) -> GdiObject {
     GdiObject::Font { height, weight, face }
 }
 
+/// The bitmap selected into a memory DC.
+fn selected_bitmap(c: &Ctx, hdc: u32) -> Option<u32> {
+    match gdi(c, hdc) {
+        Some(GdiObject::Dc { bitmap, .. }) => Some(bitmap),
+        _ => None,
+    }
+}
+
 fn get_object(c: &mut Ctx, wide: bool) -> ApiResult {
     let h = c.arg(0);
+    let h_obj = h;
     let cb = c.arg(1);
     let buf = c.arg(2);
     let Some(o) = gdi(c, h) else { return ok(3, 0) };
     let bytes: Vec<u8> = match o {
         GdiObject::Font { height, weight, face } => logfont_bytes(height, weight, &face, wide),
+        // a DIB section: DIBSECTION when there is room for it (BITMAP, then the
+        // BITMAPINFOHEADER it was made with, color masks, section and offset)
+        GdiObject::Bitmap { w, h, bpp, bits, pitch } if cb >= 84 && c.p.dib_colors.contains_key(&h_obj) => {
+            let colors = c.p.dib_colors[&h_obj].len() as u32;
+            let mut v = Vec::new();
+            for x in [0, w, h.abs(), pitch as i32] {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            v.extend_from_slice(&1u16.to_le_bytes());
+            v.extend_from_slice(&(bpp as u16).to_le_bytes());
+            v.extend_from_slice(&bits.to_le_bytes());
+            for x in [40, w as u32, h as u32] {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            v.extend_from_slice(&1u16.to_le_bytes());
+            v.extend_from_slice(&(bpp as u16).to_le_bytes());
+            let masks: [u32; 3] = match bpp {
+                16 => [0x7C00, 0x03E0, 0x001F],
+                32 => [0xFF_0000, 0xFF00, 0xFF],
+                _ => [0; 3],
+            };
+            for x in [0, pitch * h.unsigned_abs(), 0, 0, colors, 0, masks[0], masks[1], masks[2], 0, 0] {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            v
+        }
         GdiObject::Bitmap { w, h, bpp, bits, pitch } => {
             let mut v = Vec::new();
             v.extend_from_slice(&0i32.to_le_bytes());
@@ -463,6 +498,7 @@ pub fn register(r: &mut Registry) {
             Some(Handle::Gdi(GdiObject::Dc { .. })) => false,
             Some(Handle::Gdi(_)) => {
                 c.p.handles.remove(&h);
+                c.p.dib_colors.remove(&h);
                 true
             }
             _ => false,
@@ -785,6 +821,16 @@ pub fn register(r: &mut Registry) {
         let ppv = c.arg(3);
         let (w, h, bpp) = read_bmi(c, bmi);
         let hb = new_bitmap(c, w, h, bpp.max(1), true);
+        // its color table: biClrUsed entries (all 2^bpp when 0) after the header
+        let colors = if bpp <= 8 {
+            let used = c.host.read_u32(bmi + 32).unwrap_or(0);
+            let n = if used == 0 || used > 1 << bpp { 1 << bpp } else { used };
+            let at = bmi + c.host.read_u32(bmi).unwrap_or(40);
+            (0..n).map(|i| c.host.read_u32(at + 4 * i).unwrap_or(0)).collect()
+        } else {
+            Vec::new()
+        };
+        c.p.dib_colors.insert(hb, colors);
         let bits = match gdi(c, hb) {
             Some(GdiObject::Bitmap { bits, .. }) => bits,
             _ => 0,
@@ -866,8 +912,29 @@ pub fn register(r: &mut Registry) {
     });
     r.add(g, "SetDIBitsToDevice", |c| ok(12, c.arg(5)));
     r.add(g, "StretchDIBits", |c| ok(13, c.arg(8)));
-    r.add(g, "GetDIBColorTable", |_c| ok(4, 0));
-    r.add(g, "SetDIBColorTable", |_c| ok(4, 0));
+    // (of the DIB section selected into the DC)
+    r.add(g, "GetDIBColorTable", |c| {
+        let (hdc, start, n, out) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        let table = selected_bitmap(c, hdc).and_then(|b| c.p.dib_colors.get(&b)).cloned().unwrap_or_default();
+        let got: Vec<u32> = table.iter().skip(start as usize).take(n as usize).copied().collect();
+        for (i, v) in got.iter().enumerate() {
+            let _ = c.host.write_u32(out + 4 * i as u32, *v);
+        }
+        ok(4, got.len() as u32)
+    });
+    r.add(g, "SetDIBColorTable", |c| {
+        let (hdc, start, n, src) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+        let new: Vec<u32> = (0..n).map(|i| c.host.read_u32(src + 4 * i).unwrap_or(0)).collect();
+        let Some(table) = selected_bitmap(c, hdc).and_then(|b| c.p.dib_colors.get_mut(&b)) else { return ok(4, 0) };
+        let mut set = 0;
+        for (i, v) in new.into_iter().enumerate() {
+            if let Some(slot) = table.get_mut(start as usize + i) {
+                *slot = v;
+                set += 1;
+            }
+        }
+        ok(4, set)
+    });
 
     // ---- drawing (no rasterisation in the harness) ---------------------------
     r.add(g, "BitBlt", |_c| ok(9, 1));
