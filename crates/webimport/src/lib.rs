@@ -27,6 +27,8 @@ pub struct Game {
     pub dirs: Vec<String>,
     /// Exes damaged by the Neshta virus that were put back together (`neshta`).
     pub neshta: Vec<String>,
+    /// Files whose data in the archive is damaged, left out (`damaged`).
+    pub damaged: Vec<String>,
 }
 
 fn u16le(d: &[u8], o: usize) -> Result<u16, String> {
@@ -72,8 +74,9 @@ fn safe_parts(name: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The zip's files and folders: (path parts, is a folder, contents).
-pub fn read_zip(z: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String> {
+/// The zip's files and folders: (path parts, is a folder, contents); and the files left out
+/// as their data is damaged (an exe that is fails it).
+pub fn read_zip(z: &[u8]) -> Result<(Vec<(Vec<String>, bool, Vec<u8>)>, Vec<String>), String> {
     let lowest = z.len().saturating_sub(22 + 65535);
     let eocd = (lowest..=z.len().saturating_sub(22)).rev().find(|&i| u32le(z, i) == Ok(0x0605_4b50)).ok_or("not a zip archive")?;
     let mut count = u16le(z, eocd + 10)? as u64;
@@ -86,6 +89,7 @@ pub fn read_zip(z: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String> {
         }
     }
     let mut out = Vec::new();
+    let mut damaged = Vec::new();
     let mut p = cd as usize;
     for _ in 0..count {
         if u32le(z, p)? != 0x0201_4b50 {
@@ -134,18 +138,23 @@ pub fn read_zip(z: &[u8]) -> Result<Vec<(Vec<String>, bool, Vec<u8>)>, String> {
         let start = l + 30 + u16le(z, l + 26)? as usize + u16le(z, l + 28)? as usize;
         let raw = z.get(start..start + csize as usize).ok_or("truncated zip")?;
         let data = match method {
-            0 => raw.to_vec(),
+            0 => Ok(raw.to_vec()),
             8 => {
                 let mut v = Vec::with_capacity(size as usize);
-                flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).map_err(|e| format!("{name}: {e}"))?;
-                v
+                flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).map(|_| v).map_err(|e| format!("{name}: {e}"))
             }
-            9 => nsis::inflate_with(raw, false, true).map_err(|e| format!("{name}: Deflate64: {e}"))?,
+            9 => nsis::inflate_with(raw, false, true).map_err(|e| format!("{name}: Deflate64: {e}")),
             m => return Err(format!("{name}: compression method {m} is not supported")),
         };
-        out.push((parts, false, data));
+        match data {
+            Ok(data) => out.push((parts, false, data)),
+            // (a damaged DLL or sound the game ships: the game may do without, or with the
+            // system's copy)
+            Err(_) if !name.to_lowercase().ends_with(".exe") => damaged.push(parts.join("/")),
+            Err(e) => return Err(e),
+        }
     }
-    Ok(out)
+    Ok((out, damaged))
 }
 
 /// A 7z archive's files and folders, as `read_zip` gives them.
@@ -265,6 +274,7 @@ fn is_lzh(data: &[u8]) -> bool {
 /// files with a single shared top folder stripped (its name is the title then), an
 /// IExpress package unwrapped.
 pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
+    let mut damaged = Vec::new();
     let entries = if archive.starts_with(b"7z\xbc\xaf\x27\x1c") {
         read_7z(archive)?
     } else if archive.starts_with(b"Rar!") {
@@ -274,12 +284,25 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     } else if archive.starts_with(b"MZ") {
         // a self-extracting zip, else a game released as its exe alone (GameMaker 8 keeps
         // the game data inside)
-        read_zip(archive).unwrap_or_else(|_| {
-            let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
-            vec![(vec![file.to_owned()], false, archive.to_vec())]
-        })
+        match read_zip(archive) {
+            Ok((entries, d)) => {
+                damaged = d;
+                entries
+            }
+            Err(_) => {
+                let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+                vec![(vec![file.to_owned()], false, archive.to_vec())]
+            }
+        }
     } else {
-        read_zip(archive)?
+        // (bytes in front of a zip, as an HTTP header an upload kept: its offsets count from
+        // its first entry)
+        let (entries, d) = read_zip(archive).or_else(|e| match archive.windows(4).position(|w| w == b"PK\x03\x04") {
+            Some(at) if at > 0 => read_zip(&archive[at..]).map_err(|_| e),
+            _ => Err(e),
+        })?;
+        damaged = d;
+        entries
     };
     let top = entries.first().map(|(p, _, _)| p[0].clone());
     let shared = top.filter(|t| entries.iter().all(|(p, is_dir, _)| &p[0] == t && (p.len() > 1 || *is_dir)));
@@ -318,7 +341,7 @@ pub fn import(archive: &[u8], name: &str) -> Result<Game, String> {
     }
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s).to_owned();
-    let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs, neshta: repaired };
+    let mut game = Game { title: shared.unwrap_or(stem), source: name.to_owned(), files, iexpress: None, dirs, neshta: repaired, damaged };
     // (the game's folder first: an IExpress package in a folder unwraps from there)
     game.reroot();
     game.iexpress = unwrap_iexpress(&mut game.files)?;
@@ -669,6 +692,9 @@ impl Game {
         if !self.neshta.is_empty() {
             m["neshta"] = json!(self.neshta);
         }
+        if !self.damaged.is_empty() {
+            m["damaged"] = json!(self.damaged);
+        }
         m
     }
 }
@@ -996,5 +1022,32 @@ mod tests {
         let damaged = [&original[..NESHTA_KEPT], &infected[NESHTA_KEPT..]].concat();
         assert_eq!(neshta(&damaged), Some(Ok(original.clone())));
         assert_eq!(neshta(&original), None);
+    }
+
+    /// A zip of (name, method, data as stored).
+    fn zip(entries: &[(&str, u16, &[u8])]) -> Vec<u8> {
+        let (mut z, mut cd) = (Vec::new(), Vec::new());
+        for &(name, method, data) in entries {
+            let at = z.len() as u32;
+            let sizes = [&(data.len() as u32).to_le_bytes()[..], &(data.len() as u32).to_le_bytes()].concat();
+            z.extend([&b"PK\x03\x04\x14\0\0\0"[..], &method.to_le_bytes(), &[0; 8], &sizes, &(name.len() as u16).to_le_bytes(), &[0; 2], name.as_bytes(), data].concat());
+            cd.extend([&b"PK\x01\x02\x14\0\x14\0\0\0"[..], &method.to_le_bytes(), &[0; 8], &sizes, &(name.len() as u16).to_le_bytes(), &[0; 12], &at.to_le_bytes(), name.as_bytes()].concat());
+        }
+        let (cd_at, cd_len, n) = (z.len() as u32, cd.len() as u32, entries.len() as u16);
+        z.extend(cd);
+        z.extend([&b"PK\x05\x06\0\0\0\0"[..], &n.to_le_bytes(), &n.to_le_bytes(), &cd_len.to_le_bytes(), &cd_at.to_le_bytes(), &[0; 2]].concat());
+        z
+    }
+
+    #[test]
+    fn damaged_zip() {
+        let mut exe = pe(0x1000, 0x1000);
+        exe[0x80..0x88].copy_from_slice(b"game.exe");
+        // a stray HTTP header in front, a DLL whose deflate data is garbage
+        let z = [&b"ion/octet-stream\r\n\r\n"[..], &zip(&[("game.exe", 0, &exe), ("bass.dll", 8, &[0xff; 16])])].concat();
+        let game = import(&z, "1.zip").unwrap();
+        assert_eq!(game.files.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["game.exe"]);
+        assert_eq!(game.damaged, ["bass.dll"]);
+        assert!(read_zip(&zip(&[("game.exe", 8, &[0xff; 16])])).is_err());
     }
 }
