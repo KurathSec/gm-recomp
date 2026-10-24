@@ -207,8 +207,8 @@ const DI8_METHODS: &[Method] = &[
 
 static DI8A: Interface = Interface { name: "IDirectInput8A", iids: &[IID_DI8A], methods: DI8_METHODS };
 static DI8W: Interface = Interface { name: "IDirectInput8W", iids: &[IID_DI8W], methods: DI8_METHODS };
-static DI8A_CLASS: [&Interface; 1] = [&DI8A];
-static DI8W_CLASS: [&Interface; 1] = [&DI8W];
+pub(crate) static DI8A_CLASS: [&Interface; 1] = [&DI8A];
+pub(crate) static DI8W_CLASS: [&Interface; 1] = [&DI8W];
 
 fn okn(c: &mut Ctx) -> ApiResult {
     ret(c, DI_OK)
@@ -484,8 +484,8 @@ static DEVICE_W: Interface = Interface {
     iids: &["{54D41081-DC15-4833-A41B-748F73A38179}"],
     methods: DEVICE_METHODS,
 };
-static DEVICE_A_CLASS: [&Interface; 1] = [&DEVICE_A];
-static DEVICE_W_CLASS: [&Interface; 1] = [&DEVICE_W];
+pub(crate) static DEVICE_A_CLASS: [&Interface; 1] = [&DEVICE_A];
+pub(crate) static DEVICE_W_CLASS: [&Interface; 1] = [&DEVICE_W];
 
 pub fn register(r: &mut Registry) {
     for i in [&DI8A, &DI8W, &DEVICE_A, &DEVICE_W] {

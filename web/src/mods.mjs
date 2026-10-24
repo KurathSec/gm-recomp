@@ -14,9 +14,19 @@ const modLoader = (e) => gm8(e) || gmsVm(e);
 
 /**
  * id: the mod (crates/gmmod `apply`); options: {key, label, type 'bool' | 'number' | 'text',
- * default, applies?}; files: what it needs from /mods/<id>/.
+ * default, applies?}; files: what it needs from /mods/<id>/. A `page` mod changes no files:
+ * the page around the game does it (player.mjs).
  */
 export const MODS = [
+  {
+    id: 'SaveStates',
+    name: 'Save states',
+    about: 'A key saves everything the game is at that moment, another goes back to it exactly (up to 10 states per game, kept in this browser only; F7 and F8 at first, a button opens the list).',
+    applies: (e) => !!e,
+    page: true,
+    options: [],
+    files: [],
+  },
   {
     id: 'debug',
     name: 'Debug mode',
@@ -89,6 +99,9 @@ export const MODS = [
     files: [],
   },
 ];
+
+/** A mod the page does, not the files (`page`). */
+export const pageMod = (id) => MODS.some((m) => m.id === id && m.page);
 
 export function modsFor(engine) {
   return MODS.filter((m) => m.applies(engine));

@@ -873,16 +873,23 @@ export class D3DGL {
     this.keyValid = false;
   }
 
-  /** The back buffer as a PNG (ArrayBuffer). */
-  async snapshot() {
+  /** The part of the back buffer last shown, read now: {w, h, px} (RGBA, rows top-down). */
+  grab() {
     this.flush();
     const gl = this.gl;
     const b = this.back;
+    if (!b) return null;
     const [sx, sy, sw, sh] = this.shown ?? [0, 0, b.w, b.h];
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, b.fbo);
     const px = new Uint8Array(sw * sh * 4);
     gl.readPixels(sx, sy, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, px);
     this.bindTarget(this.target, this.targetW, this.targetH);
+    return { w: sw, h: sh, px };
+  }
+
+  /** The back buffer as a PNG (ArrayBuffer). */
+  async snapshot() {
+    const { w: sw, h: sh, px } = this.grab();
     const c = new OffscreenCanvas(sw, sh);
     const img = new ImageData(new Uint8ClampedArray(px.buffer), sw, sh);
     // Rows are stored top-down already (D3D order); the frame is opaque.

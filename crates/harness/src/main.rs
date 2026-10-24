@@ -136,6 +136,10 @@ enum Cmd {
         /// The date the game sees, in Unix seconds (default a fixed one).
         #[arg(long)]
         epoch: Option<u64>,
+        /// Make or load a save state after a frame: frame:save:file or frame:load:file,
+        /// repeatable.
+        #[arg(long)]
+        state: Vec<String>,
     },
     /// Print a .wasm file as text (for inspecting failed modules).
     Wat { path: PathBuf },
@@ -180,7 +184,20 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, key, mouse, audio_out, replay, epoch } => {
+        Cmd::Run { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, key, mouse, audio_out, replay, epoch, state } => {
+            let states = state
+                .iter()
+                .map(|s| {
+                    let mut p = s.splitn(3, ':');
+                    let (f, op, path) = (p.next().unwrap_or(""), p.next().unwrap_or(""), p.next().unwrap_or(""));
+                    let op = match op {
+                        "save" => runtime::engine::StateOp::Save,
+                        "load" => runtime::engine::StateOp::Load,
+                        _ => anyhow::bail!("--state wants frame:save:file or frame:load:file"),
+                    };
+                    Ok((f.parse()?, op, PathBuf::from(path)))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let mouse = mouse
                 .iter()
                 .map(|k| {
@@ -205,7 +222,7 @@ fn main() -> Result<()> {
                     Ok((u32::from_str_radix(a.trim_start_matches("0x"), 16)?, u32::from_str_radix(l.trim_start_matches("0x"), 16)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, keys, mouse, audio_out, replay, epoch })
+            run::run(run::RunOpts { game_dir, exe, trace, frames, aot, max_api_calls, quiet, seconds, recent, dump, keep_writes, write_dir, dump_mem, keys, mouse, audio_out, replay, epoch, states })
         }
         Cmd::Wat { path } => {
             let bytes = std::fs::read(&path)?;

@@ -3,6 +3,7 @@
 //! their own). Every file is a view of guest memory, so buffered access (mmioGetInfo,
 //! mmioAdvance) hands out the whole file as the buffer.
 
+use serde::{Deserialize, Serialize};
 use super::{ApiResult, Ctx, Registry, Ret};
 
 fn ok(n: u32, v: u32) -> ApiResult {
@@ -10,7 +11,7 @@ fn ok(n: u32, v: u32) -> ApiResult {
 }
 
 /// An open file: its bytes in guest memory, the position, whether the buffer is ours.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct File {
     base: u32,
     size: u32,

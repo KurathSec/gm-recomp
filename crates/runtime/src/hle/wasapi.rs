@@ -29,6 +29,7 @@ const KSDATAFORMAT_SUBTYPE_PCM: &str = "{00000001-0000-0010-8000-00AA00389B71}";
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: &str = "{00000003-0000-0010-8000-00AA00389B71}";
 
 /// A shared-mode stream (one IAudioClient).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Stream {
     pub channels: u16,
     pub rate: u32,
@@ -144,14 +145,14 @@ static VOLUME: Interface = Interface {
     ],
 };
 
-static ENUMERATOR_CLASS: [&Interface; 1] = [&ENUMERATOR];
-static COLLECTION_CLASS: [&Interface; 1] = [&COLLECTION];
-static DEVICE_CLASS: [&Interface; 2] = [&DEVICE, &ENDPOINT];
-static PROPERTIES_CLASS: [&Interface; 1] = [&PROPERTIES];
-static CLIENT_CLASS: [&Interface; 1] = [&CLIENT];
-static RENDER_CLASS: [&Interface; 1] = [&RENDER];
-static CLOCK_CLASS: [&Interface; 1] = [&CLOCK];
-static VOLUME_CLASS: [&Interface; 1] = [&VOLUME];
+pub(crate) static ENUMERATOR_CLASS: [&Interface; 1] = [&ENUMERATOR];
+pub(crate) static COLLECTION_CLASS: [&Interface; 1] = [&COLLECTION];
+pub(crate) static DEVICE_CLASS: [&Interface; 2] = [&DEVICE, &ENDPOINT];
+pub(crate) static PROPERTIES_CLASS: [&Interface; 1] = [&PROPERTIES];
+pub(crate) static CLIENT_CLASS: [&Interface; 1] = [&CLIENT];
+pub(crate) static RENDER_CLASS: [&Interface; 1] = [&RENDER];
+pub(crate) static CLOCK_CLASS: [&Interface; 1] = [&CLOCK];
+pub(crate) static VOLUME_CLASS: [&Interface; 1] = [&VOLUME];
 
 fn ensure_registered(c: &mut Ctx) {
     if c.p.registry.lookup(com::DLL, "IMMDeviceEnumerator::QueryInterface").is_some() {

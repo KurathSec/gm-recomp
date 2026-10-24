@@ -33,6 +33,7 @@ pub mod user32;
 pub mod wasapi;
 pub mod winsock;
 
+use serde::{Deserialize, Serialize};
 use crate::mem::Guest;
 use crate::process::Process;
 use crate::fasthash::HashMap;
@@ -40,7 +41,7 @@ use crate::fasthash::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ApiId(pub u32);
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Regs {
     pub eax: u32,
     pub ecx: u32,
@@ -214,7 +215,7 @@ pub enum InputEvent {
 }
 
 /// A game controller as XInput and the joystick API report it.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct PadState {
     pub connected: bool,
     pub buttons: u16,
@@ -696,6 +697,64 @@ impl Registry {
     pub fn func(&self, id: ApiId) -> Option<ApiFn> {
         self.entries.get(id.0 as usize).and_then(|e| e.func)
     }
+
+    /// What a save state keeps of the registry (`RegistryState`).
+    pub fn state(&self) -> RegistryState {
+        let mut data_addr: Vec<((String, String), u32)> = self.data_addr.iter().map(|(k, &a)| (k.clone(), a)).collect();
+        data_addr.sort();
+        RegistryState {
+            names: self.entries.iter().map(|e| (e.dll.clone(), e.name.clone())).collect(),
+            data_addr,
+            data_next: self.data_next,
+            data_pending: self.data_pending.clone(),
+        }
+    }
+
+    /// The APIs both have agree (an id is a stub address the guest holds).
+    pub fn check(&self, s: &RegistryState) -> Result<(), String> {
+        for (i, (e, (dll, name))) in self.entries.iter().zip(&s.names).enumerate() {
+            if e.dll != *dll || e.name != *name {
+                return Err(format!("API {i} is {}!{} here but {dll}!{name} in the state (another version of the player)", e.dll, e.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// Makes the ids what they were in the state: APIs it named since start are named
+    /// again (`intern`), those named here since are dropped.
+    pub fn restore(&mut self, s: &RegistryState) -> Result<(), String> {
+        self.check(s)?;
+        while self.entries.len() > s.names.len() {
+            let id = self.entries.len() as u32 - 1;
+            let e = self.entries.pop().unwrap();
+            let key = (e.dll, e.name);
+            if self.by_name.get(&key) == Some(&ApiId(id)) {
+                self.by_name.remove(&key);
+            }
+            self.idle_ok.remove(&id);
+            self.math_fns.remove(&id);
+        }
+        for (i, (dll, name)) in s.names.iter().enumerate().skip(self.entries.len()) {
+            let id = self.intern(dll, name);
+            if id.0 as usize != i {
+                return Err(format!("{dll}!{name} cannot be API {i} again"));
+            }
+        }
+        self.data_addr = s.data_addr.iter().cloned().collect();
+        self.data_next = s.data_next;
+        self.data_pending = s.data_pending.clone();
+        Ok(())
+    }
+}
+
+/// The registry in a save state: each id's API (`dll`, `name`) and the exported
+/// variables handed out.
+#[derive(Serialize, Deserialize)]
+pub struct RegistryState {
+    pub names: Vec<(String, String)>,
+    pub data_addr: Vec<((String, String), u32)>,
+    pub data_next: u32,
+    pub data_pending: Vec<(u32, Vec<u8>)>,
 }
 
 /// Registers a batch of `(name, nargs, constant)` stubs that return a constant.
@@ -725,3 +784,31 @@ pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 pub const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 pub const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+
+/// Every COM class (its interfaces, primary first), for a save state to find its
+/// objects' classes again by their interfaces' names.
+pub(crate) fn com_classes() -> Vec<&'static [&'static com::Interface]> {
+    vec![
+        &com::WEBBROWSER,
+        &dinput::DI8A_CLASS,
+        &dinput::DI8W_CLASS,
+        &dinput::DEVICE_A_CLASS,
+        &dinput::DEVICE_W_CLASS,
+        &dmusic::SEGMENT_CLASS,
+        &dmusic::SEGMENT_STATE_CLASS,
+        &dmusic::AUDIOPATH_CLASS,
+        &dmusic::PATH_BUFFER_CLASS,
+        &dmusic::PERFORMANCE_CLASS,
+        &dmusic::LOADER_CLASS,
+        &dsound::DEVICE_CLASS,
+        &dsound::BUFFER_CLASS,
+        &wasapi::ENUMERATOR_CLASS,
+        &wasapi::COLLECTION_CLASS,
+        &wasapi::DEVICE_CLASS,
+        &wasapi::PROPERTIES_CLASS,
+        &wasapi::CLIENT_CLASS,
+        &wasapi::RENDER_CLASS,
+        &wasapi::CLOCK_CLASS,
+        &wasapi::VOLUME_CLASS,
+    ]
+}

@@ -16,7 +16,7 @@ const STATUS_OK: u32 = 0;
 const INVALID_PARAMETER: u32 = 2;
 const NOT_IMPLEMENTED: u32 = 6;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct State {
     next: u32,
     /// font -> em size in pixels

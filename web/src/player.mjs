@@ -18,6 +18,8 @@ const GAME_KEYS = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|D
  * @param {Record<string, () => void>} [o.pageKeys]  keys the page handles itself, never sent to the game
  * @param {number} [o.epoch]  the date the game sees (Unix seconds; default now)
  * @param {boolean} [o.persist]  keep the game's saves in this browser (default true)
+ * @param {boolean} [o.saveStates]  save states (state-store.mjs): the returned `states`
+ *   saves and loads them (statepanel.mjs is a page's list of them)
  * Test and diagnosis options, as worker.mjs takes them: frames, pace, pacing, ahead, script,
  * capture, monitor, replay, slowMs, useProfile.
  * Callbacks: onLog(line), onSize(w, h) (the game's resolution), onStats(stats),
@@ -27,7 +29,8 @@ const GAME_KEYS = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|D
  * 'question' or 'error' (GameMaker 8's runtime error: Ignore or Abort): resolve to the text,
  * '' for OK, Yes or Ignore, null to cancel, for No or Abort; the browser's
  * alert/prompt/confirm without it).
- * @returns {{worker: Worker, setKeymap(map): void, soundStats(): Promise<string | null>, stop(): void}}
+ * onStateStored(slot, error) (a save state is in the browser's storage, or could not be).
+ * @returns {{worker: Worker, setKeymap(map): void, soundStats(): Promise<string | null>, stop(): void, states: object | null}}
  */
 export function playGame(o) {
   const { game, local = false, canvas, modChoices = {}, pageKeys = {} } = o;
@@ -118,6 +121,8 @@ export function playGame(o) {
     else if (data.type === 'capture') o.onCapture?.(data.frame, data.png);
     else if (data.type === 'saved') o.onSaved?.();
     else if (data.type === 'prompt') answerPrompt(data);
+    else if (data.type === 'state') stateReply(data);
+    else if (data.type === 'state-stored') o.onStateStored?.(data.slot, data.ok ? null : data.error);
     else if (data.type === 'done') o.onDone?.(data.status);
   };
   w.onerror = (e) => {
@@ -144,6 +149,42 @@ export function playGame(o) {
     Atomics.store(ringIdx, 0, (wr + 1) | 0);
   };
 
+  // Save states: the store worker keeps them; the game's worker makes and loads them,
+  // and reaches the store through a port of its own.
+  let store = null;
+  let statePort = null;
+  let seq = 0;
+  const calls = new Map();
+  const answer = (r) => {
+    const c = calls.get(r.id);
+    calls.delete(r.id);
+    if (r.ok) c?.resolve(r.result);
+    else c?.reject(new Error(r.error));
+  };
+  const call = (target, msg) =>
+    new Promise((resolve, reject) => {
+      const id = ++seq;
+      calls.set(id, { resolve, reject });
+      target.postMessage({ ...msg, id });
+    });
+  const stateReply = answer;
+  if (o.saveStates) {
+    store = new Worker(new URL('./state-store.mjs', import.meta.url), { type: 'module' });
+    store.onmessage = ({ data }) => answer(data);
+    const ch = new MessageChannel();
+    store.postMessage({ op: 'port', port: ch.port1 }, [ch.port1]);
+    statePort = ch.port2;
+  }
+  const states = store && {
+    /** The game's states: [{slot, time, bytes, stored, thumb (Blob | null)}]. */
+    list: () => call(store, { op: 'list', game }),
+    /** Saves the game as it is at the end of its next frame into `slot` (resolves once made). */
+    save: (slot) => call(w, { type: 'state', op: 'save', slot }),
+    /** Goes back to the state in `slot`. */
+    load: (slot) => call(w, { type: 'state', op: 'load', slot }),
+    remove: (slot) => call(store, { op: 'delete', game, slot }),
+  };
+
   const offscreen = canvas.transferControlToOffscreen();
   w.postMessage(
     {
@@ -164,8 +205,9 @@ export function playGame(o) {
       inputRing,
       useProfile: o.useProfile ?? true,
       modChoices,
+      statePort,
     },
-    [offscreen],
+    statePort ? [offscreen, statePort] : [offscreen],
   );
 
   // Input goes to the worker as it happens; the runtime applies it at the guest's next
@@ -248,11 +290,13 @@ export function playGame(o) {
       keymap = map ?? {};
     },
     soundStats,
+    states,
     /** Stops the game and the page's listeners. */
     stop() {
       stopped = true;
       for (const off of listeners) off();
       w.terminate();
+      store?.terminate();
       audioNode?.context.close().catch(() => {});
     },
   };

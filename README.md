@@ -118,6 +118,14 @@ engine allows.
   - GodMode, CrimsonKid and DotKid;
   - DbgHelper: gm8x_fix's patches on GameMaker 8, the sleep margin on GameMaker: Studio;
   - AllowFullscreen, on GameMaker 8 only.
+- **Save states** (every engine) are done by the page, not in the game's files: one key
+  (F7 at first) saves everything the process is at that moment, another (F8) goes back
+  to it exactly. Up to 10 per game are kept in this browser (IndexedDB, compressed); the
+  **States** button lists them. The runtime (`crates/runtime/src/state.rs`) takes and
+  restores a state at the end of a frame: guest memory, the registers, and the emulated
+  Windows state (`Process`, serialized with serde), then rebuilds the GPU's textures and
+  shaders and reopens MCI music. A state loads into a later session too, and is refused
+  by a player whose state layout differs.
 - **Play online** (GameMaker 8): [I wanna play online 1.2.3](https://github.com/Pardocaninacting/i-wanna-play-online-1.2.3)'s
   converter runs in the page and changes the game before it starts: the others playing the
   same game show up, with chat and their saves. Its `http_dll_2_3.dll` is replaced by a port
@@ -168,6 +176,7 @@ The page around it decides the rest: layout, buttons, where saves go. Other modu
 - `import.mjs`: importing an archive.
 - `saves.mjs`: saves in IndexedDB, and exporting them.
 - `mods.mjs`: mod choices.
+- `statepanel.mjs`: the save-state list over a game (with `playGame`'s `saveStates`; `state-store.mjs` keeps the states).
 
 The modules find their files by relative paths. `web/tools/bundle.sh <dir>` collects everything into one directory, which can be served under any path:
 - the modules;
@@ -247,6 +256,10 @@ There are also test tools:
   (`game=zz-test-d3d9-shaders`).
 - `tests/gms/` has tools for GMS `data.win` files: a room lister, a rough GML bytecode
   lister, and test copies with patched bytecode.
+- `harness run … --state <frame>:save:<file>` and `--state <frame>:load:<file>` make and
+  load save states. A state made at frame F of one run and loaded into another should
+  continue exactly: saving another state some frames later in both runs gives the same
+  memory.
 
 ## Documentation
 

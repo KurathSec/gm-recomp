@@ -78,6 +78,23 @@ unsafe extern "C" {
     fn audio_push(samples: *const f32, len: usize, rate: u32);
 }
 
+// Save states (runtime::state): the page keeps them; guest memory goes to and from
+// them in JS (web/src/host.mjs), not through this module's memory.
+#[link(wasm_import_module = "host")]
+unsafe extern "C" {
+    /// A state was made: its meta part, and guest memory over `ranges` (address, length
+    /// pairs) for JS to copy before this returns.
+    fn state_saved(meta: *const u8, meta_len: usize, ranges: *const u32, nranges: usize);
+    /// The meta part of the state to load: its length (-1: none), then the copy.
+    fn state_meta_len() -> i32;
+    fn state_meta_copy(out: *mut u8);
+    /// Zeroes `clear` (address, length pairs), then writes the state's memory. 1 on success.
+    fn state_memory(clear: *const u32, nclear: usize) -> i32;
+    /// The guest's clock (ms) went to the state's.
+    fn state_loaded(clock_ms: f64);
+    fn state_failed(why: *const u8, len: usize);
+}
+
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
     /// Changed files, serialized as by `WebSaves`.
@@ -474,6 +491,32 @@ impl Machine for Web {
         let mut v = vec![0u8; n as usize];
         unsafe { system_dll_copy(v.as_mut_ptr()) };
         Some(v)
+    }
+    fn state_saved(&mut self, meta: &[u8], ranges: &[(u32, u32)]) {
+        let flat: Vec<u32> = ranges.iter().flat_map(|&(a, n)| [a, n]).collect();
+        unsafe { state_saved(meta.as_ptr(), meta.len(), flat.as_ptr(), ranges.len()) }
+    }
+    fn state_meta(&mut self) -> Option<Vec<u8>> {
+        let n = unsafe { state_meta_len() };
+        if n < 0 {
+            return None;
+        }
+        let mut v = vec![0u8; n as usize];
+        unsafe { state_meta_copy(v.as_mut_ptr()) };
+        Some(v)
+    }
+    fn state_memory(&mut self, clear: &[(u32, u32)]) -> Result<(), String> {
+        let flat: Vec<u32> = clear.iter().flat_map(|&(a, n)| [a, n]).collect();
+        // (memory may have grown for the state's ranges)
+        state().guest_bytes = (glue().size)() as u64 * 65536;
+        if unsafe { state_memory(flat.as_ptr(), clear.len()) } == 1 { Ok(()) } else { Err("the state's memory could not be written".into()) }
+    }
+    fn state_loaded(&mut self) {
+        let ms = self.engine_ref().process().clock_us as f64 / 1000.0;
+        unsafe { state_loaded(ms) }
+    }
+    fn state_failed(&mut self, why: &str) {
+        unsafe { state_failed(why.as_ptr(), why.len()) }
     }
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         let st = state();
@@ -952,6 +995,20 @@ pub extern "C" fn replay_push(kind: u32, frame: f64, clock_us: f64, a: i32, b: i
 pub extern "C" fn set_monitor(on: u32) {
     if let Some(e) = state().engine.as_mut() {
         e.monitor = on != 0;
+    }
+}
+
+/// Makes (`op` 1) or loads (2) a save state at the end of the next frame the game
+/// shows (runtime::state); the host's `state_*` imports do the rest.
+#[unsafe(no_mangle)]
+pub extern "C" fn state_request(op: u32) {
+    if let Some(e) = state().engine.as_mut() {
+        e.state_op = match op {
+            1 => Some(engine::StateOp::Save),
+            2 => Some(engine::StateOp::Load),
+            _ => None,
+        };
+        e.state_tries = 0;
     }
 }
 

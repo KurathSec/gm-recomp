@@ -5,6 +5,7 @@
 //! their D3D object and uploaded from guest memory when first used after a change.
 //!
 //! The browser implements [`Gpu`] with WebGL2; the harness uses the no-op default.
+use serde::{Deserialize, Serialize};
 
 /// D3DRENDERSTATETYPE indices used by the hosts.
 pub mod rs {
@@ -178,7 +179,9 @@ pub struct NullGpu;
 impl Gpu for NullGpu {}
 
 /// Direct3D 8 device state.
+#[derive(Serialize, Deserialize)]
 pub struct DeviceState {
+    #[serde(with = "crate::state::big_array")]
     pub rs: [u32; 256],
     pub tss: [[u32; TSS_COUNT]; STAGES],
     pub textures: [u32; STAGES],

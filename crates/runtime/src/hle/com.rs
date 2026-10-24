@@ -98,6 +98,11 @@ fn vtable(c: &mut Ctx, i: &'static Interface) -> u32 {
     v
 }
 
+/// The COM class whose interfaces have these names (a save state names them).
+pub fn class_of(names: &[String]) -> Option<&'static [&'static Interface]> {
+    super::com_classes().into_iter().find(|c| c.len() == names.len() && c.iter().zip(names).all(|(i, n)| i.name == n))
+}
+
 /// Creates an object exposing `ifaces` (the first is the primary interface).
 /// Returns the pointer of the primary interface.
 pub fn create(c: &mut Ctx, kind: &'static str, ifaces: &'static [&'static Interface], data: HashMap<&'static str, u32>) -> u32 {
@@ -520,7 +525,7 @@ static WEB_BROWSER2: Interface = Interface {
     },
 };
 
-static WEBBROWSER: [&Interface; 6] = [&OLE_OBJECT, &PERSIST_STREAM_INIT, &OLE_CONTROL, &OLE_IN_PLACE_OBJECT, &WEB_BROWSER2, &OLE_IN_PLACE_ACTIVE_OBJECT];
+pub(crate) static WEBBROWSER: [&Interface; 6] = [&OLE_OBJECT, &PERSIST_STREAM_INIT, &OLE_CONTROL, &OLE_IN_PLACE_OBJECT, &WEB_BROWSER2, &OLE_IN_PLACE_ACTIVE_OBJECT];
 
 /// (CLSID, object kind, interfaces) of every class CoCreateInstance can make.
 static CLASSES: [(&str, &str, &[&Interface]); 3] = [

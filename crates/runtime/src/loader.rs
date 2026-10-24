@@ -1,11 +1,12 @@
 //! Maps PE images into guest memory, applies relocations and binds imports to
 //! HLE stubs or to exports of other loaded images.
 
+use serde::{Deserialize, Serialize};
 use crate::mem::{Guest, PAGE_EXECUTE_READWRITE, Vm};
 use pe::{ImportName, Pe};
 use crate::fasthash::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedModule {
     pub name: String,
     pub path: String,
@@ -20,7 +21,9 @@ pub struct LoadedModule {
     pub forwards: HashMap<String, (String, String)>,
     /// VA ranges that hold code (for discovery/translation).
     pub code_ranges: Vec<(u32, u32)>,
-    /// File bytes (kept for discovery).
+    /// File bytes (kept for discovery). Not in save states: a loaded state takes them
+    /// from the running process's modules or the file system (`crate::state`).
+    #[serde(skip)]
     pub file: Vec<u8>,
     pub tls_callbacks: Vec<u32>,
     pub tls_index_va: u32,

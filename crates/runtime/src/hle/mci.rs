@@ -3,6 +3,7 @@
 //! and MIDI elements play through the mixer on the virtual clock; positions, lengths
 //! and MM_MCINOTIFY follow that clock. MIDI goes through the SoundFont synthesizer.
 
+use serde::{Deserialize, Serialize};
 use super::audio::{self, Pcm, Source};
 use super::{ApiResult, Ctx, Ret};
 use std::cell::RefCell;
@@ -49,10 +50,12 @@ fn ok(nargs: u32, v: u32) -> ApiResult {
     Ok(Ret::stdcall(nargs, v))
 }
 
-/// An open device.
+/// An open device. In a save state without its media, which `reopen` finds again.
+#[derive(Serialize, Deserialize)]
 pub struct McDevice {
     pub element: String,
     pub alias: String,
+    #[serde(skip, default = "no_media")]
     pub media: Rc<Media>,
     pub mode: u32,
     /// Position in source frames (fractional) and when it was last advanced.
@@ -67,7 +70,25 @@ pub struct McDevice {
     pub volume: u32,
     pub time_format: u32,
     /// MIDI elements: the synthesizer playing them.
+    #[serde(skip)]
     pub midi: Option<Box<super::midi::MidiPlayer>>,
+}
+
+fn no_media() -> Rc<Media> {
+    Rc::new(Media::new(Pcm::default(), Some(0), None))
+}
+
+/// After a save state loaded: each device's media again (decoded anew or from
+/// `Process::mci_media`). A MIDI play starts over, as after a seek.
+pub fn reopen(p: &mut crate::process::Process) {
+    let elements: Vec<(u32, String)> = p.mci.iter().map(|(&id, d)| (id, d.element.clone())).collect();
+    for (id, element) in elements {
+        let media = if element.is_empty() { None } else { load_media_in(p, &element) };
+        if let Some(d) = p.mci.get_mut(&id) {
+            d.media = media.unwrap_or_else(no_media);
+            d.midi = None;
+        }
+    }
 }
 
 /// Decoded media: a sound, or a MIDI file's length.
@@ -212,16 +233,20 @@ fn open_compressed(bytes: Vec<u8>) -> Result<Media, String> {
 
 /// Opens (and decodes, once per file) an element.
 fn load_media(c: &mut Ctx, element: &str) -> Option<Rc<Media>> {
-    let key = c.p.vpath(element);
-    if let Some(m) = c.p.mci_media.get(&key) {
+    load_media_in(c.p, element)
+}
+
+fn load_media_in(p: &mut crate::process::Process, element: &str) -> Option<Rc<Media>> {
+    let key = p.vpath(element);
+    if let Some(m) = p.mci_media.get(&key) {
         return Some(m.clone());
     }
-    let bytes = c.p.fs.read_all(&key)?;
+    let bytes = p.fs.read_all(&key)?;
     let media = if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
         match audio::parse_wav(&bytes) {
             Ok(pcm) => Media::new(pcm, None, None),
             Err(e) => {
-                c.p.log(format!("MCI: {element}: {e}"));
+                p.log(format!("MCI: {element}: {e}"));
                 Media::new(Pcm::default(), Some(0), None)
             }
         }
@@ -232,13 +257,13 @@ fn load_media(c: &mut Ctx, element: &str) -> Option<Rc<Media>> {
         match open_compressed(bytes) {
             Ok(m) => m,
             Err(e) => {
-                c.p.log(format!("MCI: {element}: cannot decode ({e})"));
+                p.log(format!("MCI: {element}: cannot decode ({e})"));
                 Media::new(Pcm::default(), Some(0), None)
             }
         }
     };
     let m = Rc::new(media);
-    c.p.mci_media.insert(key, m.clone());
+    p.mci_media.insert(key, m.clone());
     Some(m)
 }
 

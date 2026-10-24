@@ -358,7 +358,7 @@ pub static SEGMENT8: Interface = Interface {
     ],
 };
 
-pub static SEGMENT_CLASS: [&Interface; 1] = [&SEGMENT8];
+pub(crate) static SEGMENT_CLASS: [&Interface; 1] = [&SEGMENT8];
 
 pub static SEGMENT_STATE8: Interface = Interface {
     name: "IDirectMusicSegmentState8",
@@ -382,7 +382,7 @@ pub static SEGMENT_STATE8: Interface = Interface {
     ],
 };
 
-static SEGMENT_STATE_CLASS: [&Interface; 1] = [&SEGMENT_STATE8];
+pub(crate) static SEGMENT_STATE_CLASS: [&Interface; 1] = [&SEGMENT_STATE8];
 
 // ---- IDirectMusicAudioPath8 and its buffer ---------------------------------------------------
 
@@ -430,7 +430,7 @@ pub static AUDIOPATH8: Interface = Interface {
     ],
 };
 
-pub static AUDIOPATH_CLASS: [&Interface; 1] = [&AUDIOPATH8];
+pub(crate) static AUDIOPATH_CLASS: [&Interface; 1] = [&AUDIOPATH8];
 
 /// The audio path's secondary buffer: volume, pan and frequency of what the path plays.
 fn pb_set(key: &'static str) -> impl Fn(&mut Ctx) -> ApiResult {
@@ -480,7 +480,7 @@ static PATH_BUFFER8: Interface = Interface {
     ],
 };
 
-static PATH_BUFFER_CLASS: [&Interface; 1] = [&PATH_BUFFER8];
+pub(crate) static PATH_BUFFER_CLASS: [&Interface; 1] = [&PATH_BUFFER8];
 
 // ---- IDirectMusicPerformance8 -------------------------------------------------------------
 
@@ -709,8 +709,8 @@ pub static PERFORMANCE8: Interface = Interface {
     ],
 };
 
-pub static PERFORMANCE_CLASS: [&Interface; 1] = [&PERFORMANCE8];
-pub static LOADER_CLASS: [&Interface; 1] = [&LOADER8];
+pub(crate) static PERFORMANCE_CLASS: [&Interface; 1] = [&PERFORMANCE8];
+pub(crate) static LOADER_CLASS: [&Interface; 1] = [&LOADER8];
 
 pub fn register(r: &mut Registry) {
     for i in [&SEGMENT8, &SEGMENT_STATE8, &AUDIOPATH8, &PATH_BUFFER8] {

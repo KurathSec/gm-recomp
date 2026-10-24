@@ -3,12 +3,77 @@
 import { asset } from './asset.mjs';
 import { GL_OPTIONS } from './gpu.mjs';
 import { runGame } from './host.mjs';
-import { applyMods, selectedMods } from './mods.mjs';
+import { applyMods, pageMod, selectedMods } from './mods.mjs';
 import { KEYS } from './keys.mjs';
 import { applySaves, loadGame, loadProfile, loadSaves, openSaves, storeProfile, storeSaves } from './saves.mjs';
 
 let input = null;
 const early = [];
+
+// Save states (state-store.mjs keeps them; the page asks with {type: 'state', id, op:
+// 'save' | 'load', slot} and hears {type: 'state', id, ok, error?}, and for a save once more
+// {type: 'state-stored', slot, ok, error?}).
+let game = null;
+let store = null;
+let storeSeq = 0;
+const storeCalls = new Map();
+const storeCall = (msg, transfer = []) =>
+  new Promise((resolve, reject) => {
+    const id = ++storeSeq;
+    storeCalls.set(id, { resolve, reject });
+    store.postMessage({ ...msg, id }, transfer);
+  });
+
+/** A small picture of the frame a state was made at (WebP where the browser makes it). */
+async function thumbnail(frame) {
+  if (!frame || typeof OffscreenCanvas !== 'function') return null;
+  const img = new ImageData(new Uint8ClampedArray(frame.px.buffer), frame.w, frame.h);
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+  const full = new OffscreenCanvas(frame.w, frame.h);
+  full.getContext('2d').putImageData(img, 0, 0);
+  const s = Math.min(1, 240 / frame.w);
+  const small = new OffscreenCanvas(Math.max(1, Math.round(frame.w * s)), Math.max(1, Math.round(frame.h * s)));
+  const g = small.getContext('2d');
+  g.imageSmoothingEnabled = s < 1;
+  g.drawImage(full, 0, 0, small.width, small.height);
+  return small.convertToBlob({ type: 'image/webp', quality: 0.85 });
+}
+
+/** `p`, or a rejection once the game shows no frame for a while (a dialog is open). */
+function soon(p) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      input.state.cancel();
+      reject(new Error('the game shows no frames now'));
+    }, 5000);
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
+async function handleState({ id, op, slot }) {
+  const reply = (r) => self.postMessage({ type: 'state', id, ...r });
+  if (!input?.state || !store) return reply({ ok: false, error: input ? 'save states are off' : 'the game has not started yet' });
+  try {
+    if (op === 'save') {
+      const st = await soon(input.state.save());
+      reply({ ok: true });
+      const time = Date.now();
+      const thumb = await thumbnail(st.frame).catch(() => null);
+      const state = { meta: st.meta, pages: st.pages, chunks: st.chunks };
+      storeCall({ op: 'put', game, slot, time, thumb, state }, [st.meta.buffer, st.pages.buffer, ...st.chunks.map((c) => c.buffer)]).then(
+        () => self.postMessage({ type: 'state-stored', slot, ok: true }),
+        (e) => self.postMessage({ type: 'state-stored', slot, ok: false, error: String(e?.message ?? e) }),
+      );
+    } else if (op === 'load') {
+      const state = await storeCall({ op: 'get', game, slot });
+      await soon(input.state.load(state));
+      reply({ ok: true });
+    } else reply({ ok: false, error: `unknown op ${op}` });
+  } catch (e) {
+    reply({ ok: false, error: String(e?.message ?? e) });
+  }
+}
 
 function handleInput(data) {
   if (!input) return early.push(data);
@@ -25,7 +90,18 @@ function handleInput(data) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
-  const { game, frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false, modChoices = {} } = data;
+  if (data.type === 'state') return handleState(data);
+  if (data.statePort) {
+    store = data.statePort;
+    store.onmessage = ({ data: r }) => {
+      const c = storeCalls.get(r.id);
+      storeCalls.delete(r.id);
+      if (r.ok) c?.resolve(r.result);
+      else c?.reject(new Error(r.error));
+    };
+  }
+  game = data.game;
+  const { frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false, modChoices = {} } = data;
   if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
@@ -68,10 +144,11 @@ self.onmessage = async ({ data }) => {
     // the folders the game comes with empty (a save folder), as paths ending in '/'
     for (const d of manifest.dirs ?? []) downloaded.push([`${d}/`, new Uint8Array(0), 0]);
     // The mods chosen for the game change its files before the saves go on top.
-    const mods = selectedMods(modChoices, manifest.engine);
+    const chosen = selectedMods(modChoices, manifest.engine);
     for (const id of Object.keys(modChoices)) {
-      if (modChoices[id]?.on && !mods.some((m) => m.id === id)) post(`mod ${id}: does not work with this game's engine, left out`);
+      if (modChoices[id]?.on && !chosen.some((m) => m.id === id)) post(`mod ${id}: does not work with this game's engine, left out`);
     }
+    const mods = chosen.filter((m) => !pageMod(m.id));
     if (mods.length) {
       const t = performance.now();
       downloaded = await applyMods(downloaded, manifest, mods, post);

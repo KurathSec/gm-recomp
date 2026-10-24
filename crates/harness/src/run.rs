@@ -8,7 +8,7 @@ use recomp::abi::{self, GLOBALS, Global as G, RT_FUNCS};
 use runtime::engine::{self, Engine, Machine};
 use runtime::mem::Fault;
 use runtime::{Guest, Process};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use wasmtime::{
     AsContext, AsContextMut, Caller, Config, Extern, Func, Global, GlobalType, Linker, Memory, MemoryType, Module, Mutability,
@@ -48,6 +48,8 @@ pub struct RunOpts {
     /// A session recorded by the page's monitor mode, replayed.
     pub replay: Option<PathBuf>,
     pub epoch: Option<u64>,
+    /// Save states to make or load: (after frame, what, file).
+    pub states: Vec<(u64, runtime::engine::StateOp, PathBuf)>,
 }
 
 /// What a monitor log holds for a replay.
@@ -131,6 +133,27 @@ struct Hd {
     /// GMR_PROFILE=<ms>: translated functions sampled every <ms> ms (from the wasm stack
     /// at epoch ticks), as the innermost one and as anywhere on the stack.
     samples: Option<(std::collections::HashMap<String, u64>, std::collections::HashMap<String, u64>)>,
+    /// Save states not asked for yet, by frame, and the file of the one asked for.
+    states: Vec<(u64, runtime::engine::StateOp, PathBuf)>,
+    state_file: Option<PathBuf>,
+}
+
+/// A harness save state: u32 meta length, meta, u32 range count, (address, length)
+/// pairs, then the ranges' bytes.
+fn read_state(path: &Path) -> Option<(Vec<u8>, Vec<(u32, u32)>, Vec<u8>)> {
+    let b = std::fs::read(path).ok()?;
+    let u = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    let n = u(0)? as usize;
+    let meta = b.get(4..4 + n)?.to_vec();
+    let mut o = 4 + n;
+    let count = u(o)? as usize;
+    o += 4;
+    let mut ranges = Vec::new();
+    for _ in 0..count {
+        ranges.push((u(o)?, u(o + 4)?));
+        o += 8;
+    }
+    Some((meta, ranges, b[o..].to_vec()))
 }
 
 /// Store and Caller both give direct access to their data.
@@ -311,7 +334,54 @@ impl<C: Cx> Machine for Wt<'_, C> {
     fn print(&mut self, s: &str) {
         eprintln!("{s}");
     }
+    fn state_saved(&mut self, meta: &[u8], ranges: &[(u32, u32)]) {
+        let Some(path) = self.cx.hd_ref().state_file.clone() else { return };
+        let mut out = Vec::new();
+        out.extend((meta.len() as u32).to_le_bytes());
+        out.extend(meta);
+        out.extend((ranges.len() as u32).to_le_bytes());
+        for &(a, n) in ranges {
+            out.extend(a.to_le_bytes());
+            out.extend(n.to_le_bytes());
+        }
+        for &(a, n) in ranges {
+            let mut buf = vec![0u8; n as usize];
+            let _ = self.read(a, &mut buf);
+            out.extend(buf);
+        }
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("save state: {}: {e}", path.display());
+        }
+    }
+    fn state_meta(&mut self) -> Option<Vec<u8>> {
+        let path = self.cx.hd_ref().state_file.clone()?;
+        read_state(&path).map(|s| s.0)
+    }
+    fn state_memory(&mut self, clear: &[(u32, u32)]) -> Result<(), String> {
+        let path = self.cx.hd_ref().state_file.clone().ok_or("no state file")?;
+        let (_, ranges, bytes) = read_state(&path).ok_or("unreadable state file")?;
+        // (memory past what is mapped is zero already)
+        let mapped = self.cpu.memory.data_size(&*self.cx) as u64;
+        for &(a, n) in clear {
+            let end = (a as u64 + n as u64).min(mapped);
+            if end > a as u64 {
+                self.fill(a, (end - a as u64) as u32, 0).map_err(|e| e.to_string())?;
+            }
+        }
+        let mut o = 0usize;
+        for (a, n) in ranges {
+            self.write(a, &bytes[o..o + n as usize]).map_err(|e| e.to_string())?;
+            o += n as usize;
+        }
+        Ok(())
+    }
     fn take_input(&mut self, frame: u64, clock_us: u64) -> Vec<runtime::InputEvent> {
+        if let Some(i) = self.cx.hd_ref().states.iter().position(|s| s.0 <= frame) {
+            let hd = self.cx.hd();
+            let (_, op, path) = hd.states.remove(i);
+            hd.state_file = Some(path);
+            hd.engine.state_op = Some(op);
+        }
         if let Some(limit) = self.cx.hd_ref().frame_ms {
             let now = self.cx.hd_ref().t0.elapsed().as_micros() as u64;
             let hd = self.cx.hd();
@@ -487,7 +557,7 @@ pub fn run(opts: RunOpts) -> Result<()> {
         eng.probes = w.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
     }
 
-    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0), net: Default::default(), samples: profile_ms.map(|_| Default::default()) });
+    let mut store = Store::new(&wt_engine, Hd { engine: eng, linker: None, t0: Instant::now(), keys: opts.keys.clone(), mouse: opts.mouse.clone(), replay: session.input, soundfont_given: false, frame_ms: std::env::var("GMR_FRAME_MS").ok().and_then(|v| v.parse().ok()), frame_mark: (0, 0, 0, 0, 0, 0, 0), net: Default::default(), samples: profile_ms.map(|_| Default::default()), states: opts.states.clone(), state_file: None });
     store.set_epoch_deadline(1);
     if profile_ms.is_some() {
         let secs = opts.seconds;

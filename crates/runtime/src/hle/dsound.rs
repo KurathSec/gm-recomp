@@ -456,8 +456,8 @@ static SOUND_3D_BUFFER: Interface = Interface {
     ],
 };
 
-static DEVICE_CLASS: [&Interface; 1] = [&DIRECTSOUND8];
-static BUFFER_CLASS: [&Interface; 3] = [&SOUND_BUFFER8, &SOUND_NOTIFY, &SOUND_3D_BUFFER];
+pub(crate) static DEVICE_CLASS: [&Interface; 1] = [&DIRECTSOUND8];
+pub(crate) static BUFFER_CLASS: [&Interface; 3] = [&SOUND_BUFFER8, &SOUND_NOTIFY, &SOUND_3D_BUFFER];
 
 fn create_device(c: &mut Ctx, nargs: u32) -> ApiResult {
     let pp = c.arg(1);

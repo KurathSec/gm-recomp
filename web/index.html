@@ -114,6 +114,31 @@
       #keys .km-scope { display: flex; gap: 16px; font-size: 13px; }
       #keys .km-buttons { display: flex; gap: 8px; justify-content: flex-end; }
       #keys .km-buttons .primary { border-color: var(--accent); color: var(--accent); }
+      /* save states (src/statepanel.mjs) */
+      .st-panel { position: absolute; top: 12px; right: 12px; z-index: 5; width: min(420px, calc(100% - 24px)); max-height: calc(100% - 24px); display: flex; flex-direction: column; gap: 8px; padding: 12px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45); font-size: 13px; }
+      .st-head { display: flex; align-items: center; justify-content: space-between; }
+      .st-title { font-weight: 600; font-size: 15px; }
+      .st-close { padding: 0 8px; font-size: 16px; line-height: 1.4; }
+      .st-about { color: var(--muted); font-size: 12px; }
+      .st-keys { display: flex; gap: 14px; flex-wrap: wrap; }
+      .st-key { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+      .st-key button { padding: 1px 8px; min-width: 44px; color: var(--fg); }
+      .st-listen { border-color: var(--accent) !important; color: var(--accent) !important; }
+      .st-list { display: flex; flex-direction: column; gap: 4px; overflow: auto; min-height: 0; }
+      .st-row { display: grid; grid-template-columns: 80px 1fr auto; gap: 10px; align-items: center; padding: 4px; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
+      .st-row:hover { background: var(--bg); }
+      .st-chosen { border-color: var(--accent); }
+      .st-pic { width: 80px; height: 60px; background: #000; border-radius: 4px; overflow: hidden; display: grid; place-items: center; }
+      .st-pic img { max-width: 100%; max-height: 100%; image-rendering: pixelated; }
+      .st-name { font-weight: 600; }
+      .st-when { color: var(--muted); font-size: 12px; }
+      .st-empty .st-name { color: var(--muted); font-weight: 400; }
+      .st-empty .st-pic { background: transparent; border: 1px dashed var(--line); }
+      .st-btns button:disabled { opacity: 0.4; cursor: default; }
+      .st-btns { display: flex; gap: 4px; }
+      .st-btns button { padding: 2px 8px; font-size: 12px; }
+      .st-notice { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); z-index: 6; padding: 5px 12px; border-radius: 6px; background: rgba(20, 20, 24, 0.88); color: #ececf1; pointer-events: none; font-size: 13px; }
+      .st-notice.st-error { color: #ff9b8f; }
     </style>
   </head>
   <body>
@@ -139,6 +164,7 @@
         <button id="wipe">Delete saves</button>
         <button id="modsbtn" title="Change the game before it starts (restarts it)" hidden>Mods</button>
         <button id="keysbtn" title="Keys you press reach the game as other keys">Keys</button>
+        <button id="statesbtn" title="Save states (the Save states mod)" hidden>States</button>
         <button id="statsbtn" title="Frame rate, frame time and input latency">Stats</button>
         <button id="logbtn">Log</button>
         <button id="fs" title="F4">Fullscreen</button>
@@ -158,6 +184,7 @@
     <script type="module">
       import { deleteGame, deleteSaves, exportSaves, listGames, loadGame, loadSaves, openSaves, parseSaves, storeGame, storeSaves } from './src/saves.mjs';
       import { editKeymap, loadKeymap } from './src/keymap.mjs';
+      import { statesPanel } from './src/statepanel.mjs';
       import { playGame } from './src/player.mjs';
       import { loadChoices, modsFor, saveChoices, selectedMods } from './src/mods.mjs';
 
@@ -568,10 +595,14 @@
           if (document.referrer && new URL(document.referrer).origin === location.origin && history.length > 1) history.back();
           else location.href = './';
         };
+        const saveStates = !!modChoices.SaveStates?.on;
+        let statesUi = null;
         const player = playGame({
           game,
           local,
           canvas: screen,
+          saveStates,
+          onStateStored: (slot, error) => statesUi?.stored(slot, error),
           frames,
           epoch: runEpoch,
           capture,
@@ -631,6 +662,12 @@
           const r = await editKeymap(document.getElementById('keys'), game);
           if (r) player.setKeymap(r.map);
         };
+        if (saveStates) {
+          statesUi = statesPanel({ player, game, mount: document.getElementById('stage') });
+          const b = document.getElementById('statesbtn');
+          b.hidden = false;
+          b.onclick = () => statesUi.toggle();
+        }
         // &keytest=ms:code:1|0,...: real key events at those times (tests of the input path)
         for (const k of (q.get('keytest') ?? '').split(',').filter(Boolean)) {
           const [ms, code, down] = k.split(':');

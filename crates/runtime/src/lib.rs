@@ -8,6 +8,7 @@ pub mod hle;
 pub mod loader;
 pub mod mem;
 pub mod process;
+pub mod state;
 pub mod vfs;
 
 pub use hle::{ApiError, ApiId, ApiResult, Ctx, Host, InputEvent, Regs, Registry, Ret};

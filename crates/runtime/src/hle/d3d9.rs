@@ -4,6 +4,7 @@
 //! created; draws go to the host as `gpu::DrawCall9` records, or through the Direct3D 8
 //! fixed-function path when no shaders are set.
 
+use serde::{Deserialize, Serialize};
 use super::gpu::{self, DrawCall9};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
 use crate::mem::Guest;
@@ -43,9 +44,10 @@ const IIDS: &[(&str, &[&str])] = &[
 ];
 
 /// Device state.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct State9 {
     pub device: u32,
+    #[serde(with = "crate::state::big_array")]
     pub rs: [u32; 256],
     pub tss: [[u32; gpu::TSS_COUNT]; 8],
     pub samp: [[u32; 14]; 16],
@@ -62,7 +64,9 @@ pub struct State9 {
     pub indices: u32,
     pub vs: u32,
     pub ps: u32,
+    #[serde(with = "crate::state::boxed_array")]
     pub vs_f: Box<[[f32; 4]; 256]>,
+    #[serde(with = "crate::state::boxed_array")]
     pub ps_f: Box<[[f32; 4]; 224]>,
     pub vs_i: [[i32; 4]; 16],
     pub ps_i: [[i32; 4]; 16],

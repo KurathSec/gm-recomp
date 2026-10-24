@@ -32,6 +32,14 @@ pub enum Ctl {
     Yield,
 }
 
+/// A save state the host asked for, made or loaded at the end of the main thread's next
+/// frame (`crate::state`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StateOp {
+    Save,
+    Load,
+}
+
 /// Dispatches a secondary thread may run before it is preempted (busy waits).
 const SLICE_BUDGET: u64 = 200_000;
 
@@ -195,6 +203,10 @@ pub struct Engine {
     /// Print each input event as the guest takes it (`input <frame> <clock> ...`), so
     /// a session can be replayed (`harness run --replay`).
     pub monitor: bool,
+    /// A save state to make or load at the main thread's next frame end, and the frames
+    /// a load waited so far (`crate::state`).
+    pub state_op: Option<StateOp>,
+    pub state_tries: u32,
 }
 
 impl Engine {
@@ -258,6 +270,8 @@ impl Engine {
             stale_hits: 0,
             code_written_seen: 0,
             monitor: false,
+            state_op: None,
+            state_tries: 0,
         }
     }
 
@@ -363,6 +377,22 @@ pub trait Machine: Guest {
     fn prompt(&mut self, _ask: crate::hle::Ask, _title: &str, _text: &str) -> Option<String> {
         None
     }
+    /// A save state was made (`StateOp::Save`): `meta` from `crate::state::save`, and
+    /// the guest memory over `ranges` (address, length), which the host reads itself.
+    fn state_saved(&mut self, _meta: &[u8], _ranges: &[(u32, u32)]) {}
+    /// The save state to load: its `meta` part (None when there is none).
+    fn state_meta(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    /// Puts the loading state's guest memory in place: `clear` (address, length) zeroed
+    /// first, then the ranges the state saved.
+    fn state_memory(&mut self, _clear: &[(u32, u32)]) -> Result<(), String> {
+        Err("the host keeps no save states".into())
+    }
+    /// The process is now a loaded state: its clock went to the state's time.
+    fn state_loaded(&mut self) {}
+    /// A save or load asked for did not happen (why, for the player).
+    fn state_failed(&mut self, _why: &str) {}
 }
 
 // ---- registers ---------------------------------------------------------------------------
@@ -438,7 +468,7 @@ pub fn stop<M: Machine + ?Sized>(m: &mut M, msg: String) {
     m.set_global(Global::Ctl, 1);
 }
 
-fn request<M: Machine + ?Sized>(m: &mut M, c: Ctl) {
+pub(crate) fn request<M: Machine + ?Sized>(m: &mut M, c: Ctl) {
     let e = m.engine();
     if !matches!(e.ctl, Some(Ctl::Stop(_))) {
         e.ctl = Some(c);
@@ -843,6 +873,9 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
                     m.print(&line);
                 }
                 write_regs(m, &regs);
+                if m.engine_ref().state_op.is_some() {
+                    crate::state::at_api_return(m, id);
+                }
             } else {
                 regs.eax = ret.eax;
                 if let Some(edx) = ret.edx {
@@ -855,6 +888,9 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
                     m.print(&line);
                 }
                 write_regs(m, &regs);
+                if m.engine_ref().state_op.is_some() {
+                    crate::state::at_api_return(m, id);
+                }
                 // The caller has left the nested guest call it runs in (Delphi runs an
                 // `except` block on the handler frame's stack and goes on from there,
                 // never returning to the callback that dispatched the exception): back to
@@ -1911,7 +1947,7 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
 
 // ---- guest threads ----------------------------------------------------------------------
 
-fn save_ctx<M: Machine + ?Sized>(m: &mut M) -> ThreadCtx {
+pub(crate) fn save_ctx<M: Machine + ?Sized>(m: &mut M) -> ThreadCtx {
     let flags = [Global::Cf, Global::Pf, Global::Af, Global::Zf, Global::Sf, Global::Of, Global::Df].map(|g| m.global(g));
     let mut xmm = [0u128; 16];
     let n = if m.engine_ref().x64 { 16 } else { 8 };
@@ -1921,7 +1957,7 @@ fn save_ctx<M: Machine + ?Sized>(m: &mut M) -> ThreadCtx {
     ThreadCtx { regs: read_regs(m), flags, xmm, mxcsr: m.global(Global::Mxcsr) }
 }
 
-fn restore_ctx<M: Machine + ?Sized>(m: &mut M, c: &ThreadCtx) {
+pub(crate) fn restore_ctx<M: Machine + ?Sized>(m: &mut M, c: &ThreadCtx) {
     write_regs(m, &c.regs);
     for (g, v) in [Global::Cf, Global::Pf, Global::Af, Global::Zf, Global::Sf, Global::Of, Global::Df].into_iter().zip(c.flags) {
         m.set_global(g, v);

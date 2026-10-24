@@ -3,6 +3,7 @@
 //! (FMOD Ex hands such WAV files to ACM: without them it reported "Unsupported file or
 //! audio format"), and copy PCM. Other formats are not possible.
 
+use serde::{Deserialize, Serialize};
 use super::{ApiResult, Ctx, Registry, Ret};
 use std::collections::HashMap;
 
@@ -18,7 +19,7 @@ const MS_ADPCM: u16 = 2;
 const IMA_ADPCM: u16 = 0x11;
 
 /// A WAVEFORMATEX, with what the ADPCM formats add after it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Format {
     tag: u16,
     channels: u16,
@@ -30,14 +31,14 @@ pub struct Format {
     coefs: Vec<(i32, i32)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Stream {
     src: Format,
     dst: Format,
 }
 
 /// Open streams by handle.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Streams {
     list: HashMap<u32, Stream>,
     next: u32,

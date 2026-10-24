@@ -1453,7 +1453,8 @@ fn numpad_key(c: &mut Ctx, i: usize, vk: u8, scan: u16, down: bool, numlock: boo
 
 pub(crate) fn pump_input(c: &mut Ctx) {
     let frame = c.p.frames_presented;
-    let events = c.host.poll_input(frame, c.p.clock_us);
+    let mut events = std::mem::take(&mut c.p.injected_input);
+    events.extend(c.host.poll_input(frame, c.p.clock_us));
     if c.host.monitoring() {
         let clock = c.p.clock_us;
         for ev in &events {

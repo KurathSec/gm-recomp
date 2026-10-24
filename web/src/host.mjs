@@ -8,6 +8,8 @@ import { D3DGL } from './gpu.mjs';
 // (crates/web/src/lib.rs GLUE_FUNCS; nop64 is 64-bit code's no-op function)
 const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call', 'gcopy', 'rget', 'rset', 'get64', 'set64', 'call64', 'nop64'];
 const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
+// A save state's memory goes in chunks of this size.
+const STATE_CHUNK = 16 << 20;
 
 /**
  * @param {object} o
@@ -139,6 +141,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // read right after the wait. 'jit' holds a finished frame until its time and resumes
   // the guest just early enough for the next one; 'asap' shows each frame when it is
   // done and resumes the guest at the frame's time.
+  // A loaded save state moves the guest's clock to the state's time: pacing starts over
+  // from there.
+  let clockMoved = () => {};
   const due = (clockMs) => {
     const now = performance.now();
     // more than 250 ms behind (a long load, a hidden tab): start over from now
@@ -269,6 +274,10 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       // the next frame look 40 ms away and ahead translation run into it.
       let frameStep = 20;
       const steps = [];
+      clockMoved = (clockMs) => {
+        shownClock = clockMs;
+        steps.length = 0;
+      };
       if (ahead)
         gpuImports.gpu_slack = (clockMs) => {
           const now = performance.now();
@@ -375,6 +384,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // read at the guest's every message poll, also while the worker blocks in a wait.
   const keyRing = inputRing && { idx: new Int32Array(inputRing, 0, 2), ev: new Int32Array(inputRing, 8, 256 * 3), when: new Float64Array(inputRing, 8 + 256 * 12, 256) };
   let systemDll = null;
+  // The save or load asked for: {resolve, reject, state (a load's)}.
+  let stateWait = null;
+  const guestBytes = () => new Uint8Array(glue.exports.mem.buffer);
   const host = {
     // A dialog for the player (hle Host::prompt: GameMaker 8's message, question and text
     // dialogs, I wanna play online's input_box): `prompt(title, text, default | null, kind)`
@@ -426,6 +438,85 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         rt.exports.input_key(keyRing.ev[k], keyRing.ev[k + 1], down);
       }
       Atomics.store(keyRing.idx, 1, w);
+    },
+    // Save states (crates/web state_*, runtime::state): {meta, pages, chunks, frame}: the
+    // runtime's part, the numbers of the guest memory's non-zero 4 KB pages over the ranges
+    // it names, their bytes (in chunks), and the frame shown.
+    state_saved(metaPtr, metaLen, rangesPtr, n) {
+      const meta = mem().slice(metaPtr, metaPtr + metaLen);
+      const ranges = new Uint32Array(rt.exports.memory.buffer, rangesPtr, 2 * n).slice();
+      const g = guestBytes();
+      const words = new Int32Array(g.buffer, 0, g.length >>> 2);
+      const pages = [];
+      const chunks = [];
+      let chunk = null;
+      let used = 0;
+      for (let r = 0; r < n; r++) {
+        const start = ranges[2 * r] >>> 0;
+        const end = Math.min(start + (ranges[2 * r + 1] >>> 0), g.length);
+        for (let at = start - (start % 4096); at < end; at += 4096) {
+          let k = at >>> 2;
+          const stop = k + 1024;
+          while (k < stop && (words[k] | words[k + 1] | words[k + 2] | words[k + 3] | words[k + 4] | words[k + 5] | words[k + 6] | words[k + 7]) === 0) k += 8;
+          if (k === stop) continue;
+          pages.push(at / 4096);
+          if (!chunk || used === chunk.length) {
+            chunk = new Uint8Array(STATE_CHUNK);
+            chunks.push(chunk);
+            used = 0;
+          }
+          chunk.set(g.subarray(at, at + 4096), used);
+          used += 4096;
+        }
+      }
+      if (chunk) chunks[chunks.length - 1] = chunk.slice(0, used);
+      const st = { meta, pages: Uint32Array.from(pages), chunks, frame: gpu?.grab() ?? null };
+      const w = stateWait;
+      stateWait = null;
+      w?.resolve(st);
+    },
+    state_meta_len() {
+      return stateWait?.state ? stateWait.state.meta.length : -1;
+    },
+    state_meta_copy(out) {
+      mem().set(stateWait.state.meta, out);
+    },
+    state_memory(clearPtr, n) {
+      const clear = new Uint32Array(rt.exports.memory.buffer, clearPtr, 2 * n).slice();
+      const g = guestBytes();
+      for (let r = 0; r < n; r++) {
+        const start = clear[2 * r] >>> 0;
+        const end = Math.min(start + (clear[2 * r + 1] >>> 0), g.length);
+        if (end > start) g.fill(0, start, end);
+      }
+      const { pages, chunks } = stateWait.state;
+      let c = 0;
+      let off = 0;
+      for (let i = 0; i < pages.length; i++) {
+        const at = pages[i] * 4096;
+        if (at + 4096 > g.length) return 0;
+        while (off >= chunks[c].length) {
+          c++;
+          off = 0;
+        }
+        g.set(chunks[c].subarray(off, off + 4096), at);
+        off += 4096;
+      }
+      return 1;
+    },
+    state_loaded(clockMs) {
+      startReal = performance.now() - clockMs;
+      prevClock = clockMs;
+      lastClockMs = clockMs;
+      clockMoved(clockMs);
+      const w = stateWait;
+      stateWait = null;
+      w?.resolve();
+    },
+    state_failed(ptr, len) {
+      const w = stateWait;
+      stateWait = null;
+      w?.reject(new Error(dec.decode(mem().subarray(ptr, ptr + len))));
     },
     print(ptr, len) {
       print(dec.decode(mem().subarray(ptr, ptr + len)));
@@ -649,6 +740,12 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   const ep = x.alloc(e.length);
   mem().set(e, ep);
   if (canvas) gpu = new D3DGL(canvas, () => glue.exports.mem.buffer, () => x.memory.buffer, print);
+  const stateAsk = (op, state) =>
+    new Promise((resolve, reject) => {
+      stateWait?.reject(new Error('superseded'));
+      stateWait = { resolve, reject, state };
+      x.state_request(op);
+    });
   if (onReady) {
     onReady({
       key: (vk, scan, down, when) => {
@@ -660,6 +757,19 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         x.input_mouse(mx | 0, my | 0, buttons);
       },
       pad: (i, connected, buttons, lt, rt, lx, ly, rx, ry) => x.input_pad(i, connected ? 1 : 0, buttons, lt | (rt << 8), lx, ly, rx, ry),
+      // Save states, made and loaded at the end of the game's next frame: `save()` resolves to
+      // a state (see `state_saved`), `load(state)` once the game runs from it; either rejects
+      // with why not. One at a time: a new one cancels the one waiting.
+      state: {
+        save: () => stateAsk(1, null),
+        load: (state) => stateAsk(2, state),
+        cancel: () => {
+          x.state_request(0);
+          const w = stateWait;
+          stateWait = null;
+          w?.reject(new Error('cancelled'));
+        },
+      },
     });
   }
   if (x.init(ep, e.length, frames, trace ? 1 : 0, epoch, nopIndex, gpu ? 1 : 0) !== 0) {

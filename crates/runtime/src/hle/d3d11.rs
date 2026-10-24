@@ -12,6 +12,7 @@
 //! The entry points are on demand and the interfaces are registered the first time a
 //! device or factory is made, so no other game's stub addresses move.
 
+use serde::{Deserialize, Serialize};
 use super::com::{format_iid, E_NOINTERFACE, E_NOTIMPL, S_OK};
 use super::gpu::{self, DrawCall9};
 use super::{ApiFn, ApiResult, Ctx, Registry, Ret};
@@ -31,7 +32,7 @@ const MAP_WRITE_DISCARD: u32 = 4;
 type Method = (&'static str, u32, Option<ApiFn>);
 
 /// What the context has bound, and the host-side halves of shaders and input layouts.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct State11 {
     pub device: u32,
     pub context: u32,

@@ -20,11 +20,12 @@
 //! holding the bits and integer instructions reinterpret them (floatBitsToInt and so
 //! on, as wined3d does), so float and integer code can share a register.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// An input or output signature element (ISGN/OSGN).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SigElem {
     /// Semantic name as written (e.g. "POSITION", "SV_Position", "TEXCOORD").
     pub name: String,
@@ -36,7 +37,7 @@ pub struct SigElem {
 }
 
 /// A translated shader.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Shader {
     pub vertex: bool,
     pub glsl: String,

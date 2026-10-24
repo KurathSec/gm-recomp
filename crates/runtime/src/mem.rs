@@ -1,5 +1,6 @@
 //! Guest memory access and the virtual address-space map (VirtualAlloc & co).
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -146,19 +147,20 @@ pub const PAGE_READWRITE: u32 = 0x04;
 pub const PAGE_EXECUTE_READ: u32 = 0x20;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Region {
     pub size: u32,
     /// Allocation base this region belongs to (regions split by protect/commit changes).
     pub alloc_base: u32,
     pub committed: bool,
     pub protect: u32,
-    pub tag: &'static str,
+    #[serde(with = "crate::state::static_str")]
+    pub tag: crate::state::Name,
 }
 
 /// The address-space map. Backed storage is the host's single linear memory, so this only
 /// tracks what the guest believes is reserved/committed and where free space is.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Vm {
     pub regions: BTreeMap<u32, Region>,
     /// Lowest address handed out by bottom-up searches.

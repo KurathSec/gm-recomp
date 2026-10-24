@@ -5,6 +5,7 @@ use crate::hle::{ApiId, Registry};
 use crate::loader::LoadedModule;
 use crate::mem::{Guest, PAGE_READWRITE, Vm};
 use std::collections::{BTreeMap, VecDeque};
+use serde::{Deserialize, Serialize};
 use crate::fasthash::HashMap;
 
 pub const STUB_BASE: u32 = 0x7F00_0000;
@@ -16,7 +17,7 @@ pub const PEB_BASE: u32 = 0x7FFD_F000;
 pub const STACK_BASE: u32 = 0x0003_0000;
 pub const STACK_SIZE: u32 = 0x0010_0000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Handle {
     File(FileHandle),
     Thread { id: u32 },
@@ -35,17 +36,17 @@ pub enum Handle {
     Gdi(GdiObject),
     ImageList { cx: i32, cy: i32, count: i32, flags: u32, bk: u32 },
     Timer,
-    Dummy(&'static str),
+    Dummy(#[serde(with = "crate::state::static_str")] crate::state::Name),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindEntry {
     pub name: String,
     pub size: u64,
     pub is_dir: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHandle {
     pub path: String,
     /// Path in the VFS.
@@ -54,7 +55,7 @@ pub struct FileHandle {
     pub writable: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GdiObject {
     Dc { hwnd: u32, font: u32, brush: u32, pen: u32, bitmap: u32, text_color: u32, bk_color: u32, bk_mode: u32 },
     Font { height: i32, weight: i32, face: String },
@@ -67,7 +68,7 @@ pub enum GdiObject {
     Cursor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Window {
     pub class: String,
     pub wndproc: u32,
@@ -92,7 +93,7 @@ pub struct Window {
     pub sel: (u32, u32),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WndClass {
     pub style: u32,
     pub wndproc: u32,
@@ -106,7 +107,7 @@ pub struct WndClass {
     pub atom: u16,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Msg {
     pub hwnd: u32,
     pub msg: u32,
@@ -118,7 +119,7 @@ pub struct Msg {
 
 /// A first-fit heap (HeapAlloc / GlobalAlloc / LocalAlloc) over one or more regions;
 /// it grows by adding regions under the same handle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heap {
     /// The handle: base of the first region.
     pub base: u32,
@@ -197,7 +198,7 @@ impl Heap {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Thread {
     pub id: u32,
     pub teb: u32,
@@ -221,7 +222,7 @@ pub struct Thread {
 
 /// What a guest thread is doing. Threads run one at a time: secondary threads are
 /// scheduled from the main thread's blocking points (see `hle::threads`).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum ThreadState {
     #[default]
     Running,
@@ -239,7 +240,7 @@ pub enum ThreadState {
 }
 
 /// A thread's registers while it is not running.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadCtx {
     pub regs: crate::hle::Regs,
     /// cf, pf, af, zf, sf, of, df
@@ -253,7 +254,7 @@ pub struct ThreadCtx {
 pub const THREAD_EXIT: u32 = RET_TO_HOST + 0xFFC;
 
 /// A DirectSound buffer: PCM data in guest memory plus playback state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoundBuffer {
     pub primary: bool,
     pub flags: u32,
@@ -282,18 +283,38 @@ pub struct SoundBuffer {
     pub fired: Vec<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct D3dObject {
-    pub kind: &'static str,
+    #[serde(with = "crate::state::static_str")]
+    pub kind: crate::state::Name,
     pub refcount: u32,
+    #[serde(with = "crate::state::static_keys")]
     pub data: HashMap<&'static str, u32>,
+}
+
+fn placeholder_fs() -> Box<dyn crate::vfs::Vfs> {
+    Box::new(crate::vfs::MemFs::new())
+}
+fn placeholder_saves() -> Box<dyn crate::vfs::SaveSink> {
+    Box::new(crate::vfs::NullSaves)
+}
+fn placeholder_gpu() -> Box<dyn crate::hle::gpu::Gpu> {
+    Box::new(crate::hle::gpu::NullGpu)
+}
+fn placeholder_audio() -> Box<dyn crate::hle::audio::AudioSink> {
+    Box::new(crate::hle::audio::NullSink)
 }
 
 /// The temp directory (TEMP, GetTempPath), where Windows has it.
 pub const TEMP_DIR: &str = "C:\\Users\\player\\AppData\\Local\\Temp";
 
+/// Saved by `state::save` and put back by `state::load`, except the fields marked
+/// `serde(skip)`: the host's (files, GPU, sound), the API table, caches, players whose
+/// decoder state cannot be saved, and counters, which stay as they are.
+#[derive(Serialize, Deserialize)]
 pub struct Process {
     pub vm: Vm,
+    #[serde(skip, default = "Registry::default")]
     pub registry: Registry,
     pub modules: Vec<LoadedModule>,
     /// Fake bases for HLE DLLs that have no image.
@@ -332,8 +353,10 @@ pub struct Process {
     pub exe_path: String,
     pub cwd: String,
     /// The guest's file system (`C:\\game` and everything below it).
+    #[serde(skip, default = "placeholder_fs")]
     pub fs: Box<dyn crate::vfs::Vfs>,
     /// Receives the game's file changes (not the temp directory) for persistence.
+    #[serde(skip, default = "placeholder_saves")]
     pub saves: Box<dyn crate::vfs::SaveSink>,
     /// Host wall-clock time at process start (Unix seconds); dates follow it plus the
     /// virtual clock.
@@ -346,6 +369,7 @@ pub struct Process {
     /// Clock reads of the running secondary thread since it last yielded.
     pub slice_polls: u32,
     /// Winsock sockets and the names behind their stand-in addresses
+    #[serde(skip)]
     pub sockets: crate::hle::winsock::Sockets,
     /// Audio Compression Manager streams.
     pub acm: crate::hle::acm::Streams,
@@ -360,6 +384,7 @@ pub struct Process {
     /// wait): queued (bytes, key, OVERLAPPED*).
     pub ports: HashMap<u32, std::collections::VecDeque<(u32, u64, u64)>>,
     /// http_dll_2_3.dll's buffers and sockets (hle::httpdll)
+    #[serde(skip)]
     pub httpdll: crate::hle::httpdll::State,
     pub gdiplus: crate::hle::gdiplus::State,
     /// SetDllDirectory's folder: LoadLibrary looks there after the game's folder
@@ -369,6 +394,7 @@ pub struct Process {
     /// change after it is translated (`recomp::cfg::FuncInfo::volatile`).
     pub code_written: Vec<(u32, u32)>,
     /// System DLLs the host was asked for and does not have (lowercase).
+    #[serde(skip)]
     pub system_dll_missing: std::collections::HashSet<String>,
     /// Text drawn on GameMaker 8's dialog forms (hle::user32 `answer_dialog`), by window.
     pub dialog_text: HashMap<u32, Vec<String>>,
@@ -394,7 +420,9 @@ pub struct Process {
     pub next_gdi: u32,
     pub stock_objects: HashMap<u32, u32>,
     pub registry_values: HashMap<String, Vec<u8>>,
+    #[serde(skip)]
     pub frames_presented: u64,
+    #[serde(skip)]
     pub frame_limit: u64,
     pub d3d_objects: HashMap<u32, D3dObject>,
     /// Direct3D device state and the host renderer it drives.
@@ -403,30 +431,39 @@ pub struct Process {
     pub d3d9: Box<crate::hle::d3d9::State9>,
     pub d3d11: Box<crate::hle::d3d11::State11>,
     pub d3d9_blocks: HashMap<u32, Box<crate::hle::d3d9::State9>>,
+    #[serde(skip, default = "placeholder_gpu")]
     pub gpu: Box<dyn crate::hle::gpu::Gpu>,
     pub sound_buffers: BTreeMap<u32, SoundBuffer>,
     /// The sound mix and where finished samples go.
+    #[serde(skip)]
     pub mixer: crate::hle::audio::Mixer,
     /// WASAPI streams, by IAudioClient (hle::wasapi).
     pub wasapi: HashMap<u32, crate::hle::wasapi::Stream>,
     /// DirectMusic: loaded sounds, playing segments, master volume (mB), default path,
     /// loader search directories.
+    #[serde(skip)]
     pub dm_sounds: Vec<crate::hle::dmusic::DmSound>,
+    #[serde(skip)]
     pub dm_voices: Vec<crate::hle::dmusic::DmVoice>,
     pub dm_master_volume: i32,
     pub dm_default_path: u32,
     pub dm_search_dirs: HashMap<u32, String>,
+    #[serde(skip, default = "placeholder_audio")]
     pub audio: Box<dyn crate::hle::audio::AudioSink>,
     /// MCI devices: id -> (mode, element), and devices opened by name/alias.
     pub mci: crate::hle::mci::Devices,
     /// Decoded MCI media by file, kept for reopening.
+    #[serde(skip)]
     pub mci_media: HashMap<String, std::rc::Rc<crate::hle::mci::Media>>,
     pub next_mci: u32,
     /// COM interface name -> vtable address in guest memory.
+    #[serde(with = "crate::state::static_keys")]
     pub com_vtables: HashMap<&'static str, u32>,
     /// Interface pointer -> (object base, interface index) for HLE COM objects.
     pub com_ifaces: HashMap<u32, (u32, u32)>,
+    #[serde(with = "crate::state::com_classes")]
     pub com_classes: HashMap<u32, &'static [&'static crate::hle::com::Interface]>,
+    #[serde(skip)]
     pub draw_calls: u64,
     /// msvcrt state: errno cell, FILE* -> file handle, rand() seed.
     pub crt_errno: u32,
@@ -441,6 +478,7 @@ pub struct Process {
     /// Characters written to stdout one at a time (fputc), until the line ends.
     pub crt_line: Vec<u8>,
     /// Each module's resource directory, parsed once (by module base).
+    #[serde(skip)]
     pub resources: HashMap<u32, std::rc::Rc<Vec<pe::Resource>>>,
     /// Keypad keys held (by VK_NUMPAD0.., VK_DECIMAL last) and the key each was sent as.
     pub numpad_sent: [u8; 11],
@@ -454,29 +492,68 @@ pub struct Process {
     /// Direct3D version (8, 9) that owns them: uploaded while the game waits.
     pub pending_uploads: Vec<(u32, u8)>,
     /// The MIDI SoundFont, once the host supplied it (or failed to).
+    #[serde(skip)]
     pub soundfont: Option<std::sync::Arc<rustysynth::SoundFont>>,
+    #[serde(skip)]
     pub soundfont_failed: bool,
     /// Game controllers 0..3.
     pub pads: [crate::hle::PadState; 4],
     /// Waitable timers: (handle, virtual time they become signaled).
     pub timers_due: Vec<(u32, u64)>,
+    #[serde(skip)]
     pub textures_created: u64,
     pub next_d3d_handle: u32,
+    #[serde(skip)]
     pub trace: bool,
     /// A 64-bit process (docs/x64.md): the Win64 ABI and layouts, the TEB at GS.
     pub x64: bool,
+    #[serde(skip)]
     pub api_calls: u64,
+    #[serde(skip)]
     pub unimplemented: Vec<String>,
+    #[serde(with = "crate::state::big_array")]
     pub key_state: [u8; 256],
     /// DirectInput keyboard state, by DIK code (scan code, 0x80 for extended keys).
+    #[serde(with = "crate::state::big_array")]
     pub dik: [u8; 256],
     /// Last mouse position (client coordinates of the game window) and buttons.
     pub mouse: (i32, i32),
     pub mouse_buttons: u32,
+    #[serde(skip)]
     pub log: Vec<String>,
+    /// Input the next message poll takes before the host's (a loaded state's catching up
+    /// with the keys held now, `crate::state`).
+    #[serde(skip)]
+    pub injected_input: Vec<crate::hle::InputEvent>,
 }
 
 impl Process {
+    /// A process read from a save state takes over what is not in it from the running
+    /// one: the host's ends (file system, GPU, sound, sockets), caches and statistics.
+    pub fn adopt_host_parts(&mut self, live: &mut Process) {
+        use std::mem::take;
+        std::mem::swap(&mut self.registry, &mut live.registry);
+        std::mem::swap(&mut self.fs, &mut live.fs);
+        std::mem::swap(&mut self.saves, &mut live.saves);
+        std::mem::swap(&mut self.gpu, &mut live.gpu);
+        std::mem::swap(&mut self.audio, &mut live.audio);
+        self.sockets = take(&mut live.sockets);
+        self.httpdll = take(&mut live.httpdll);
+        self.system_dll_missing = take(&mut live.system_dll_missing);
+        self.frames_presented = live.frames_presented;
+        self.frame_limit = live.frame_limit;
+        self.dm_sounds = take(&mut live.dm_sounds);
+        self.mci_media = take(&mut live.mci_media);
+        self.draw_calls = live.draw_calls;
+        self.resources = take(&mut live.resources);
+        self.soundfont = live.soundfont.take();
+        self.soundfont_failed = live.soundfont_failed;
+        self.textures_created = live.textures_created;
+        self.trace = live.trace;
+        self.unimplemented = take(&mut live.unimplemented);
+        self.log = take(&mut live.log);
+    }
+
     pub fn new(mut fs: Box<dyn crate::vfs::Vfs>, exe_path: &str, cmdline: &str) -> Self {
         crate::vfs::add_standard_dirs(fs.as_mut());
         Self::with_registry(Registry::new(), fs, exe_path, cmdline)
@@ -625,6 +702,7 @@ impl Process {
             mouse: (0, 0),
             mouse_buttons: 0,
             log: Vec::new(),
+            injected_input: Vec::new(),
         }
     }
 
