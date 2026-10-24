@@ -2146,8 +2146,13 @@ pub struct Started {
 pub fn start<M: Machine>(m: &mut M, exe: &str) -> Result<Started, String> {
     let mut order = Vec::new();
     let mut seen = HashSet::default();
-    // Imported DLLs come from the game directory, else the system directory.
+    // Imported DLLs come from the game directory, else the system directory (not the
+    // Direct3D wrappers a game may ship: the emulated API serves those).
     let read = |m: &M, name: &str| {
+        let stem = name.rsplit(['\\', '/']).next().unwrap_or(name).to_lowercase();
+        if crate::hle::kernel32::GAME_COPY_IGNORED.contains(&stem.trim_end_matches(".dll")) {
+            return None;
+        }
         let fs = &m.engine_ref().process().fs;
         fs.read_all(name).or_else(|| if name.contains('\\') { None } else { fs.read_all(&format!("{}\\{name}", crate::hle::kernel32::SYSTEM_DIR)) })
     };

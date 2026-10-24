@@ -64,6 +64,36 @@ fn read_format(c: &Ctx, p: u32) -> Option<Format> {
     Some(f)
 }
 
+/// A whole ADPCM (MS or IMA) wave's data as interleaved 16-bit samples, from its fmt
+/// chunk (a WAVEFORMATEX): what a WAV file with such data plays (DirectMusic, MCI).
+pub fn decode_wave(fmt: &[u8], data: &[u8]) -> Option<Vec<i16>> {
+    let u16_at = |o: usize| fmt.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    let tag = u16_at(0);
+    let mut f = Format { tag, channels: u16_at(2), rate: u32::from_le_bytes(fmt.get(4..8)?.try_into().ok()?), block_align: u16_at(12), bits: u16_at(14), ..Default::default() };
+    let extra = u16_at(16);
+    match tag {
+        MS_ADPCM if extra >= 4 => {
+            f.samples_per_block = u16_at(18);
+            let n = u16_at(20).min(256) as usize;
+            f.coefs = (0..n).map(|k| (u16_at(22 + 4 * k) as i16 as i32, u16_at(24 + 4 * k) as i16 as i32)).collect();
+        }
+        IMA_ADPCM if extra >= 2 => f.samples_per_block = u16_at(18),
+        _ => return None,
+    }
+    if !convertible(&f, &pcm_for(&f)) || f.block_align == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for b in data.chunks_exact(f.block_align as usize) {
+        if tag == MS_ADPCM {
+            ms_adpcm_block(&f, b, &mut out);
+        } else {
+            ima_adpcm_block(&f, b, &mut out);
+        }
+    }
+    Some(out)
+}
+
 /// Whether `src` decodes (or copies) to `dst`, and the PCM it gives.
 fn convertible(src: &Format, dst: &Format) -> bool {
     let pcm16 = dst.tag == PCM && dst.bits == 16 && dst.channels == src.channels && dst.rate == src.rate;
@@ -330,5 +360,35 @@ mod tests {
         ima_adpcm_block(&f, &b, &mut out);
         assert_eq!(out.len(), 9);
         assert_eq!(out[0], 16);
+    }
+
+    #[test]
+    fn ms_adpcm_wave_file_decodes() {
+        // WAVEFORMATEX + cbSize 4 + samples per block 4 + one coefficient pair (256, 0)
+        let mut fmt = Vec::new();
+        for v in [MS_ADPCM, 1] {
+            fmt.extend(v.to_le_bytes());
+        }
+        fmt.extend(22050u32.to_le_bytes());
+        fmt.extend(11025u32.to_le_bytes());
+        for v in [9u16, 4, 6, 4, 1] {
+            fmt.extend(v.to_le_bytes());
+        }
+        fmt.extend(256i16.to_le_bytes());
+        fmt.extend(0i16.to_le_bytes());
+        let block = [0u8, 16, 0, 100, 0, 50, 0, 0x00, 0];
+        let data: Vec<u8> = block.iter().chain(block.iter()).copied().collect();
+        assert_eq!(decode_wave(&fmt, &data), Some(vec![50, 100, 100, 100, 50, 100, 100, 100]));
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF");
+        wav.extend((4 + 8 + fmt.len() + 8 + data.len()).to_le_bytes()[..4].to_vec());
+        wav.extend(b"WAVEfmt ");
+        wav.extend((fmt.len() as u32).to_le_bytes());
+        wav.extend(&fmt);
+        wav.extend(b"data");
+        wav.extend((data.len() as u32).to_le_bytes());
+        wav.extend(&data);
+        let pcm = super::super::audio::parse_wav(&wav).unwrap();
+        assert_eq!((pcm.samples.len(), pcm.rate), (16, 22050));
     }
 }

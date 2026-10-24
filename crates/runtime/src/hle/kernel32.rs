@@ -1190,14 +1190,14 @@ pub fn register(r: &mut Registry) {
     r.add(k, "CreateFileA", |c| {
         let path = c.str_arg(0);
         let (access, disposition) = (c.arg(1), c.arg(4));
-        let h = create_file(c, &path, access, disposition);
+        let h = if folder_without_backup_semantics(c, &path, c.arg(5)) { INVALID_HANDLE_VALUE } else { create_file(c, &path, access, disposition) };
         c.trace(format!("({path:?}, access={access:#x}, disp={disposition}) = {h:#x}"));
         ok(7, h)
     });
     r.add(k, "CreateFileW", |c| {
         let path = c.wstr_arg(0);
         let (access, disposition) = (c.arg(1), c.arg(4));
-        let h = create_file(c, &path, access, disposition);
+        let h = if folder_without_backup_semantics(c, &path, c.arg(5)) { INVALID_HANDLE_VALUE } else { create_file(c, &path, access, disposition) };
         c.trace(format!("({path:?}, access={access:#x}, disp={disposition}) = {h:#x}"));
         ok(7, h)
     });
@@ -1626,6 +1626,10 @@ pub const SYSTEM_DIR: &str = "C\\Windows\\system32";
 
 pub const CORE_DLLS: &[&str] = &["kernel32", "kernelbase", "user32", "gdi32", "ntdll", "advapi32", "ole32", "oleaut32", "shell32", "comctl32", "comdlg32", "winmm", "version", "imm32", "msimg32", "uxtheme", "dwmapi", "ws2_32", "wsock32", "mpr", "winspool.drv", "crypt32", "psapi", "shlwapi", "setupapi", "usp10", "wininet", "dbghelp", "olepro32", "imagehlp", "urlmon", "gdiplus", "windowscodecs", "hid", "opengl32"];
 /// Further HLE DLLs, used when the game does not ship its own copy.
+/// Direct3D DLLs a game may ship as a wrapper for Windows (dgVoodoo, d3d8to9, ReShade):
+/// the emulated API is used instead (a wrapper's D3D11 is what this runtime does least).
+pub const GAME_COPY_IGNORED: &[&str] = &["d3d8", "d3d9", "d3d11", "dxgi"];
+
 pub const HLE_DLLS: &[&str] = &["d3d8", "d3d9", "d3d11", "dxgi", "ddraw", "dsound", "dinput8", "dinput", "dplayx", "xinput1_3", "xinput1_4", "xinput9_1_0", "msvcrt"];
 /// DLLs emulated only when the game has no file for them (the importers do not count
 /// them as emulated, so a game that imports one statically still gets the real DLL).
@@ -1686,7 +1690,7 @@ fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u3
         return Ok(m.base);
     }
     let stem = dll_stem(name);
-    if CORE_DLLS.contains(&stem.as_str()) {
+    if CORE_DLLS.contains(&stem.as_str()) || GAME_COPY_IGNORED.contains(&stem.as_str()) {
         return Ok(c.p.fake_module(&mut *c.host, &stem));
     }
     // A DLL the game ships (or extracted at run time) is loaded and recompiled.
@@ -2065,6 +2069,17 @@ pub(crate) fn create_file(c: &mut Ctx, path: &str, access: u32, disposition: u32
         return c.p.new_handle(Handle::Dummy("directory"));
     }
     c.p.new_handle(Handle::File(FileHandle { path: path.to_string(), key, pos: 0, writable }))
+}
+
+/// CreateFile of a folder without FILE_FLAG_BACKUP_SEMANTICS fails (ERROR_ACCESS_DENIED):
+/// a GMS game opening its own folder as a file when a save is missing gets nothing.
+fn folder_without_backup_semantics(c: &mut Ctx, path: &str, flags: u32) -> bool {
+    let key = c.p.vpath(path);
+    if flags & 0x0200_0000 != 0 || !c.p.fs.is_dir(&key) {
+        return false;
+    }
+    c.set_last_error(5);
+    true
 }
 
 /// A folder CreateFile opened (FILE_FLAG_BACKUP_SEMANTICS).

@@ -237,6 +237,17 @@ pub fn parse_wav(b: &[u8]) -> Result<Pcm, String> {
     if tag == 0xFFFE && fmt.len() >= 26 {
         tag = u16_at(24); // WAVE_FORMAT_EXTENSIBLE: the subformat GUID starts with the tag
     }
+    // MS and IMA ADPCM: decoded as Windows' codecs do
+    if matches!(tag, 2 | 0x11) {
+        let pcm = super::acm::decode_wave(fmt, data).ok_or_else(|| format!("undecodable ADPCM wave (format {tag})"))?;
+        let mut samples = Vec::with_capacity(pcm.len() / channels * 2);
+        for f in pcm.chunks_exact(channels) {
+            let l = f[0] as f32 / 32768.0;
+            samples.push(l);
+            samples.push(if channels >= 2 { f[1] as f32 / 32768.0 } else { l });
+        }
+        return Ok(Pcm { samples, rate });
+    }
     let bytes = bits.div_ceil(8);
     if !(tag == 1 && matches!(bits, 8 | 16 | 24 | 32) || tag == 3 && bits == 32) {
         return Err(format!("unsupported wave format {tag} with {bits} bits"));
