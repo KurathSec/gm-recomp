@@ -2225,6 +2225,33 @@ fn write_context(c: &mut Ctx, p: u32, r: &Regs) {
     let _ = c.host.write_u32(p + 0xC8, 0x23);
 }
 
+/// CONTEXT.FloatSave (FLOATING_SAVE_AREA at +0x1C): the environment as fnstenv stores
+/// it, then ST(0)..ST(7) as 10 bytes each.
+fn write_float_save(c: &mut Ctx, p: u32, f: &fpu::Fpu) {
+    let _ = c.host.write(p, &f.env_image());
+    for i in 0..8u32 {
+        let _ = c.host.write(p + 28 + 10 * i, &f.st_bits(i).to_le_bytes()[..10]);
+    }
+}
+
+fn read_float_save(c: &Ctx, p: u32, f: &mut fpu::Fpu) {
+    let mut env = [0u8; 28];
+    let _ = c.host.read(p, &mut env);
+    f.load_env_image(&env);
+    for i in 0..8u32 {
+        let mut b = [0u8; 16];
+        let _ = c.host.read(p + 28 + 10 * i, &mut b[..10]);
+        let empty = (f.tag_word() >> (2 * ((f.status_word() as u32 >> 11 & 7) + i) % 16)) & 3 == 3;
+        f.set_st_raw(i, u128::from_le_bytes(b), empty);
+    }
+}
+
+/// x87 exceptions raised by an unmasked FPU fault (STATUS_FLOAT_DENORMAL_OPERAND ..
+/// STATUS_FLOAT_UNDERFLOW).
+fn is_fpu_fault(code: u32) -> bool {
+    (0xC000_008D..=0xC000_0093).contains(&code)
+}
+
 fn read_context(c: &Ctx, p: u32, r: &mut Regs) {
     let g = |off: u32| c.host.read_u32(p + off).unwrap_or(0);
     r.edi = g(0x9C);
@@ -2250,6 +2277,16 @@ pub fn dispatch_exception(c: &mut Ctx, code: u32, flags: u32, addr: u32, params:
     let disp = ctx + CONTEXT_SIZE;
     write_exception_record(c, rec, code, flags & !EXCEPTION_UNWINDING, addr, params);
     write_context(c, ctx, ctx_regs);
+    // An x87 fault's handlers get the FPU state in FloatSave and run with the FPU as
+    // FNSAVE leaves it, initialized (else the handler's own FPU code faults again, and
+    // the faulting code's operands stay on the stack); one that continues gets the
+    // state back from FloatSave.
+    let fpu_fault = is_fpu_fault(code);
+    if fpu_fault {
+        let f = c.host.fpu_state();
+        write_float_save(c, ctx + 0x1C, &f);
+        c.host.set_fpu_state(&fpu::Fpu::new());
+    }
     let _ = c.host.write_u32(disp, 0);
     let detail = if code == 0x0EED_FADE && params.len() >= 2 { format!(" ({})", delphi_exception_text(c, params[1])) } else { String::new() };
     c.p.log(format!("exception {code:#x} at {addr:#x}{detail}: dispatching"));
@@ -2273,6 +2310,11 @@ pub fn dispatch_exception(c: &mut Ctx, code: u32, flags: u32, addr: u32, params:
             0 => {
                 let mut regs = *c.regs;
                 read_context(c, ctx, &mut regs);
+                if fpu_fault {
+                    let mut f = c.host.fpu_state();
+                    read_float_save(c, ctx + 0x1C, &mut f);
+                    c.host.set_fpu_state(&f);
+                }
                 c.p.log(format!("exception {code:#x}: handler continues at {:#x} (esp {:#x} ebp {:#x})", regs.eip, regs.esp, regs.ebp));
                 *c.regs = regs;
                 return Ok(Ret::resume());

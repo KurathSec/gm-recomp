@@ -104,6 +104,9 @@ pub struct Engine {
     pub exit: Option<u32>,
     pub ctl: Option<Ctl>,
     pub depth: u32,
+    /// The stack top of each nested guest call (call_guest) running, with the thread
+    /// making it: a thread whose stack pointer is above the innermost has left that call.
+    pub frame_tops: Vec<(usize, u32)>,
     pub translated: usize,
     /// Modules instantiated for translated code.
     pub modules: usize,
@@ -210,6 +213,7 @@ impl Engine {
             exit: None,
             ctl: None,
             depth: 0,
+            frame_tops: Vec::new(),
             translated: 0,
             modules: 0,
             translate_us: 0,
@@ -530,11 +534,14 @@ impl<M: Machine> Host for M {
         write_regs(self, &callee);
         // Lend the process to the nested dispatcher.
         p.nest += 1;
+        let thread = p.current;
         let owned = std::mem::replace(p, Process::empty());
         self.engine().p = Some(Box::new(owned));
+        self.engine().frame_tops.push((thread, frame_top));
         let r = run_until(self, addr, marker, Some(frame_top));
         {
             let e = self.engine();
+            e.frame_tops.pop();
             e.depth -= 1;
             if let Some(back) = e.p.take() {
                 *p = *back;
@@ -848,6 +855,17 @@ pub fn call_api<M: Machine>(m: &mut M, id: ApiId) {
                     m.print(&line);
                 }
                 write_regs(m, &regs);
+                // The caller has left the nested guest call it runs in (Delphi runs an
+                // `except` block on the handler frame's stack and goes on from there,
+                // never returning to the callback that dispatched the exception): back to
+                // that call's dispatcher, which unwinds it. (Translated code seldom
+                // returns there by itself: the resolve cache keeps it going.)
+                let e = m.engine_ref();
+                if let (Some(&(thread, top)), Some(p)) = (e.frame_tops.last(), e.p.as_ref()) {
+                    if p.current == thread && regs.esp > top {
+                        request(m, Ctl::Resume);
+                    }
+                }
             }
         }
         // A handler continued in a frame outside the callback this API made: the
@@ -1870,7 +1888,12 @@ pub fn run_until<M: Machine>(m: &mut M, addr: u32, marker: u32, frame_top: Optio
                     m.engine().ctl = Some(Ctl::Stop(msg.clone()));
                     return Err(msg);
                 }
-                Some(Ctl::Fault { code, ip }) => raise_fault(m, code, ip)?,
+                // (a handler that went on in a frame outside its callback: the globals hold
+                // that state, and whether it is outside this call too is checked below)
+                Some(Ctl::Fault { code, ip }) => match raise_fault(m, code, ip) {
+                    Err(e) if e == UNWIND => {}
+                    r => r?,
+                },
                 Some(Ctl::Resume) | Some(Ctl::Yield) | None => {}
             }
             if let Some(top) = frame_top {
