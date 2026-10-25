@@ -481,25 +481,56 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       const chunks = [];
       let chunk = null;
       let used = 0;
-      for (let r = 0; r < n; r++) {
-        const start = ranges[2 * r] >>> 0;
-        const end = Math.min(start + (ranges[2 * r + 1] >>> 0), g.length);
-        for (let at = start - (start % 4096); at < end; at += 4096) {
-          let k = at >>> 2;
-          const stop = k + 1024;
-          while (k < stop && (words[k] | words[k + 1] | words[k + 2] | words[k + 3] | words[k + 4] | words[k + 5] | words[k + 6] | words[k + 7]) === 0) k += 8;
-          if (k === stop) continue;
-          pages.push(at / 4096);
+      // The pages go into the buffers of the state this one replaces where there is one:
+      // writing into fresh memory cost three times as much (each of its pages is mapped as
+      // it is first written). Pages in a row are copied at once.
+      const spare = stateWait?.state ?? [];
+      let si = 0;
+      let sOff = 0;
+      const nextChunk = () => {
+        for (; si < spare.length; si++, sOff = 0) {
+          const n = Math.min(STATE_CHUNK, spare[si].byteLength - sOff);
+          if (n >= 4096) {
+            const c = new Uint8Array(spare[si], sOff, n - (n % 4096));
+            sOff += c.length;
+            return c;
+          }
+        }
+        return new Uint8Array(STATE_CHUNK);
+      };
+      const copy = (from, to) => {
+        while (from < to) {
           if (!chunk || used === chunk.length) {
-            chunk = new Uint8Array(STATE_CHUNK);
+            chunk = nextChunk();
             chunks.push(chunk);
             used = 0;
           }
-          chunk.set(g.subarray(at, at + 4096), used);
-          used += 4096;
+          const n = Math.min(to - from, chunk.length - used);
+          chunk.set(g.subarray(from, from + n), used);
+          used += n;
+          from += n;
         }
+      };
+      for (let r = 0; r < n; r++) {
+        const start = ranges[2 * r] >>> 0;
+        const end = Math.min(start + (ranges[2 * r + 1] >>> 0), g.length);
+        let run = -1;
+        let at = start - (start % 4096);
+        for (; at < end; at += 4096) {
+          let k = at >>> 2;
+          const stop = k + 1024;
+          while (k < stop && (words[k] | words[k + 1] | words[k + 2] | words[k + 3] | words[k + 4] | words[k + 5] | words[k + 6] | words[k + 7]) === 0) k += 8;
+          if (k === stop) {
+            if (run >= 0) copy(run, at);
+            run = -1;
+            continue;
+          }
+          pages.push(at / 4096);
+          if (run < 0) run = at;
+        }
+        if (run >= 0) copy(run, at);
       }
-      if (chunk) chunks[chunks.length - 1] = chunk.slice(0, used);
+      if (chunk) chunks[chunks.length - 1] = chunk.subarray(0, used);
       const st = { meta, pages: Uint32Array.from(pages), chunks, frame: gpu?.grab() ?? null };
       const w = stateWait;
       stateWait = null;
@@ -514,12 +545,20 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     state_memory(clearPtr, n) {
       const clear = new Uint32Array(rt.exports.memory.buffer, clearPtr, 2 * n).slice();
       const g = guestBytes();
-      for (let r = 0; r < n; r++) {
-        const start = clear[2 * r] >>> 0;
-        const end = Math.min(start + (clear[2 * r + 1] >>> 0), g.length);
-        if (end > start) g.fill(0, start, end);
-      }
       const { pages, chunks } = stateWait.state;
+      // What the guest used is zeroed where the state has no page (its pages, in address
+      // order as the ranges are, go over the rest).
+      let q = 0;
+      for (let r = 0; r < n; r++) {
+        let at = clear[2 * r] >>> 0;
+        const end = Math.min(at + (clear[2 * r + 1] >>> 0), g.length);
+        while (at < end) {
+          while (q < pages.length && pages[q] * 4096 + 4096 <= at) q++;
+          const next = q < pages.length ? pages[q] * 4096 : end;
+          if (next > at) g.fill(0, at, Math.min(next, end));
+          at = Math.max(at, next + 4096);
+        }
+      }
       let c = 0;
       let off = 0;
       for (let i = 0; i < pages.length; i++) {
@@ -791,7 +830,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       // a state (see `state_saved`), `load(state)` once the game runs from it; either rejects
       // with why not. One at a time: a new one cancels the one waiting.
       state: {
-        save: () => stateAsk(1, null),
+        save: (spare) => stateAsk(1, spare ?? []),
         load: (state) => stateAsk(2, state),
         cancel: () => {
           x.state_request(0);

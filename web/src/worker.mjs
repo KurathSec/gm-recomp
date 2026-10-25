@@ -17,10 +17,13 @@ let game = null;
 let store = null;
 let storeSeq = 0;
 const storeCalls = new Map();
-const storeCall = (msg, transfer = []) =>
+// (states handed to the store, by call: what takes them back)
+const lent = new Map();
+const storeCall = (msg, transfer = [], onBack = null) =>
   new Promise((resolve, reject) => {
     const id = ++storeSeq;
     storeCalls.set(id, { resolve, reject });
+    if (onBack) lent.set(id, onBack);
     store.postMessage({ ...msg, id }, transfer);
   });
 
@@ -51,23 +54,41 @@ function soon(p) {
   return Promise.race([p, late]).finally(() => clearTimeout(timer));
 }
 
+/** The state last saved or loaded here ({slot, state}): loaded again without the store. */
+let held = null;
+
 async function handleState({ id, op, slot }) {
+  // (the page deleted the slot)
+  if (op === 'drop') {
+    if (held?.slot === slot) held = null;
+    return;
+  }
   const reply = (r) => self.postMessage({ type: 'state', id, ...r });
   if (!input?.state || !store) return reply({ ok: false, error: input ? 'save states are off' : 'the game has not started yet' });
   try {
     if (op === 'save') {
-      const st = await soon(input.state.save());
+      // (the state held here gives its buffers to the new one, which replaces it)
+      const old = held && (await held.state);
+      held = null;
+      const st = await soon(input.state.save(old ? [...new Set(old.chunks.map((c) => c.buffer))] : []));
       reply({ ok: true });
       const time = Date.now();
-      const thumb = await thumbnail(st.frame).catch(() => null);
       const state = { meta: st.meta, pages: st.pages, chunks: st.chunks };
-      storeCall({ op: 'put', game, slot, time, thumb, state }, [st.meta.buffer, st.pages.buffer, ...st.chunks.map((c) => c.buffer)]).then(
+      // (handed to the store, which gives it back as soon as it has its own copy)
+      let back;
+      held = { slot, state: new Promise((res) => (back = res)) };
+      const thumb = await thumbnail(st.frame).catch(() => null);
+      const transfer = [...new Set([state.meta.buffer, state.pages.buffer, ...state.chunks.map((c) => c.buffer)])];
+      storeCall({ op: 'put', game, slot, time, thumb, state }, transfer, back).then(
         () => self.postMessage({ type: 'state-stored', slot, ok: true }),
         (e) => self.postMessage({ type: 'state-stored', slot, ok: false, error: String(e?.message ?? e) }),
       );
     } else if (op === 'load') {
-      const state = await storeCall({ op: 'get', game, slot });
-      await soon(input.state.load(state));
+      if (held?.slot !== slot) {
+        held = null;
+        held = { slot, state: await storeCall({ op: 'get', game, slot }) };
+      }
+      await soon(input.state.load(await held.state));
       reply({ ok: true });
     } else reply({ ok: false, error: `unknown op ${op}` });
   } catch (e) {
@@ -94,6 +115,11 @@ self.onmessage = async ({ data }) => {
   if (data.statePort) {
     store = data.statePort;
     store.onmessage = ({ data: r }) => {
+      if (r.back) {
+        lent.get(r.back)?.(r.state);
+        lent.delete(r.back);
+        return;
+      }
       const c = storeCalls.get(r.id);
       storeCalls.delete(r.id);
       if (r.ok) c?.resolve(r.result);

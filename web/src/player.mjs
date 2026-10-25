@@ -182,7 +182,10 @@ export function playGame(o) {
     save: (slot) => call(w, { type: 'state', op: 'save', slot }),
     /** Goes back to the state in `slot`. */
     load: (slot) => call(w, { type: 'state', op: 'load', slot }),
-    remove: (slot) => call(store, { op: 'delete', game, slot }),
+    remove: (slot) => {
+      w.postMessage({ type: 'state', op: 'drop', slot });
+      return call(store, { op: 'delete', game, slot });
+    },
   };
 
   const offscreen = canvas.transferControlToOffscreen();

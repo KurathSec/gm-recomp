@@ -1,14 +1,16 @@
 // Save states kept in this browser (player.mjs `saveStates`), a worker of their own so
 // compressing and storing them stays off the game's thread. Per game up to SLOTS slots in
 // IndexedDB: database gmrecomp-states, store "states", key "<game>\0<slot>", value {game,
-// slot, time, bytes, stored, thumb: Blob, data: Blob (`pack`ed, gzipped)}. The state last
-// saved or loaded is also kept as it is, to load it again at once.
+// slot, time, bytes, stored, thumb: Blob, data: Blob (gzipped: magic, meta length, page
+// count, meta, page numbers, pages)}. The game's worker keeps the state it last saved or
+// loaded itself, to load it again at once.
 //
 // The page lists and deletes: messages {id, op: 'list' | 'delete', game, slot}, answered
 // {id, ok, result | error}. The game's worker (worker.mjs) hands states in and takes them
 // out through the port the page gives with {op: 'port', port}: {id, op: 'put', game, slot,
 // time, thumb, state} and {id, op: 'get', game, slot}, answered the same way, a put once
-// the state is stored.
+// the state is stored. States are handed over, not copied: a put's state goes back at once
+// as {back: id, state}, once copied here to be compressed.
 
 export const SLOTS = 10;
 
@@ -37,17 +39,24 @@ const committed = (tx) =>
 const key = (game, slot) => `${game}\0${String(slot).padStart(2, '0')}`;
 const range = (game) => IDBKeyRange.bound(`${game}\0`, `${game}\0￿`);
 
-/** {game, slot, time, state}: the state last saved or loaded. */
-let kept = null;
 /** Per slot, the latest put: an older one still compressing is not stored over it. */
 const latest = new Map();
 
 const MAGIC = 0x31534d47; // "GMS1"
 
-/** A state as bytes: magic, meta length, page count, meta, page numbers, pages. */
-function pack(state) {
-  const head = new Uint32Array([MAGIC, state.meta.length, state.pages.length]);
-  return new Blob([head, state.meta, state.pages, ...state.chunks]);
+/** A state gzipped (see the value's `data` above) and its size before. */
+async function compress(state) {
+  const gz = new CompressionStream('gzip');
+  const out = new Response(gz.readable).blob();
+  const w = gz.writable.getWriter();
+  const parts = [new Uint8Array(new Uint32Array([MAGIC, state.meta.length, state.pages.length]).buffer), state.meta, new Uint8Array(state.pages.buffer, state.pages.byteOffset, state.pages.byteLength)];
+  let bytes = 0;
+  for (const p of [...parts, ...state.chunks]) {
+    await w.write(p);
+    bytes += p.length;
+  }
+  await w.close();
+  return { data: await out, bytes };
 }
 
 function unpack(buf) {
@@ -61,7 +70,6 @@ function unpack(buf) {
   return { meta, pages, chunks: [data] };
 }
 
-const gzip = (blob) => new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
 const gunzip = (blob) => new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
 
 async function list(game) {
@@ -69,28 +77,33 @@ async function list(game) {
   return all.map(({ slot, time, bytes, stored, thumb }) => ({ slot, time, bytes, stored, thumb }));
 }
 
-async function put({ game, slot, time, thumb, state }) {
-  kept = { game, slot, time, state };
+/** A state's buffers, to hand it over. */
+const buffers = (state) => [...new Set([state.meta.buffer, state.pages.buffer, ...state.chunks.map((c) => c.buffer)])];
+
+async function put({ id, game, slot, time, thumb, state }, target) {
   latest.set(key(game, slot), time);
-  const raw = pack(state);
-  const data = await gzip(raw);
+  // A copy is compressed; the state goes back to the game's worker at once, which loads it
+  // again from there (also when the copy could not be made).
+  let copy;
+  try {
+    copy = { meta: state.meta.slice(), pages: state.pages.slice(), chunks: state.chunks.map((c) => c.slice()) };
+  } finally {
+    target.postMessage({ back: id, state }, buffers(state));
+  }
+  const { data, bytes } = await compress(copy);
   if (latest.get(key(game, slot)) !== time) return;
   const tx = (await db()).transaction('states', 'readwrite');
-  tx.objectStore('states').put({ game, slot, time, bytes: raw.size, stored: data.size, thumb, data }, key(game, slot));
+  tx.objectStore('states').put({ game, slot, time, bytes, stored: data.size, thumb, data }, key(game, slot));
   await committed(tx);
 }
 
 async function get({ game, slot }) {
-  if (kept && kept.game === game && kept.slot === slot) return kept.state;
   const v = await done((await db()).transaction('states').objectStore('states').get(key(game, slot)));
   if (!v) throw new Error('empty slot');
-  const state = unpack(await gunzip(v.data));
-  kept = { game, slot, time: v.time, state };
-  return state;
+  return unpack(await gunzip(v.data));
 }
 
 async function remove({ game, slot }) {
-  if (kept && kept.game === game && kept.slot === slot) kept = null;
   latest.delete(key(game, slot));
   const tx = (await db()).transaction('states', 'readwrite');
   tx.objectStore('states').delete(key(game, slot));
@@ -108,7 +121,8 @@ function serve(target) {
     const f = ops[data.op];
     try {
       if (!f) throw new Error(`unknown op ${data.op}`);
-      target.postMessage({ id: data.id, ok: true, result: await f(data) });
+      const result = await f(data, target);
+      target.postMessage({ id: data.id, ok: true, result }, data.op === 'get' ? buffers(result) : []);
     } catch (e) {
       target.postMessage({ id: data.id, ok: false, error: String(e?.message ?? e) });
     }
