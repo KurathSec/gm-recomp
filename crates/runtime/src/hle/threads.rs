@@ -25,9 +25,9 @@ fn ok(nargs: u32, v: u32) -> ApiResult {
 
 /// Whether waiting on `h` is over; `consume` takes the signal (auto-reset events).
 pub fn signaled(p: &mut Process, h: u32, consume: bool) -> bool {
-    if let Some(i) = p.timers_due.iter().position(|&(t, _)| t == h) {
+    if let Some(i) = p.timers_due.iter().position(|&(t, ..)| t == h) {
         if p.timers_due[i].1 <= p.clock_us {
-            p.timers_due.remove(i);
+            p.timer_fired(i);
             if let Some(Handle::Event { signaled, .. }) = p.handles.get_mut(&h) {
                 *signaled = true;
             }
@@ -129,7 +129,7 @@ fn next_wake(p: &Process) -> Option<u64> {
             ThreadState::Waiting { until, .. } | ThreadState::CondVar { until, .. } => *until,
             _ => None,
         })
-        .chain(p.timers_due.iter().map(|&(_, at)| at))
+        .chain(p.timers_due.iter().map(|&(_, at, _)| at))
         .filter(|&at| at > p.clock_us)
         .min()
 }

@@ -498,8 +498,8 @@ pub struct Process {
     pub soundfont_failed: bool,
     /// Game controllers 0..3.
     pub pads: [crate::hle::PadState; 4],
-    /// Waitable timers: (handle, virtual time they become signaled).
-    pub timers_due: Vec<(u32, u64)>,
+    /// Waitable timers: (handle, virtual time they become signaled, period in µs or 0).
+    pub timers_due: Vec<(u32, u64, u64)>,
     #[serde(skip)]
     pub textures_created: u64,
     pub next_d3d_handle: u32,
@@ -711,6 +711,17 @@ impl Process {
         self.next_handle += 4;
         self.handles.insert(id, h);
         id
+    }
+
+    /// Waitable timer `i` reached its due time: a periodic one is due again at its next
+    /// period after now (missed periods signal once, as on Windows), a one-shot one is done.
+    pub fn timer_fired(&mut self, i: usize) {
+        let (_, at, period) = self.timers_due[i];
+        if period == 0 {
+            self.timers_due.remove(i);
+        } else {
+            self.timers_due[i].1 = at + period * ((self.clock_us.saturating_sub(at)) / period + 1);
+        }
     }
 
     pub fn new_gdi(&mut self, o: GdiObject) -> u32 {

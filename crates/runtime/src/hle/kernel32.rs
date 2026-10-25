@@ -1025,7 +1025,7 @@ pub fn register(r: &mut Registry) {
         let (h, timeout) = (c.arg(0), c.arg(1));
         // Events: wait until signaled; other objects are always signaled (single thread).
         // A waitable timer becomes signaled at its due time.
-        if let Some(i) = c.p.timers_due.iter().position(|&(t, _)| t == h) {
+        if let Some(i) = c.p.timers_due.iter().position(|&(t, ..)| t == h) {
             let at = c.p.timers_due[i].1;
             let now = c.p.clock_us;
             if at > now {
@@ -1035,7 +1035,7 @@ pub fn register(r: &mut Registry) {
                 }
                 c.advance_clock(at - now);
             }
-            c.p.timers_due.remove(i);
+            c.p.timer_fired(i);
             if let Some(Handle::Event { signaled, manual }) = c.p.handles.get_mut(&h) {
                 *signaled = *manual;
             }
@@ -1099,6 +1099,8 @@ pub fn register(r: &mut Registry) {
     r.add(k, "CloseHandle", |c| {
         let h = c.arg(0);
         c.p.handles.remove(&h);
+        // (closing a waitable timer cancels it)
+        c.p.timers_due.retain(|&(t, ..)| t != h);
         ok(1, 1)
     });
     r.add(k, "DuplicateHandle", |c| {
@@ -3826,12 +3828,15 @@ pub fn register_extra(r: &mut Registry) {
     });
     r.alias(k, "CreateWaitableTimerA", k, "CreateWaitableTimerW");
     r.add(k, "SetWaitableTimer", |c| {
-        let (h, due_p) = (c.arg(0), c.arg(1));
+        let (h, due_p, period_ms) = (c.arg(0), c.arg(1), c.arg(2));
         let due = c.host.read_u64(due_p).unwrap_or(0) as i64;
         // negative: relative, in 100 ns units; positive: absolute FILETIME (taken as now)
         let delay_us = if due < 0 { (-due) as u64 / 10 } else { 0 };
         let at = c.p.clock_us + delay_us;
-        c.p.timers_due.push((h, at));
+        // Setting a timer again replaces its due time. FMOD's WASAPI output waits on a
+        // 10 ms periodic one to mix, and the game waits for its mixer thread.
+        c.p.timers_due.retain(|&(t, ..)| t != h);
+        c.p.timers_due.push((h, at, period_ms as u64 * 1000));
         if let Some(Handle::Event { signaled, .. }) = c.p.handles.get_mut(&h) {
             *signaled = delay_us == 0;
         }
@@ -3839,7 +3844,7 @@ pub fn register_extra(r: &mut Registry) {
     });
     r.add(k, "CancelWaitableTimer", |c| {
         let h = c.arg(0);
-        c.p.timers_due.retain(|&(t, _)| t != h);
+        c.p.timers_due.retain(|&(t, ..)| t != h);
         ok(1, 1)
     });
     // GameMaker 8.2's extensions (gm82core, gm82net, gm82dx9): on demand, so the ids of
