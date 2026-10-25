@@ -312,12 +312,42 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       // resumes at once until one comes again.
       const chromium = typeof requestAnimationFrame === 'function' && !!self.navigator?.userAgentData;
       let gated = chromium;
+      // A game faster than the display (a game speed of 75 or 120 on a 60 Hz screen) ran
+      // at the display's rate, one frame per animation frame. Its frames due before the
+      // next display frame run at once, without yielding: the one just presented would
+      // not be shown, and committing it held the next one back. The display's period is
+      // the shortest of the last 16 gaps between animation frames.
+      let lastFrameAt = 0;
+      let displayStep = 0;
+      const gaps = [];
+      const noteFrame = (t) => {
+        if (lastFrameAt && t - lastFrameAt > 2) {
+          gaps.push(t - lastFrameAt);
+          if (gaps.length > 16) gaps.shift();
+          if (gaps.length >= 4) displayStep = Math.min(...gaps);
+        }
+        lastFrameAt = t;
+      };
+      const runNow = () => {
+        if (!displayStep || frameStep > displayStep - 1) return false;
+        const now = performance.now();
+        const nextDisplay = lastFrameAt + Math.ceil((now - lastFrameAt) / displayStep) * displayStep;
+        return due(shownClock + frameStep) < nextDisplay - 2;
+      };
+      // (frames in a row run without yielding, at most 4: input still arrives)
+      let unshown = 0;
       const resume = () => {
+        if (gated && unshown < 4 && runNow()) {
+          unshown++;
+          return wakeUp();
+        }
+        unshown = 0;
         if (!gated) return channel.port2.postMessage(0);
         let done = false;
-        const go = () => {
+        const go = (t) => {
           if (done) return;
           done = true;
+          if (t !== undefined) noteFrame(t);
           channel.port2.postMessage(0);
         };
         requestAnimationFrame(go);
