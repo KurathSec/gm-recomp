@@ -327,6 +327,42 @@ pub fn intrinsics(shared_memory: bool) -> (Vec<u8>, Vec<(&'static str, String)>)
     (module.finish(), names)
 }
 
+/// Delphi's System.Move (`cfg::is_delphi_move`) as one `memory.copy`: memmove(edx, eax,
+/// ecx) for a count above zero, then its `ret` (eip the return address, esp past it).
+fn delphi_move() -> wasm_encoder::Function {
+    use wasm_encoder::{BlockType, Function, Instruction as W, MemArg};
+    const EAX: u32 = 0;
+    const ECX: u32 = 1;
+    const EDX: u32 = 2;
+    const ESP: u32 = 4;
+    let mut f = Function::new([]);
+    f.instruction(&W::LocalGet(ECX));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::I32GtS);
+    f.instruction(&W::LocalGet(EAX));
+    f.instruction(&W::LocalGet(EDX));
+    f.instruction(&W::I32Ne);
+    f.instruction(&W::I32And);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::LocalGet(EDX));
+    f.instruction(&W::LocalGet(EAX));
+    f.instruction(&W::LocalGet(ECX));
+    f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    f.instruction(&W::End);
+    f.instruction(&W::LocalGet(ESP));
+    f.instruction(&W::I32Load(MemArg { offset: 0, align: 0, memory_index: 0 }));
+    f.instruction(&W::GlobalSet(abi::Global::Eip as u32));
+    f.instruction(&W::LocalGet(ESP));
+    f.instruction(&W::I32Const(4));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::LocalSet(ESP));
+    for r in 0..8 {
+        f.instruction(&W::LocalGet(r));
+    }
+    f.instruction(&W::End);
+    f
+}
+
 impl<'m> Translator<'m> {
     pub fn new(mem: &'m dyn GuestMem, opts: Options) -> Self {
         Translator { mem, opts, cfgs: BTreeMap::new(), unimplemented: Vec::new(), cache: Default::default() }
@@ -479,6 +515,14 @@ impl<'m> Translator<'m> {
         let mut out_funcs = Vec::new();
         let ranges: Vec<(u32, Vec<(u32, u32)>)> = self.cfgs.iter().map(|(&e, cfg)| (e, code_ranges(cfg))).collect();
         for (&entry, cfg) in &self.cfgs {
+            if !x64 && cfg::is_delphi_move(self.mem, entry) {
+                functions.function(types::FUNC);
+                let name = abi::export_name(entry);
+                exports.export(&name, ExportKind::Func, func_index[&entry]);
+                code.function(&delphi_move());
+                out_funcs.push((entry, name));
+                continue;
+            }
             let emit = |x87_inline: bool| {
                 let mut fe = if x64 { lift::FuncEmit::new64(cfg, &func_index) } else { lift::FuncEmit::new(cfg, &func_index) };
                 fe.probe = self.opts.probes.contains(&entry);

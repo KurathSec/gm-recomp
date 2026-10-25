@@ -161,6 +161,43 @@ pub fn build(mem: &dyn GuestMem, entry: u32, info: &FuncInfo, inline: bool, cach
 /// The callee at `target` as blocks to inline, if it is small: a few instructions
 /// within 4 KiB after its entry, leaving by `ret` or direct jumps to functions (no
 /// jump tables or computed jumps; calls are fine).
+/// Delphi's System.Move as GameMaker 8's runners have it (John O'Harrow's FastCode one):
+/// its entry, with the jump table's address left out (`None`), and its loops for more
+/// than 32 bytes, 0x5c bytes in. It moves 8 bytes at a time through the x87 unit
+/// (fild/fistp qword), which here takes the exact path for every string a runner copies.
+const DELPHI_MOVE_ENTRY: [Option<u8>; 54] = {
+    const B: [u8; 54] = [
+        0x39, 0xd0, 0x74, 0x31, 0x83, 0xf9, 0x20, 0x77, 0x7c, 0x83, 0xe9, 0x08, 0x7f, 0x07, 0xff, 0x24, 0x8d, 0, 0, 0, 0, 0xdf, 0x2c, 0x01, 0xdf, 0x28, 0x83,
+        0xf9, 0x08, 0x7e, 0x11, 0xdf, 0x68, 0x08, 0x83, 0xf9, 0x10, 0x7e, 0x06, 0xdf, 0x68, 0x10, 0xdf, 0x7a, 0x10, 0xdf, 0x7a, 0x08, 0xdf, 0x3a, 0xdf, 0x3c, 0x11, 0xc3,
+    ];
+    let mut out = [None; 54];
+    let mut i = 0;
+    while i < 54 {
+        if i < 17 || i > 20 {
+            out[i] = Some(B[i]);
+        }
+        i += 1;
+    }
+    out
+};
+const DELPHI_MOVE_LOOPS: [u8; 90] = [
+    0x52, 0xdf, 0x28, 0x8d, 0x44, 0x01, 0xf8, 0x8d, 0x4c, 0x0a, 0xf8, 0xdf, 0x28, 0x51, 0xf7, 0xd9, 0x83, 0xe2, 0xf8, 0x8d, 0x4c, 0x0a, 0x08, 0x5a, 0xdf, 0x2c, 0x01, 0xdf, 0x3c, 0x11,
+    0x83, 0xc1, 0x08, 0x7c, 0xf5, 0xdf, 0x3a, 0x5a, 0xdf, 0x3a, 0xc3, 0x7e, 0x2e, 0x39, 0xd0, 0x77, 0xd1, 0x29, 0xca, 0x39, 0xd0, 0x8d, 0x14, 0x11, 0x76, 0xc8, 0x83, 0xe9, 0x08, 0x51,
+    0xdf, 0x2c, 0x01, 0xdf, 0x28, 0x01, 0xd1, 0x83, 0xe1, 0xf8, 0x29, 0xd1, 0xdf, 0x2c, 0x01, 0xdf, 0x3c, 0x11, 0x83, 0xe9, 0x08, 0x7f, 0xf5, 0x59, 0xdf, 0x3a, 0xdf, 0x3c, 0x11, 0xc3,
+];
+
+/// Whether `entry` is that Move: memmove(edx, eax, ecx) for a count above zero, which
+/// changes only eax, ecx, edx and the flags, none of which a caller keeps (the register
+/// convention), and the x87 registers it empties again.
+pub fn is_delphi_move(mem: &dyn GuestMem, entry: u32) -> bool {
+    let mut head = [0u8; 54];
+    let mut loops = [0u8; 90];
+    mem.read(entry, &mut head)
+        && head.iter().zip(&DELPHI_MOVE_ENTRY).all(|(b, want)| want.is_none_or(|w| *b == w))
+        && mem.read(entry.wrapping_add(0x5c), &mut loops)
+        && loops == DELPHI_MOVE_LOOPS
+}
+
 fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache, bits: Bits) -> Option<std::rc::Rc<Cfg>> {
     if let Some(c) = cache.borrow().get(&(target, depth)) {
         return c.clone();
@@ -171,6 +208,10 @@ fn inlinable(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache:
 }
 
 fn inlinable_uncached(mem: &dyn GuestMem, target: u32, info: &FuncInfo, depth: u8, cache: &InlineCache, bits: Bits) -> Option<Cfg> {
+    // (Delphi's Move is replaced by the translator as a whole: never inlined)
+    if matches!(bits, Bits::B32) && is_delphi_move(mem, target) {
+        return None;
+    }
     let c = build_with(mem, target, info, depth, cache, bits).ok()?;
     let n: usize = c.blocks.values().map(|b| b.instrs.len()).sum();
     let simple = n <= MAX_INLINE_INSTRS
