@@ -63,6 +63,8 @@ pub struct State11 {
     pub target: (u32, u32, u32),
     /// The virtual time of the last Present.
     pub last_present_us: u64,
+    /// Presents in a row that came less than half a display frame after the one before.
+    pub short_presents: u32,
     pub shaders: HashMap<u32, super::dxbc::Shader>,
     /// Input layouts: (semantic name, index, DXGI format, slot, offset).
     pub layouts: HashMap<u32, Vec<(String, u32, u32, u32, u32)>>,
@@ -623,14 +625,27 @@ fn output_find_closest_mode(c: &mut Ctx) -> ApiResult {
 
 /// A display's frame (µs): what a runner that does not wait for its next frame gets.
 const DISPLAY_FRAME_US: u64 = 1_000_000 / 60;
+/// Short frames in a row after which a runner presenting without vsync is taken as one
+/// that never waits.
+const UNPACED_AFTER: u32 = 30;
 
 fn sc_present(c: &mut Ctx) -> ApiResult {
     // A runner that does not wait between frames (a game speed above what a display
     // shows, such as 9999) gets a display's frame, as vsync would give it: its
     // delta_time then follows what the player sees instead of a tenth of a millisecond.
+    // With vsync asked for (a sync interval) every short frame waits for it. Without,
+    // only a runner that keeps not waiting does: one running late once (a room change)
+    // presents its next frame at once, and a display frame then left it late again,
+    // every frame, so OVERREV's game speed of 120 dropped to 60 for good.
+    let sync_interval = c.arg(1);
     let since = c.p.clock_us.saturating_sub(c.p.d3d11.last_present_us);
     if c.p.d3d11.last_present_us != 0 && since < DISPLAY_FRAME_US / 2 {
-        c.advance_clock(DISPLAY_FRAME_US - since);
+        c.p.d3d11.short_presents += 1;
+        if sync_interval != 0 || c.p.d3d11.short_presents > UNPACED_AFTER {
+            c.advance_clock(DISPLAY_FRAME_US - since);
+        }
+    } else {
+        c.p.d3d11.short_presents = 0;
     }
     c.p.d3d11.last_present_us = c.p.clock_us;
     c.p.frames_presented += 1;
