@@ -719,6 +719,10 @@ export class D3DGL {
   }
 
   shaderCreate(id, vertex, glsl) {
+    // (a loaded save state's shader that is here already: it and its programs stay)
+    const had = this.shaders?.get(id);
+    if (had?.vertex === vertex && had.glsl === glsl) return;
+    if (had) this.shaderDelete(id);
     (this.shaders ??= new Map()).set(id, { vertex, glsl });
     // Compile now so a translation problem shows up when the game creates the shader.
     const gl = this.gl;

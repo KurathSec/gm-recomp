@@ -170,8 +170,9 @@ async function handleState({ id, op, slot, state: given, version, changes }) {
     } else if (op === 'load') {
       if (held?.slot !== slot) {
         held = null;
-        // (handed over by the store, not shared: the next save starts with fresh memory)
-        held = { slot, state: await storeCall({ op: 'get', game, slot }), spare: false };
+        // (in shared memory from the store, which has done with it: the next save may go into it)
+        const state = await storeCall({ op: 'get', game, slot });
+        held = { slot, state, spare: state.chunks.every((c) => c.buffer instanceof SharedArrayBuffer) };
       }
       await soon(input.state.load(held.state));
       reply({ ok: true });
@@ -419,7 +420,7 @@ self.onmessage = async ({ data }) => {
     };
     // the guest's network connections go through PlayOnline's relay, when it is on
     const relayUrl = mods.find((m) => m.id === 'PlayOnline')?.config.RelayUrl || undefined;
-    const status = await runGame({ relayUrl, prompt, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile, ctl: instant ? ctl : undefined });
+    const status = await runGame({ relayUrl, prompt, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile, ctl: instant ? ctl : undefined, stateThreads: store ? Math.min(3, (navigator.hardwareConcurrency || 2) - 2) : 0 });
     await saving;
     await profileSaving;
     self.postMessage({ type: 'done', status });

@@ -316,7 +316,7 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     let mut new = body.process;
     let keep = kept_textures(&live, &new);
     // From here on the state replaces the process; a failure stops it.
-    drop_gpu_objects(&mut live, &keep);
+    drop_gpu_objects(&mut live, &new, &keep);
     for &(a, n) in &body.ranges {
         if m.ensure_mapped(a, n).is_err() {
             m.engine().p = Some(live);
@@ -463,14 +463,25 @@ fn kept_textures(live: &Process, new: &Process) -> HashSet<u32> {
         .collect()
 }
 
-/// Deletes the host's copies of the process's textures (but those in `keep`) and shaders.
-fn drop_gpu_objects(p: &mut Process, keep: &HashSet<u32>) {
-    let ids: Vec<(u32, bool, bool)> = p.d3d_objects.iter().map(|(&id, o)| (id, o.data.get("gpu").copied().unwrap_or(0) != 0, o.data.get("shader").copied().unwrap_or(0) != 0)).collect();
-    for (id, tex, shader) in ids {
+/// The ids of a process's shaders.
+fn shader_ids(p: &Process) -> HashSet<u32> {
+    let d3d9 = p.d3d_objects.iter().filter(|(_, o)| o.data.get("shader").copied().unwrap_or(0) != 0).map(|(&id, _)| id);
+    d3d9.chain(p.d3d11.shaders.keys().copied()).collect()
+}
+
+/// Deletes the host's copies of the process's textures (but those in `keep`) and of the
+/// shaders the loaded process `new` has not (the host keeps one made again the same, and
+/// the programs made of it).
+fn drop_gpu_objects(p: &mut Process, new: &Process, keep: &HashSet<u32>) {
+    let ids: Vec<(u32, bool)> = p.d3d_objects.iter().map(|(&id, o)| (id, o.data.get("gpu").copied().unwrap_or(0) != 0)).collect();
+    for (id, tex) in ids {
         if tex && !keep.contains(&id) {
             p.gpu.texture_delete(id);
         }
-        if shader || p.d3d11.shaders.contains_key(&id) {
+    }
+    let theirs = shader_ids(new);
+    for id in shader_ids(p) {
+        if !theirs.contains(&id) {
             p.gpu.shader_delete(id);
         }
     }

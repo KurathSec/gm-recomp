@@ -8,8 +8,8 @@ import { D3DGL } from './gpu.mjs';
 // (crates/web/src/lib.rs GLUE_FUNCS; nop64 is 64-bit code's no-op function)
 const GLUE_FUNCS = ['g2r', 'r2g', 'fill', 'get', 'set', 'size', 'grow', 'vget', 'vset', 'call', 'gcopy', 'rget', 'rset', 'get64', 'set64', 'call64', 'nop64'];
 const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
-// A save state's memory goes in chunks of this size.
-const STATE_CHUNK = 16 << 20;
+// A save state's fresh buffer is mapped by helper threads in chunks of this size.
+const MAP_CHUNK = 1 << 20;
 
 /**
  * @param {object} o
@@ -47,8 +47,10 @@ const STATE_CHUNK = 16 << 20;
  * @param {(modules: {base: number, size: number, id: number}[]) => Promise<Uint32Array|null>} [o.sharedProfile]
  *   without `profile`: what other games with the same modules needed (a runner's code is the same
  *   in every game built with it)
+ * @param {number} [o.stateThreads]  helper threads (state-map.mjs) that map save states' fresh
+ *   buffers
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl, prompt, ctl }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl, prompt, ctl, stateThreads = 0 }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -417,6 +419,23 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // The save or load asked for: {resolve, reject, state (a load's)}.
   let stateWait = null;
   const guestBytes = () => new Uint8Array(glue.exports.mem.buffer);
+  // Save states' helper threads (`stateThreads`): all, and those that have started.
+  const stateThreadsAll = [];
+  const stateHelpers = [];
+  // The page numbers a save finds (kept for the next).
+  let stateList = null;
+  // The helpers map `bytes` of fresh buffer `buf` while this thread copies into it, a chunk
+  // at a time: returns what to call before writing into chunk c (it takes those no helper
+  // has, or waits for the helper's), or null without helpers.
+  const mapAhead = (buf, bytes) => {
+    if (!stateHelpers.length) return null;
+    const n = Math.ceil(bytes / MAP_CHUNK);
+    const st = new Int32Array(new SharedArrayBuffer(4 * Math.max(1, n)));
+    for (const h of stateHelpers) h.postMessage({ buf, states: st.buffer, n, chunk: MAP_CHUNK });
+    return (c) => {
+      if (Atomics.compareExchange(st, c, 0, 2) === 1) while (Atomics.load(st, c) === 1) Atomics.wait(st, c, 1);
+    };
+  };
   const host = {
     // A dialog for the player (hle Host::prompt: GameMaker 8's message, question and text
     // dialogs, I wanna play online's input_box): `prompt(title, text, default | null, kind)`
@@ -476,63 +495,56 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       const meta = mem().slice(metaPtr, metaPtr + metaLen);
       const ranges = new Uint32Array(rt.exports.memory.buffer, rangesPtr, 2 * n).slice();
       const g = guestBytes();
-      const words = new Int32Array(g.buffer, 0, g.length >>> 2);
-      const pages = [];
-      const chunks = [];
-      let chunk = null;
-      let used = 0;
-      // The pages go into the buffers of the state this one replaces where there is one:
-      // writing into fresh memory cost three times as much (each of its pages is mapped as
-      // it is first written). Pages in a row are copied at once. Fresh buffers are shared
-      // memory: the store's worker compresses them while the game's keeps them to load.
-      const spare = stateWait?.state ?? [];
-      let si = 0;
-      let sOff = 0;
-      const nextChunk = () => {
-        for (; si < spare.length; si++, sOff = 0) {
-          const n = Math.min(STATE_CHUNK, spare[si].byteLength - sOff);
-          if (n >= 4096) {
-            const c = new Uint8Array(spare[si], sOff, n - (n % 4096));
-            sOff += c.length;
-            return c;
-          }
-        }
-        return new Uint8Array(new SharedArrayBuffer(STATE_CHUNK));
-      };
-      const copy = (from, to) => {
-        while (from < to) {
-          if (!chunk || used === chunk.length) {
-            chunk = nextChunk();
-            chunks.push(chunk);
-            used = 0;
-          }
-          const n = Math.min(to - from, chunk.length - used);
-          chunk.set(g.subarray(from, from + n), used);
-          used += n;
-          from += n;
-        }
-      };
+      // [first, end) page numbers
+      const spans = [];
+      let total = 0;
       for (let r = 0; r < n; r++) {
         const start = ranges[2 * r] >>> 0;
         const end = Math.min(start + (ranges[2 * r + 1] >>> 0), g.length);
-        let run = -1;
-        let at = start - (start % 4096);
-        for (; at < end; at += 4096) {
-          let k = at >>> 2;
-          const stop = k + 1024;
-          while (k < stop && (words[k] | words[k + 1] | words[k + 2] | words[k + 3] | words[k + 4] | words[k + 5] | words[k + 6] | words[k + 7]) === 0) k += 8;
-          if (k === stop) {
-            if (run >= 0) copy(run, at);
-            run = -1;
-            continue;
-          }
-          pages.push(at / 4096);
-          if (run < 0) run = at;
-        }
-        if (run >= 0) copy(run, at);
+        if (end <= start) continue;
+        spans.push([Math.floor(start / 4096), Math.ceil(end / 4096)]);
+        total += spans.at(-1)[1] - spans.at(-1)[0];
       }
-      if (chunk) chunks[chunks.length - 1] = chunk.subarray(0, used);
-      const st = { meta, pages: Uint32Array.from(pages), chunks, frame: gpu?.grab() ?? null };
+      // The non-zero pages are found, then copied (pages in a row at once) into one buffer:
+      // that of the state this one replaces where it is big enough, as writing into fresh
+      // memory cost three times as much (each of its pages is mapped as it is first
+      // written; the helpers map a fresh one's while this thread copies). Fresh ones are
+      // shared memory: the store's worker compresses them while the game's keeps them to load.
+      if (!stateList || stateList.length < total) stateList = new Uint32Array(Math.ceil(total * 1.125));
+      const list = stateList;
+      let count = 0;
+      const zpage = glue.exports.zpage;
+      for (const [first, end] of spans) {
+        for (let p = zpage(first, end, 0); p < end; p = zpage(p, end, 0)) {
+          const q = zpage(p, end, 1);
+          while (p < q) list[count++] = p++;
+        }
+      }
+      const bytes = count * 4096;
+      const spare = Array.isArray(stateWait?.state) ? stateWait.state : [];
+      let buf = spare.find((b) => b instanceof SharedArrayBuffer && b.byteLength >= bytes);
+      let mapped = null;
+      if (!buf) {
+        buf = new SharedArrayBuffer(Math.max(4096, Math.ceil((bytes * 1.125) / 4096) * 4096));
+        mapped = mapAhead(buf, bytes);
+      }
+      const out = new Uint8Array(buf, 0, bytes);
+      let off = 0;
+      for (let i = 0; i < count; ) {
+        let j = i + 1;
+        while (j < count && list[j] === list[j - 1] + 1) j++;
+        let at = list[i] * 4096;
+        const end = list[j - 1] * 4096 + 4096;
+        while (at < end) {
+          const n = mapped ? Math.min(end - at, MAP_CHUNK - (off % MAP_CHUNK)) : end - at;
+          mapped?.(Math.floor(off / MAP_CHUNK));
+          out.set(g.subarray(at, at + n), off);
+          at += n;
+          off += n;
+        }
+        i = j;
+      }
+      const st = { meta, pages: list.slice(0, count), chunks: [out], frame: gpu?.grab() ?? null };
       const w = stateWait;
       stateWait = null;
       w?.resolve(st);
@@ -560,17 +572,23 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
           at = Math.max(at, next + 4096);
         }
       }
+      // (pages in a row, from one chunk, at once)
       let c = 0;
       let off = 0;
-      for (let i = 0; i < pages.length; i++) {
-        const at = pages[i] * 4096;
-        if (at + 4096 > g.length) return 0;
+      for (let i = 0; i < pages.length; ) {
         while (off >= chunks[c].length) {
           c++;
           off = 0;
         }
-        g.set(chunks[c].subarray(off, off + 4096), at);
-        off += 4096;
+        let j = i + 1;
+        const most = i + (chunks[c].length - off) / 4096;
+        while (j < most && j < pages.length && pages[j] === pages[j - 1] + 1) j++;
+        const at = pages[i] * 4096;
+        const len = (j - i) * 4096;
+        if (at + len > g.length) return 0;
+        g.set(chunks[c].subarray(off, off + len), at);
+        off += len;
+        i = j;
       }
       return 1;
     },
@@ -870,6 +888,11 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // (texture content stamps unlike any other copy's: runtime::state keeps textures by them)
   x.set_content_seed(crypto.getRandomValues(new Uint32Array(1))[0] || 1);
   if (monitor) x.set_monitor(1);
+  for (let i = 0; i < stateThreads; i++) {
+    const h = new Worker(new URL('./state-map.mjs', import.meta.url), { type: 'module' });
+    h.onmessage = () => stateHelpers.push(h);
+    stateThreadsAll.push(h);
+  }
   // [kind, frame, clock, a, b, c]: a recorded session's input
   for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);
   for (let i = 0, n = x.module_count(); i < n; i++) startModules.push({ base: x.module_at(i, 0), size: x.module_at(i, 1), id: x.module_at(i, 2) >>> 0 });
@@ -886,6 +909,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     const q = (p) => tail[Math.min(tail.length - 1, Math.floor(p * tail.length))].toFixed(2);
     print(`frame cost (ms, second half of the run): median ${q(0.5)}  p95 ${q(0.95)}  p99 ${q(0.99)}  max ${q(1)}`);
   }
+  for (const h of stateThreadsAll) h.terminate();
   if (onExit) onExit({ guestMemory: glue.exports.mem });
   return status;
 }

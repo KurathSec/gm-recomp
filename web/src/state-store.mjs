@@ -68,26 +68,44 @@ async function compress(state) {
   return { data: await out, bytes };
 }
 
-function unpack(buf) {
-  const head = new Uint32Array(buf, 0, 3);
+/** A state from its gzipped bytes, its memory in shared memory (the game's worker may save its next state into it). */
+async function unpack(blob) {
+  const reader = blob.stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+  let left = new Uint8Array(0);
+  const fill = async (out) => {
+    for (let at = 0; at < out.length; ) {
+      if (!left.length) {
+        const { done, value } = await reader.read();
+        if (done) throw new Error('not a save state');
+        left = value;
+      }
+      const n = Math.min(out.length - at, left.length);
+      out.set(left.subarray(0, n), at);
+      left = left.subarray(n);
+      at += n;
+    }
+  };
+  const head = new Uint32Array(3);
+  await fill(new Uint8Array(head.buffer));
   if (head[0] !== MAGIC) throw new Error('not a save state');
   const [, metaLen, n] = head;
-  const meta = new Uint8Array(buf, 12, metaLen);
-  // (the page numbers are copied: their offset need not be aligned)
-  const pages = new Uint32Array(buf.slice(12 + metaLen, 12 + metaLen + 4 * n));
-  const data = new Uint8Array(buf, 12 + metaLen + 4 * n, 4096 * n);
+  const meta = new Uint8Array(metaLen);
+  await fill(meta);
+  const pages = new Uint32Array(n);
+  await fill(new Uint8Array(pages.buffer));
+  const data = new Uint8Array(new SharedArrayBuffer(Math.max(1, 4096 * n)), 0, 4096 * n);
+  await fill(data);
+  reader.cancel().catch(() => {});
   return { meta, pages, chunks: [data] };
 }
-
-const gunzip = (blob) => new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
 
 async function list(game) {
   const all = await done((await db()).transaction('states').objectStore('states').getAll(range(game)));
   return all.map(({ slot, time, bytes, stored, thumb }) => ({ slot, time, bytes, stored, thumb }));
 }
 
-/** A state's buffers, to hand it over. */
-const buffers = (state) => [...new Set([state.meta.buffer, state.pages.buffer, ...state.chunks.map((c) => c.buffer)])];
+/** A state's buffers, to hand it over (shared memory is shared). */
+const buffers = (state) => [...new Set([state.meta.buffer, state.pages.buffer, ...state.chunks.map((c) => c.buffer)])].filter((b) => !(b instanceof SharedArrayBuffer));
 
 async function put({ game, slot, time, thumb, state }) {
   latest.set(key(game, slot), time);
@@ -101,7 +119,7 @@ async function put({ game, slot, time, thumb, state }) {
 async function get({ game, slot }) {
   const v = await done((await db()).transaction('states').objectStore('states').get(key(game, slot)));
   if (!v) throw new Error('empty slot');
-  return unpack(await gunzip(v.data));
+  return unpack(v.data);
 }
 
 async function remove({ game, slot }) {

@@ -551,6 +551,7 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     types.ty().function([ValType::I32], [ValType::I64]); // 7: get64
     types.ty().function([ValType::I32, ValType::I64], []); // 8: set64
     types.ty().function([ValType::I64; 16], [ValType::I64; 16]); // 9: a translated 64-bit function
+    types.ty().function([ValType::I32; 3], [ValType::I32]); // 10: zpage
     let mut imports = ImportSection::new();
     imports.import("rt", "memory", EntityType::Memory(MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None }));
     imports.import(
@@ -751,6 +752,40 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     }
     f.instruction(&I::End);
     code.function(&f);
+    // zpage(p, end, zero): the first of guest memory's 4 KB pages p..end that is all zero
+    // (`zero` 1) or is not (0), else end; save states find the pages to keep with it
+    // (host.mjs). Locals 3: address, 4: 64-byte blocks left.
+    funcs.function(10);
+    let mut f = Function::new([(2, ValType::I32)]);
+    let g = |offset| I::V128Load(wasm_encoder::MemArg { offset, align: 4, memory_index: 1 });
+    f.instruction(&I::Block(wasm_encoder::BlockType::Empty));
+    f.instruction(&I::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&I::LocalGet(0)).instruction(&I::LocalGet(1)).instruction(&I::I32GeU).instruction(&I::BrIf(1));
+    f.instruction(&I::LocalGet(0)).instruction(&I::I32Const(12)).instruction(&I::I32Shl).instruction(&I::LocalSet(3));
+    f.instruction(&I::I32Const(64)).instruction(&I::LocalSet(4));
+    // (1 if the page is not all zero)
+    f.instruction(&I::Block(wasm_encoder::BlockType::Result(ValType::I32)));
+    f.instruction(&I::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&I::I32Const(1));
+    f.instruction(&I::LocalGet(3)).instruction(&g(0));
+    for offset in [16, 32, 48] {
+        f.instruction(&I::LocalGet(3)).instruction(&g(offset)).instruction(&I::V128Or);
+    }
+    f.instruction(&I::V128AnyTrue).instruction(&I::BrIf(1)).instruction(&I::Drop);
+    f.instruction(&I::LocalGet(3)).instruction(&I::I32Const(64)).instruction(&I::I32Add).instruction(&I::LocalSet(3));
+    f.instruction(&I::LocalGet(4)).instruction(&I::I32Const(1)).instruction(&I::I32Sub).instruction(&I::LocalTee(4)).instruction(&I::BrIf(0));
+    f.instruction(&I::End);
+    f.instruction(&I::I32Const(0));
+    f.instruction(&I::End);
+    f.instruction(&I::LocalGet(2)).instruction(&I::I32Ne).instruction(&I::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&I::LocalGet(0)).instruction(&I::Return);
+    f.instruction(&I::End);
+    f.instruction(&I::LocalGet(0)).instruction(&I::I32Const(1)).instruction(&I::I32Add).instruction(&I::LocalSet(0));
+    f.instruction(&I::Br(0));
+    f.instruction(&I::End);
+    f.instruction(&I::End);
+    f.instruction(&I::LocalGet(1)).instruction(&I::End);
+    code.function(&f);
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_NAME, ExportKind::Memory, 1);
@@ -760,6 +795,7 @@ fn build_glue(initial_pages: u64) -> Vec<u8> {
     for (i, name) in GLUE_FUNCS.iter().enumerate() {
         exports.export(name, ExportKind::Func, i as u32);
     }
+    exports.export("zpage", ExportKind::Func, GLUE_FUNCS.len() as u32);
     let mut m = Module::new();
     m.section(&types);
     m.section(&imports);
