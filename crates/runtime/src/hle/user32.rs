@@ -1452,6 +1452,24 @@ fn numpad_key(c: &mut Ctx, i: usize, vk: u8, scan: u16, down: bool, numlock: boo
 }
 
 pub(crate) fn pump_input(c: &mut Ctx) {
+    for (path, data) in c.host.take_files() {
+        match data {
+            Some(d) => {
+                // (the folders it is in first: a copy that started before the game made them)
+                let mut at = 0;
+                while let Some(i) = path[at..].find('\\') {
+                    at += i + 1;
+                    c.p.fs.mkdir(&path[..at - 1]);
+                }
+                c.p.fs.create(&path);
+                c.p.fs.set_len(&path, 0);
+                c.p.fs.write_at(&path, 0, &d);
+            }
+            None => {
+                c.p.fs.remove(&path);
+            }
+        }
+    }
     let frame = c.p.frames_presented;
     let mut events = std::mem::take(&mut c.p.injected_input);
     events.extend(c.host.poll_input(frame, c.p.clock_us));

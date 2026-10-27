@@ -48,7 +48,7 @@ const STATE_CHUNK = 16 << 20;
  *   without `profile`: what other games with the same modules needed (a runner's code is the same
  *   in every game built with it)
  */
-export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl, prompt }) {
+export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = false, epoch = Math.floor(Date.now() / 1000), print = console.log, onExit, canvas, pace = true, pacing = 'clock', ahead = true, onFrame, onReady, onResize, audioRing, onSave, soundfontUrl = asset('soundfont.sf2'), onStats, monitor = false, onSlow, replay, inputRing, profile, onProfile, sharedProfile, relayUrl, prompt, ctl }) {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   let rt;
@@ -575,13 +575,20 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       return 1;
     },
     state_loaded(clockMs) {
-      startReal = performance.now() - clockMs;
-      prevClock = clockMs;
-      lastClockMs = clockMs;
-      clockMoved(clockMs);
+      const anchor = () => {
+        startReal = performance.now() - clockMs;
+        prevClock = clockMs;
+        lastClockMs = clockMs;
+        clockMoved(clockMs);
+      };
+      anchor();
       const w = stateWait;
       stateWait = null;
       w?.resolve();
+      // A standby copy (ctl.standby, player.mjs) stops here, at the state, until it takes
+      // over (or loads another): the guest has run nothing of it yet. Its clock then
+      // goes on from when it resumes.
+      if (ctl?.standby && jspi) return new Promise((res) => (ctl.release = () => (anchor(), res())));
     },
     state_failed(ptr, len) {
       const w = stateWait;
@@ -666,7 +673,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   const ring = audioRing && { idx: new Int32Array(audioRing.sab, 0, 2), data: new Float32Array(audioRing.sab, 8, audioRing.frames * 2), frames: audioRing.frames };
   const audioImports = {
     audio_push(ptr, len) {
-      if (!ring) return;
+      if (!ring || ctl?.muted) return;
       const src = new Float32Array(rt.exports.memory.buffer, ptr, len);
       const n = len >> 1;
       const w = Atomics.load(ring.idx, 0);
@@ -761,6 +768,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     },
   };
 
+  // (a standby copy waits in state_loaded: the import may suspend)
+  if (ctl && jspi) host.state_loaded = new WebAssembly.Suspending(host.state_loaded);
   const engineImports = { host, gpu: gpuImports, audio: audioImports, net: netImports };
   rt = runtimeBytes instanceof WebAssembly.Module ? await WebAssembly.instantiate(runtimeBytes, engineImports) : (await WebAssembly.instantiate(runtimeBytes, engineImports)).instance;
   const x = rt.exports;
@@ -827,12 +836,25 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
         x.input_mouse(mx | 0, my | 0, buttons);
       },
       pad: (i, connected, buttons, lt, rt, lx, ly, rx, ry) => x.input_pad(i, connected ? 1 : 0, buttons, lt | (rt << 8), lx, ly, rx, ry),
+      // Files another copy of the game wrote ([{path (as stored), data: Uint8Array | null}]),
+      // written at the guest's next input poll.
+      files: (changes) => {
+        for (const { path, data } of changes) {
+          const p = enc.encode(path);
+          const pp = x.alloc(p.length);
+          mem().set(p, pp);
+          const dp = data ? x.alloc(data.length) : 0;
+          if (data) mem().set(data, dp);
+          x.fs_put(pp, p.length, dp, data ? data.length : -1);
+        }
+      },
       // Save states, made and loaded at the end of the game's next frame: `save()` resolves to
       // a state (see `state_saved`), `load(state)` once the game runs from it; either rejects
       // with why not. One at a time: a new one cancels the one waiting.
       state: {
         save: (spare) => stateAsk(1, spare ?? []),
-        load: (state) => stateAsk(2, state),
+        // (a standby copy uploads its textures before it waits at the state)
+        load: (state) => stateAsk(ctl?.standby ? 3 : 2, state),
         cancel: () => {
           x.state_request(0);
           const w = stateWait;
@@ -845,6 +867,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   if (x.init(ep, e.length, frames, trace ? 1 : 0, epoch, nopIndex, gpu ? 1 : 0) !== 0) {
     throw new Error('init failed');
   }
+  // (texture content stamps unlike any other copy's: runtime::state keeps textures by them)
+  x.set_content_seed(crypto.getRandomValues(new Uint32Array(1))[0] || 1);
   if (monitor) x.set_monitor(1);
   // [kind, frame, clock, a, b, c]: a recorded session's input
   for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);

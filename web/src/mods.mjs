@@ -24,7 +24,7 @@ export const MODS = [
     about: 'A key saves everything the game is at that moment, another goes back to it exactly (up to 10 states per game, kept in this browser only; F7 and F8 at first, a button opens the list).',
     applies: (e) => !!e,
     page: true,
-    options: [],
+    options: [{ key: 'instantLoad', label: 'Instant load: a second copy of the game waits at the state (about twice the memory)', type: 'bool', default: false }],
     files: [],
   },
   {

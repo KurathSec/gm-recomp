@@ -193,6 +193,12 @@ pub trait Host: Guest {
     fn poll_input(&mut self, _frame: u64, _clock_us: u64) -> Vec<InputEvent> {
         Vec::new()
     }
+    /// Files another copy of this game wrote since the last call ((path as stored,
+    /// contents or None if removed)): a standby copy of the player's (web/src/player.mjs)
+    /// keeps the files the game has, as it takes over at a load.
+    fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
+        Vec::new()
+    }
     /// Whether `monitor` lines are wanted (a session that can be replayed).
     fn monitoring(&self) -> bool {
         false

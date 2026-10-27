@@ -20,6 +20,9 @@ const GAME_KEYS = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|D
  * @param {boolean} [o.persist]  keep the game's saves in this browser (default true)
  * @param {boolean} [o.saveStates]  save states (state-store.mjs): the returned `states`
  *   saves and loads them (statepanel.mjs is a page's list of them)
+ * @param {boolean} [o.instantLoad]  with save states: a second copy of the game waits,
+ *   loaded and stopped, at the state last saved or loaded, and takes over at a load of it
+ *   (at once; about twice the memory). Not with a game online (PlayOnline).
  * Test and diagnosis options, as worker.mjs takes them: frames, pace, pacing, ahead, script,
  * capture, monitor, replay, slowMs, useProfile.
  * Callbacks: onLog(line), onSize(w, h) (the game's resolution), onStats(stats),
@@ -40,29 +43,40 @@ export function playGame(o) {
     target.addEventListener(type, f);
     listeners.push(() => target.removeEventListener(type, f));
   };
+  // (the standby stops at a state in a suspending import: JSPI)
+  const instant = !!(o.saveStates && o.instantLoad && typeof WebAssembly.Suspending === 'function' && !modChoices.PlayOnline?.on);
+
+  // The copies of the game: the one playing (`cur`) and, for instant loads, the one
+  // waiting at a state (`standby`). Each has its worker, canvas, key ring and sound ring.
+  const copies = [];
+  let cur = null;
+  let standby = null;
 
   // The game's resolution, for mouse coordinates.
   let gameW = 640, gameH = 480;
 
   // Sound starts with the first user gesture (browser autoplay rules); o.audio starts it
-  // without one (tests, with autoplay allowed).
-  let audio = null;
+  // without one (tests, with autoplay allowed). Each copy has its ring; the one playing is
+  // heard.
+  let ctx = null;
   let audioStarted = false;
-  let audioNode = null;
+  const latency = () => Math.max(0.015, (ctx.baseLatency || 0) + 0.01); // as low as the system allows
+  const attachAudio = (c) => {
+    if (!ctx || c.node || !c.audio) return;
+    // the queue starts at what the system's audio period needs (see the worklet)
+    c.node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: c.audio.sab, frames: c.audio.frames, latency: latency() } });
+    if (c === cur) c.node.connect(ctx.destination);
+    // Skip what piled up before the user enabled sound.
+    const idx = new Int32Array(c.audio.sab, 0, 2);
+    Atomics.store(idx, 1, Atomics.load(idx, 0));
+  };
   const startAudio = async () => {
-    if (audioStarted || !audio) return;
+    if (audioStarted || !cur?.audio) return;
     audioStarted = true;
     try {
-      const ctx = new AudioContext({ sampleRate: audio.rate, latencyHint: 0.005 }); // as low as the system allows
+      ctx = new AudioContext({ sampleRate: cur.audio.rate, latencyHint: 0.005 });
       await ctx.audioWorklet.addModule(new URL('./audio-worklet.js', import.meta.url));
-      // the queue starts at what the system's audio period needs (see the worklet)
-      const latency = Math.max(0.015, (ctx.baseLatency || 0) + 0.01);
-      const node = new AudioWorkletNode(ctx, 'ring-player', { outputChannelCount: [2], processorOptions: { sab: audio.sab, frames: audio.frames, latency } });
-      node.connect(ctx.destination);
-      audioNode = node;
-      // Skip what piled up before the user enabled sound.
-      const idx = new Int32Array(audio.sab, 0, 2);
-      Atomics.store(idx, 1, Atomics.load(idx, 0));
+      for (const c of copies) attachAudio(c);
       o.onSoundPending?.(false);
     } catch (e) {
       audioStarted = false;
@@ -70,14 +84,18 @@ export function playGame(o) {
     }
   };
   for (const t of ['pointerdown', 'keydown']) listen(window, t, startAudio);
-  const soundStats = () => !audioNode ? Promise.resolve(audioStarted ? 'audio: not running' : null) : new Promise((res) => {
-    audioNode.port.onmessage = ({ data: a }) => {
-      const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
-      const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
-      res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms, base latency ${((audioNode.context.baseLatency ?? 0) * 1000).toFixed(1)} ms, target ${(a.target * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
-    };
-    audioNode.port.postMessage(0);
-  });
+  const soundStats = () => {
+    const audioNode = cur?.node;
+    const audio = cur?.audio;
+    return !audioNode ? Promise.resolve(audioStarted ? 'audio: not running' : null) : new Promise((res) => {
+      audioNode.port.onmessage = ({ data: a }) => {
+        const rms = Math.sqrt(a.sumsq / Math.max(1, 2 * a.played));
+        const s = (f) => `${(f / audio.rate).toFixed(2)}s`;
+        res(`audio: played ${s(a.played)}, ${a.underruns} underruns (${s(a.starved)} silent), skipped ${s(a.skipped)}, rms ${rms.toFixed(4)}, context ${audioNode.context.state} at ${audioNode.context.sampleRate} Hz, output latency ${((audioNode.context.outputLatency ?? 0) * 1000).toFixed(1)} ms, base latency ${((audioNode.context.baseLatency ?? 0) * 1000).toFixed(1)} ms, target ${(a.target * 1000).toFixed(1)} ms; first sound at ${a.start.toFixed(2)}s, now ${audioNode.context.currentTime.toFixed(2)}s, underruns at ${a.events.join(' ')}`);
+      };
+      audioNode.port.postMessage(0);
+    });
+  };
 
   // A dialog the game opened (worker.mjs `prompt`): o.onPrompt answers (a string, or null
   // to cancel or for No), else the browser's own.
@@ -106,53 +124,9 @@ export function playGame(o) {
     Atomics.notify(st, 0);
   };
 
-  const w = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
-  w.onmessage = ({ data }) => {
-    if (data.type === 'log') o.onLog?.(data.line);
-    else if (data.type === 'audio') {
-      audio = data;
-      if (o.audio) startAudio();
-      else if (!audioStarted) o.onSoundPending?.(true);
-    } else if (data.type === 'size') {
-      [gameW, gameH] = [data.w, data.h];
-      o.onSize?.(data.w, data.h);
-    } else if (data.type === 'monitor') o.onMonitor?.(data.line);
-    else if (data.type === 'stats') o.onStats?.(data);
-    else if (data.type === 'capture') o.onCapture?.(data.frame, data.png);
-    else if (data.type === 'saved') o.onSaved?.();
-    else if (data.type === 'prompt') answerPrompt(data);
-    else if (data.type === 'state') stateReply(data);
-    else if (data.type === 'state-stored') o.onStateStored?.(data.slot, data.ok ? null : data.error);
-    else if (data.type === 'done') o.onDone?.(data.status);
-  };
-  w.onerror = (e) => {
-    o.onLog?.(`worker error: ${e.message}`);
-    o.onDone?.(`worker error: ${e.message}`);
-  };
-
-  // Keys go to the worker through a shared ring (written here as they happen, read at
-  // the guest's message polls): [write, read], then 256 × [vk, scan, down] and 256
-  // event times.
-  const inputRing = new SharedArrayBuffer(8 + 256 * 12 + 256 * 8);
-  const ringIdx = new Int32Array(inputRing, 0, 2);
-  const ringEv = new Int32Array(inputRing, 8, 256 * 3);
-  const ringWhen = new Float64Array(inputRing, 8 + 256 * 12, 256);
-  const sendKey = (code, down, numlock, when) => {
-    const k = KEYS[code];
-    if (!k) return;
-    const wr = Atomics.load(ringIdx, 0);
-    if (((wr - Atomics.load(ringIdx, 1)) | 0) >= 256) return; // the guest is not reading
-    const i = wr & 255;
-    // the NumLock state decides what the keypad sends (see the runtime's numpad_key)
-    ringEv.set([k[0], k[1] | (numlock ? 0x200 : 0), down ? 1 : 0], i * 3);
-    ringWhen[i] = when ?? performance.timeOrigin + performance.now();
-    Atomics.store(ringIdx, 0, (wr + 1) | 0);
-  };
-
-  // Save states: the store worker keeps them; the game's worker makes and loads them,
-  // and reaches the store through a port of its own.
+  // Save states: the store worker keeps them; the game's workers make and load them, and
+  // reach the store through ports of their own.
   let store = null;
-  let statePort = null;
   let seq = 0;
   const calls = new Map();
   const answer = (r) => {
@@ -167,55 +141,238 @@ export function playGame(o) {
       calls.set(id, { resolve, reject });
       target.postMessage({ ...msg, id });
     });
-  const stateReply = answer;
   if (o.saveStates) {
     store = new Worker(new URL('./state-store.mjs', import.meta.url), { type: 'module' });
     store.onmessage = ({ data }) => answer(data);
-    const ch = new MessageChannel();
-    store.postMessage({ op: 'port', port: ch.port1 }, [ch.port1]);
-    statePort = ch.port2;
   }
+
+  // Keys go to a worker through a shared ring (written here as they happen, read at the
+  // guest's message polls): [write, read], then 256 × [vk, scan, down] and 256 event times.
+  const newRing = () => {
+    const sab = new SharedArrayBuffer(8 + 256 * 12 + 256 * 8);
+    return { sab, idx: new Int32Array(sab, 0, 2), ev: new Int32Array(sab, 8, 256 * 3), when: new Float64Array(sab, 8 + 256 * 12, 256) };
+  };
+  const sendKeyTo = (c, code, down, numlock, when) => {
+    const k = KEYS[code];
+    if (!k || !c) return;
+    const { idx, ev, when: times } = c.ring;
+    const wr = Atomics.load(idx, 0);
+    if (((wr - Atomics.load(idx, 1)) | 0) >= 256) return; // the guest is not reading
+    const i = wr & 255;
+    // the NumLock state decides what the keypad sends (see the runtime's numpad_key)
+    ev.set([k[0], k[1] | (numlock ? 0x200 : 0), down ? 1 : 0], i * 3);
+    times[i] = when ?? performance.timeOrigin + performance.now();
+    Atomics.store(idx, 0, (wr + 1) | 0);
+  };
+  const sendKey = (code, down, numlock, when) => sendKeyTo(cur, code, down, numlock, when);
+
+  const init = {
+    game,
+    local,
+    frames: o.frames ?? 0,
+    epoch: o.epoch ?? Math.floor(Date.now() / 1000),
+    pace: o.pace ?? true,
+    pacing: o.pacing ?? 'sync',
+    ahead: o.ahead ?? true,
+    persist: o.persist ?? true,
+    slowMs: o.slowMs,
+    useProfile: o.useProfile ?? true,
+    modChoices,
+    instantLoad: instant,
+  };
+  /** Starts a copy of the game in `el` ('main': the one playing; 'standby'). */
+  const spawn = (role, el) => {
+    const c = { role, canvas: el, ring: newRing(), audio: null, node: null, size: null, w: null, want: null, ready: false };
+    const w = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
+    c.w = w;
+    w.onmessage = ({ data }) => fromCopy(c, data);
+    w.onerror = (e) => {
+      if (c === cur) {
+        o.onLog?.(`worker error: ${e.message}`);
+        o.onDone?.(`worker error: ${e.message}`);
+      } else {
+        o.onLog?.(`standby copy: worker error: ${e.message}`);
+        drop(c);
+      }
+    };
+    let port = null;
+    if (store) {
+      const ch = new MessageChannel();
+      store.postMessage({ op: 'port', port: ch.port1 }, [ch.port1]);
+      port = ch.port2;
+    }
+    const offscreen = el.transferControlToOffscreen();
+    const main = role === 'main';
+    w.postMessage(
+      { ...init, role, canvas: offscreen, inputRing: c.ring.sab, statePort: port, capture: main ? o.capture ?? [] : [], script: main ? o.script ?? [] : [], monitor: o.monitor ?? false, replay: main ? o.replay ?? null : null },
+      port ? [offscreen, port] : [offscreen],
+    );
+    copies.push(c);
+    return c;
+  };
+  const drop = (c) => {
+    c.w.terminate();
+    c.node?.disconnect();
+    copies.splice(copies.indexOf(c), 1);
+    if (standby === c) standby = null;
+  };
+
+  // Instant loads. Each save of a slot here is a new version of it; the standby waits at
+  // one (`want`, `ready` once loaded), and a load of exactly that takes it over.
+  const versions = new Map(); // slot -> saves of it so far
+  let twin = null;
+  const makeTwin = () => {
+    // a second canvas over the first, as large (the page sizes the first)
+    twin = document.createElement('canvas');
+    twin.width = canvas.width;
+    twin.height = canvas.height;
+    twin.style.cssText = 'position: absolute; visibility: hidden; display: block; image-rendering: pixelated; background: #000;';
+    canvas.after(twin);
+    const place = () => {
+      twin.style.left = `${canvas.offsetLeft}px`;
+      twin.style.top = `${canvas.offsetTop}px`;
+      twin.style.width = `${canvas.offsetWidth}px`;
+      twin.style.height = `${canvas.offsetHeight}px`;
+    };
+    place();
+    const ro = new ResizeObserver(place);
+    ro.observe(canvas);
+    if (canvas.parentElement) ro.observe(canvas.parentElement);
+    listeners.push(() => ro.disconnect());
+    for (const t of ['mousemove', 'mousedown', 'mouseup']) listen(twin, t, mouse);
+    listen(twin, 'contextmenu', (e) => e.preventDefault());
+    return twin;
+  };
+  /** The standby waits at `slot` as saved `version` times (`state`: shared, or the store's). */
+  const prepare = (slot, version, state) => {
+    if (!standby) standby = spawn('standby', twin ?? makeTwin());
+    standby.want = { slot, version };
+    standby.ready = false;
+    standby.w.postMessage({ type: 'state', op: 'prepare', slot, version, state });
+  };
+  /** Shows `c` and sends it the input; the other copies are hidden and silent. */
+  const show = (c) => {
+    for (const k of copies) {
+      k.canvas.style.visibility = k === c ? '' : 'hidden';
+      if (k.node) {
+        k.node.disconnect();
+        if (k === c) {
+          const idx = new Int32Array(k.audio.sab, 0, 2);
+          Atomics.store(idx, 1, Atomics.load(idx, 0));
+          k.node.connect(ctx.destination);
+        }
+      }
+    }
+    if (c.size) [gameW, gameH] = c.size;
+  };
+  /** The standby takes over at its state; the copy that played becomes the standby. */
+  const swap = async () => {
+    const next = standby;
+    const was = cur;
+    const { slot, version } = next.want;
+    standby = null;
+    cur = next;
+    next.ready = false;
+    show(next);
+    // the keys and controllers held now are the new copy's (it had none)
+    for (const [code, numlock] of held.values()) sendKeyTo(next, code, true, numlock);
+    padLast.forEach((p, i) => p && next.w.postMessage({ type: 'pad', index: i, ...JSON.parse(p) }));
+    await call(next.w, { type: 'state', op: 'activate' });
+    standby = was;
+    was.want = { slot, version };
+    was.ready = false;
+    was.w.postMessage({ type: 'state', op: 'standby', slot, version });
+  };
+
+  const fromCopy = (c, data) => {
+    const playing = c === cur;
+    switch (data.type) {
+      case 'log':
+        o.onLog?.(playing ? data.line : `[standby] ${data.line}`);
+        break;
+      case 'audio':
+        c.audio = data;
+        if (o.audio) startAudio();
+        else if (!audioStarted && playing) o.onSoundPending?.(true);
+        attachAudio(c);
+        break;
+      case 'size':
+        c.size = [data.w, data.h];
+        if (playing) {
+          [gameW, gameH] = c.size;
+          o.onSize?.(data.w, data.h);
+        }
+        break;
+      case 'monitor':
+        if (playing) o.onMonitor?.(data.line);
+        break;
+      case 'stats':
+        if (playing) o.onStats?.(data);
+        break;
+      case 'capture':
+        if (playing) o.onCapture?.(data.frame, data.png);
+        break;
+      case 'saved':
+        if (playing) o.onSaved?.();
+        break;
+      case 'prompt':
+        answerPrompt(data);
+        break;
+      case 'state':
+        answer(data);
+        break;
+      case 'state-stored':
+        o.onStateStored?.(data.slot, data.ok ? null : data.error);
+        break;
+      case 'files':
+        // (the files the game wrote: the standby's stay the same)
+        if (playing && standby) standby.w.postMessage({ type: 'state', op: 'files', changes: data.changes });
+        break;
+      case 'state-made': {
+        if (!playing) break;
+        const version = (versions.get(data.slot) ?? 0) + 1;
+        versions.set(data.slot, version);
+        prepare(data.slot, version, data.state);
+        break;
+      }
+      case 'standby-ready':
+        if (c === standby && c.want?.slot === data.slot && c.want?.version === data.version) c.ready = true;
+        break;
+      case 'standby-failed':
+        o.onLog?.(`standby copy: ${data.error}`);
+        break;
+      case 'done':
+        if (playing) o.onDone?.(data.status);
+        else drop(c);
+        break;
+    }
+  };
+
+  cur = spawn('main', canvas);
+
   const states = store && {
     /** The game's states: [{slot, time, bytes, stored, thumb (Blob | null)}]. */
     list: () => call(store, { op: 'list', game }),
     /** Saves the game as it is at the end of its next frame into `slot` (resolves once made). */
-    save: (slot) => call(w, { type: 'state', op: 'save', slot }),
-    /** Goes back to the state in `slot`. */
-    load: (slot) => call(w, { type: 'state', op: 'load', slot }),
+    save: (slot) => call(cur.w, { type: 'state', op: 'save', slot }),
+    /** Goes back to the state in `slot` (at once with instant loads, once the standby waits there). */
+    load: async (slot) => {
+      const version = versions.get(slot) ?? 0;
+      if (standby?.ready && standby.want?.slot === slot && standby.want.version === version) return swap();
+      await call(cur.w, { type: 'state', op: 'load', slot });
+      if (instant && !(standby?.want?.slot === slot && standby.want.version === version)) prepare(slot, version, null);
+    },
     remove: (slot) => {
-      w.postMessage({ type: 'state', op: 'drop', slot });
+      for (const c of copies) c.w.postMessage({ type: 'state', op: 'drop', slot });
+      if (standby?.want?.slot === slot) standby.ready = false;
+      versions.set(slot, (versions.get(slot) ?? 0) + 1);
       return call(store, { op: 'delete', game, slot });
     },
   };
 
-  const offscreen = canvas.transferControlToOffscreen();
-  w.postMessage(
-    {
-      game,
-      local,
-      frames: o.frames ?? 0,
-      epoch: o.epoch ?? Math.floor(Date.now() / 1000),
-      canvas: offscreen,
-      capture: o.capture ?? [],
-      pace: o.pace ?? true,
-      pacing: o.pacing ?? 'sync',
-      ahead: o.ahead ?? true,
-      script: o.script ?? [],
-      persist: o.persist ?? true,
-      monitor: o.monitor ?? false,
-      replay: o.replay ?? null,
-      slowMs: o.slowMs,
-      inputRing,
-      useProfile: o.useProfile ?? true,
-      modChoices,
-      statePort,
-    },
-    statePort ? [offscreen, statePort] : [offscreen],
-  );
-
-  // Input goes to the worker as it happens; the runtime applies it at the guest's next
-  // message poll. A key the page remaps reaches the game as its target, and is released
-  // as the key it went down as (the map may change while it is held).
+  // Input goes to the playing copy as it happens; the runtime applies it at the guest's
+  // next message poll. A key the page remaps reaches the game as its target, and is
+  // released as the key it went down as (the map may change while it is held).
   const held = new Map(); // your key -> [the game's key, NumLock state]
   for (const type of ['keydown', 'keyup']) {
     listen(window, type, (e) => {
@@ -249,12 +406,12 @@ export function playGame(o) {
   };
   listen(window, 'blur', releaseHeld);
   listen(document, 'visibilitychange', () => document.hidden && releaseHeld());
-  const mouse = (e) => {
+  function mouse(e) {
     const r = canvas.getBoundingClientRect();
     const buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
     const t = e.type === 'mousemove' ? undefined : performance.timeOrigin + e.timeStamp;
-    w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons, t });
-  };
+    cur.w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons, t });
+  }
   for (const t of ['mousemove', 'mousedown', 'mouseup']) listen(canvas, t, mouse);
   listen(canvas, 'contextmenu', (e) => e.preventDefault());
 
@@ -279,7 +436,7 @@ export function playGame(o) {
       const key = JSON.stringify(state);
       if (key !== padLast[i]) {
         padLast[i] = key;
-        w.postMessage({ type: 'pad', index: i, ...state });
+        cur.w.postMessage({ type: 'pad', index: i, ...state });
       }
     }
     requestAnimationFrame(pollPads);
@@ -287,7 +444,7 @@ export function playGame(o) {
   requestAnimationFrame(pollPads);
 
   return {
-    worker: w,
+    worker: copies[0].w,
     /** A new key map, from the next key press on (held keys are released as they went down). */
     setKeymap(map) {
       keymap = map ?? {};
@@ -298,9 +455,10 @@ export function playGame(o) {
     stop() {
       stopped = true;
       for (const off of listeners) off();
-      w.terminate();
+      for (const c of [...copies]) c.w.terminate();
       store?.terminate();
-      audioNode?.context.close().catch(() => {});
+      twin?.remove();
+      ctx?.close().catch(() => {});
     },
   };
 }

@@ -183,11 +183,13 @@ pub fn at_api_return<M: Machine>(m: &mut M, id: crate::hle::ApiId) {
         StateOp::Save => save(m),
         StateOp::Load => load(m),
     };
-    let ms = (m.now_us() - t) as f64 / 1000.0;
+    let held = std::mem::take(&mut m.engine().state_held_us);
+    let ms = (m.now_us() - t).saturating_sub(held) as f64 / 1000.0;
     match r {
         Ok(Outcome::Done(what)) => {
             m.engine().state_tries = 0;
-            m.print(&format!("save state: {what} in {ms:.0} ms"));
+            let waited = if held > 100_000 { format!(" (then waited {:.1} s at it)", held as f64 / 1e6) } else { String::new() };
+            m.print(&format!("save state: {what} in {ms:.0} ms{waited}"));
         }
         Ok(Outcome::Later(why)) => {
             let e = m.engine();
@@ -360,7 +362,21 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     m.engine().tsc = body.tsc;
     engine::restore_ctx(m, &body.ctx);
     engine::request(m, Ctl::Resume);
+    if std::mem::take(&mut m.engine().state_eager) {
+        let mut regs = engine::read_regs(m);
+        let _ = engine::with_ctx(m, &mut regs, crate::hle::ApiId(0), |c| {
+            for (tex, version) in std::mem::take(&mut c.p.pending_uploads) {
+                if version == 8 {
+                    crate::hle::d3d8::upload_pending(c, tex);
+                } else {
+                    crate::hle::d3d9::upload_pending(c, tex);
+                }
+            }
+        });
+    }
+    let held = m.now_us();
     m.state_loaded();
+    m.engine().state_held_us = m.now_us() - held;
     let mem: u64 = body.ranges.iter().map(|r| r.1 as u64).sum();
     Ok(Outcome::Done(format!("loaded ({} MB of memory)", mem >> 20)))
 }

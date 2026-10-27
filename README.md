@@ -129,7 +129,11 @@ engine allows.
   layout differs. The state last saved or loaded stays in the game's worker (in shared
   memory, which the store compresses as it is), so going back to it again takes a fifth
   of a second even for a game with a gigabyte of memory; the next save reuses its
-  buffers.
+  buffers. The mod's **instant load** option runs a second copy of the game that waits,
+  loaded and stopped, at the state last saved or loaded: a load of it shows that copy at
+  once (a few milliseconds), and the copy that played becomes the one that waits. It
+  takes about twice the memory; the game's files the playing copy writes go to the
+  waiting one too.
 - **Play online** (GameMaker 8): [I wanna play online 1.2.3](https://github.com/Pardocaninacting/i-wanna-play-online-1.2.3)'s
   converter runs in the page and changes the game before it starts: the others playing the
   same game show up, with chat and their saves. Its `http_dll_2_3.dll` is replaced by a port

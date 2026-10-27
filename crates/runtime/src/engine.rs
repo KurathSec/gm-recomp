@@ -207,6 +207,12 @@ pub struct Engine {
     /// a load waited so far (`crate::state`).
     pub state_op: Option<StateOp>,
     pub state_tries: u32,
+    /// How long the host held the last loaded state before the guest went on (a standby
+    /// copy waits at its state until it takes over), left out of the load's time.
+    pub state_held_us: u64,
+    /// The pending load uploads every texture before the guest goes on (a standby copy:
+    /// it waits at the state, and takes over with its textures ready).
+    pub state_eager: bool,
     /// Addresses where a translated invalid instruction was found changed and translated
     /// again (`rt_trap`).
     pub ud2_retried: HashSet<u32>,
@@ -275,6 +281,8 @@ impl Engine {
             monitor: false,
             state_op: None,
             state_tries: 0,
+            state_held_us: 0,
+            state_eager: false,
             ud2_retried: HashSet::default(),
         }
     }
@@ -341,6 +349,10 @@ pub trait Machine: Guest {
     /// Input that arrived from the user since the last call (`frame`: frames shown,
     /// `clock_us`: the guest's clock).
     fn take_input(&mut self, _frame: u64, _clock_us: u64) -> Vec<crate::hle::InputEvent> {
+        Vec::new()
+    }
+    /// Files another copy of the game wrote (`Host::take_files`).
+    fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
         Vec::new()
     }
     /// A General MIDI SoundFont, once available (the first call may start loading it).
@@ -696,6 +708,10 @@ impl<M: Machine> Host for M {
     fn poll_input(&mut self, frame: u64, clock_us: u64) -> Vec<crate::hle::InputEvent> {
         self.engine().frames_seen = frame;
         self.take_input(frame, clock_us)
+    }
+
+    fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
+        Machine::take_files(self)
     }
 
     fn monitoring(&self) -> bool {

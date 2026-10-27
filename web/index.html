@@ -602,6 +602,8 @@
           local,
           canvas: screen,
           saveStates,
+          // (&instant: instant loads whatever the Save states mod's setting)
+          instantLoad: !!modChoices.SaveStates?.config?.instantLoad || q.has('instant'),
           onStateStored: (slot, error) => statesUi?.stored(slot, error),
           frames,
           epoch: runEpoch,

@@ -9,10 +9,26 @@ import { applySaves, loadGame, loadProfile, loadSaves, openSaves, storeProfile, 
 
 let input = null;
 const early = [];
+// Whether this copy is the one playing (not a standby: no sound, no saved files, its
+// dialogs answered here), and what the host is told of it (host.mjs `ctl`).
+let active = true;
+let instant = false;
+const ctl = { muted: false, standby: false, release: null };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Save states (state-store.mjs keeps them; the page asks with {type: 'state', id, op:
 // 'save' | 'load', slot} and hears {type: 'state', id, ok, error?}, and for a save once more
 // {type: 'state-stored', slot, ok, error?}).
+//
+// Instant loads (player.mjs `instantLoad`): a second copy of the game (role 'standby')
+// waits at a state, loaded and stopped, and takes over at a load. The page sends it {op:
+// 'prepare', slot, state?, version} (a state to wait at: given, the one held here or the
+// store's) and {op: 'activate'}; it answers {type: 'standby-ready' | 'standby-failed',
+// slot, version}. {op: 'standby', slot, version} makes the playing copy the standby. The
+// playing copy reports {type: 'state-made', slot, state} after a save and {type: 'files',
+// changes} for the files the game wrote, which the page hands to the standby ({op:
+// 'files'}). Both copies keep states the other made: a save then writes into fresh memory,
+// never into a state's buffers.
 let game = null;
 let store = null;
 let storeSeq = 0;
@@ -55,21 +71,79 @@ function soon(p) {
  * The state last saved or loaded here ({slot, state, spare}): loaded again without the
  * store. A state saved here is in shared memory, which the store compresses as it is;
  * once that is done (`spare`) the next save writes into its buffers (fresh memory cost
- * three times as much).
+ * three times as much), but with instant loads (the other copy may keep it).
  */
 let held = null;
 
-async function handleState({ id, op, slot }) {
+/** The standby's state to wait at (see above); a newer one supersedes it. */
+let preparing = 0;
+async function prepare(slot, state, version) {
+  const mine = ++preparing;
+  try {
+    if (!state) state = held?.slot === slot ? held.state : await storeCall({ op: 'get', game, slot });
+    if (mine !== preparing) return;
+    held = { slot, state, spare: false };
+    for (;;) {
+      if (mine !== preparing) return;
+      if (!input?.state) {
+        await sleep(200);
+        continue;
+      }
+      const loading = input.state.load(state);
+      // (a copy waiting at its state goes on to its next frame, where this one loads)
+      if (ctl.release) {
+        const go = ctl.release;
+        ctl.release = null;
+        go();
+      }
+      try {
+        await loading;
+        break;
+      } catch (e) {
+        if (mine !== preparing) return;
+        // still starting, or not at a point a state loads at: again a little later
+        await sleep(300);
+      }
+    }
+    if (mine === preparing) self.postMessage({ type: 'standby-ready', slot, version });
+  } catch (e) {
+    if (mine === preparing) self.postMessage({ type: 'standby-failed', slot, version, error: String(e?.message ?? e) });
+  }
+}
+
+async function handleState({ id, op, slot, state: given, version, changes }) {
   // (the page deleted the slot)
   if (op === 'drop') {
     if (held?.slot === slot) held = null;
     return;
   }
+  if (op === 'files') {
+    if (input) input.files(changes);
+    else early.push({ type: 'files', changes });
+    return;
+  }
+  if (op === 'prepare') return prepare(slot, given, version);
+  if (op === 'standby') {
+    active = false;
+    ctl.muted = true;
+    ctl.standby = true;
+    return prepare(slot, held?.slot === slot ? held.state : null, version);
+  }
   const reply = (r) => self.postMessage({ type: 'state', id, ...r });
+  if (op === 'activate') {
+    if (!ctl.release) return reply({ ok: false, error: 'not waiting at a state' });
+    active = true;
+    ctl.muted = false;
+    ctl.standby = false;
+    const go = ctl.release;
+    ctl.release = null;
+    go();
+    return reply({ ok: true });
+  }
   if (!input?.state || !store) return reply({ ok: false, error: input ? 'save states are off' : 'the game has not started yet' });
   try {
     if (op === 'save') {
-      const spare = held?.spare ? [...new Set(held.state.chunks.map((c) => c.buffer))] : [];
+      const spare = held?.spare && !instant ? [...new Set(held.state.chunks.map((c) => c.buffer))] : [];
       held = null;
       const st = await soon(input.state.save(spare));
       reply({ ok: true });
@@ -77,6 +151,8 @@ async function handleState({ id, op, slot }) {
       const state = { meta: st.meta, pages: st.pages, chunks: st.chunks };
       const mine = { slot, state, spare: false };
       held = mine;
+      // (the standby copy waits at it: the page hands it over)
+      if (instant) self.postMessage({ type: 'state-made', slot, state });
       const thumb = await thumbnail(st.frame).catch(() => null);
       const done = () => {
         if (state.chunks.every((c) => c.buffer instanceof SharedArrayBuffer)) mine.spare = true;
@@ -107,6 +183,7 @@ async function handleState({ id, op, slot }) {
 
 function handleInput(data) {
   if (!input) return early.push(data);
+  if (data.type === 'files') return input.files(data.changes);
   if (data.type === 'key') {
     const k = KEYS[data.code];
     // the NumLock state decides what the keypad sends (see the runtime's numpad_key)
@@ -131,7 +208,10 @@ self.onmessage = async ({ data }) => {
     };
   }
   game = data.game;
-  const { frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false, modChoices = {} } = data;
+  const { frames = 0, epoch, canvas, capture = [], pace = true, pacing = 'sync', ahead = true, script = [], persist = true, monitor = false, replay = null, slowMs, inputRing, useProfile = true, local = false, modChoices = {}, role = 'main' } = data;
+  instant = !!data.instantLoad;
+  active = role !== 'standby';
+  ctl.muted = ctl.standby = !active;
   if (slowMs !== undefined) self.slowMs = slowMs;
   const post = (line) => self.postMessage({ type: 'log', line });
   try {
@@ -254,7 +334,8 @@ self.onmessage = async ({ data }) => {
       return Uint32Array.from(all.flat());
     };
     const onProfile = (entries, modules) => {
-      if (!profileDb) return;
+      // (one copy writes the profiles: the playing one)
+      if (!profileDb || !active) return;
       const merged = new Uint32Array((profile?.length ?? 0) + entries.length);
       if (profile) merged.set(profile);
       merged.set(entries, profile?.length ?? 0);
@@ -284,6 +365,9 @@ self.onmessage = async ({ data }) => {
     };
     let saving = Promise.resolve();
     const onSave = (changes) => {
+      // (a standby copy's own writes stay with it: the playing copy's are the game's)
+      if (!active) return;
+      if (instant) self.postMessage({ type: 'files', changes: changes.map(({ path, data }) => ({ path, data })) });
       // (the page hears once they are stored: a site may copy them elsewhere)
       if (db) saving = saving.then(() => storeSaves(db, game, changes)).then(() => self.postMessage({ type: 'saved' })).catch((e) => post(`saving failed: ${e}`));
     };
@@ -323,6 +407,9 @@ self.onmessage = async ({ data }) => {
     // length], then the UTF-8 text) while the game's thread waits, as on Windows.
     const promptSab = new SharedArrayBuffer(8 + 4096);
     const prompt = (title, text, def, kind) => {
+      // (a standby copy's dialogs are answered at once: what it does before its state
+      // loads is gone then)
+      if (!active) return kind === 1 ? def ?? '' : '';
       const st = new Int32Array(promptSab, 0, 2);
       Atomics.store(st, 0, 0);
       self.postMessage({ type: 'prompt', title, text, def, kind, sab: promptSab });
@@ -332,7 +419,7 @@ self.onmessage = async ({ data }) => {
     };
     // the guest's network connections go through PlayOnline's relay, when it is on
     const relayUrl = mods.find((m) => m.id === 'PlayOnline')?.config.RelayUrl || undefined;
-    const status = await runGame({ relayUrl, prompt, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile });
+    const status = await runGame({ relayUrl, prompt, runtimeBytes, files, exe: manifest.entry, frames, epoch, print, canvas, pace, pacing, ahead, onFrame, onReady, onResize, audioRing, onSave, onStats, monitor, onSlow, replay: replay?.input, inputRing, profile, onProfile, sharedProfile, ctl: instant ? ctl : undefined });
     await saving;
     await profileSaving;
     self.postMessage({ type: 'done', status });

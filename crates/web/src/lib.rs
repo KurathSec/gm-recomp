@@ -243,6 +243,8 @@ struct State {
     engine: Option<Engine>,
     /// Input from the page, applied by the HLE layer at its next message poll.
     input: Vec<runtime::InputEvent>,
+    /// Files another copy of the game wrote (`fs_put`), for the next input poll.
+    files: Vec<(String, Option<Vec<u8>>)>,
     glue: Option<Glue>,
     fs: Option<MemFs>,
     started: Option<engine::Started>,
@@ -261,7 +263,7 @@ struct State {
     nop64: u32,
 }
 
-static mut STATE: State = State { input: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0, nop64: 0 };
+static mut STATE: State = State { input: Vec::new(), files: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0, nop64: 0 };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -422,6 +424,9 @@ impl Machine for Web {
             out.push(r.pop_front().unwrap().2);
         }
         out
+    }
+    fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
+        std::mem::take(&mut state().files)
     }
     fn slack_ms(&mut self, clock_us: u64) -> f64 {
         unsafe { gpu_slack(clock_us as f64 / 1000.0) }
@@ -998,16 +1003,18 @@ pub extern "C" fn set_monitor(on: u32) {
     }
 }
 
-/// Makes (`op` 1) or loads (2) a save state at the end of the next frame the game
-/// shows (runtime::state); the host's `state_*` imports do the rest.
+/// Makes (`op` 1) or loads (2; 3: with every texture uploaded before the guest goes on,
+/// for a standby copy) a save state at the end of the next frame the game shows
+/// (runtime::state); the host's `state_*` imports do the rest.
 #[unsafe(no_mangle)]
 pub extern "C" fn state_request(op: u32) {
     if let Some(e) = state().engine.as_mut() {
         e.state_op = match op {
             1 => Some(engine::StateOp::Save),
-            2 => Some(engine::StateOp::Load),
+            2 | 3 => Some(engine::StateOp::Load),
             _ => None,
         };
+        e.state_eager = op == 3;
         e.state_tries = 0;
     }
 }
@@ -1017,6 +1024,24 @@ pub extern "C" fn state_request(op: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn input_key(vk: u32, scan: u32, down: u32) {
     state().input.push(runtime::InputEvent::Key { vk: vk as u8, scan: scan as u16, down: down != 0 });
+}
+
+/// A file another copy of the game wrote (path as stored, from `alloc`; contents from
+/// `alloc`, or a length below zero if it was removed), for the next input poll.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fs_put(path_ptr: *mut u8, path_len: usize, data_ptr: *mut u8, data_len: i32) {
+    let path = unsafe { Vec::from_raw_parts(path_ptr, path_len, path_len) };
+    let data = (data_len >= 0).then(|| unsafe { Vec::from_raw_parts(data_ptr, data_len as usize, data_len as usize) });
+    state().files.push((String::from_utf8_lossy(&path).into_owned(), data));
+}
+
+/// The base of this copy's texture content stamps (`Process::content_rev`): two copies
+/// of a game in one page, or two sessions, never stamp alike.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_content_seed(seed: u32) {
+    if let Some(p) = state().engine.as_mut().and_then(|e| e.p.as_mut()) {
+        p.content_rev = (seed as u64) << 32;
+    }
 }
 
 /// Mouse position in game-window client pixels and button state (1 left, 2 right, 4 middle).
