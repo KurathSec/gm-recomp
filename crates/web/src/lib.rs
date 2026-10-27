@@ -868,11 +868,12 @@ pub extern "C" fn glue_install(base: u32) {
 }
 
 /// Adds a game file (`path` relative to the game directory, `\`-separated) with its
-/// last-write time in Unix milliseconds (0 if unknown).
+/// last-write time in Unix milliseconds (0 if unknown). It takes `data`, which `alloc`
+/// made `data_len` long.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fs_add(path: *const u8, path_len: usize, data: *const u8, data_len: usize, mtime_ms: f64) {
+pub unsafe extern "C" fn fs_add(path: *const u8, path_len: usize, data: *mut u8, data_len: usize, mtime_ms: f64) {
     let path = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(path, path_len) }).into_owned();
-    let data = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
+    let data = unsafe { Vec::from_raw_parts(data, data_len, data_len.max(1)) };
     let ms = mtime_ms.max(0.0) as u64;
     let filetime = if ms == 0 { 0 } else { (ms / 1000 + 11_644_473_600) * 10_000_000 + (ms % 1000) * 10_000 };
     // (a path ending in '\\': a folder the game comes with, empty)

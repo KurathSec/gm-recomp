@@ -826,9 +826,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     mem().set(p, pp);
     const dp = x.alloc(data.length);
     mem().set(data, dp);
+    // (the runtime keeps the data)
     x.fs_add(pp, p.length, dp, data.length, mtime);
     x.dealloc(pp, p.length);
-    x.dealloc(dp, data.length);
     total += data.length;
   }
   print(`${files.length} files, ${(total / 1048576).toFixed(1)} MB`);
