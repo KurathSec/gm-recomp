@@ -155,6 +155,9 @@ export function playGame(o) {
   const sendKeyTo = (c, code, down, numlock, when) => {
     const k = KEYS[code];
     if (!k || !c) return;
+    // (the keys this copy has down: released when it stops playing)
+    if (down) c.down.set(code, numlock);
+    else c.down.delete(code);
     const { idx, ev, when: times } = c.ring;
     const wr = Atomics.load(idx, 0);
     if (((wr - Atomics.load(idx, 1)) | 0) >= 256) return; // the guest is not reading
@@ -182,7 +185,7 @@ export function playGame(o) {
   };
   /** Starts a copy of the game in `el` ('main': the one playing; 'standby'). */
   const spawn = (role, el) => {
-    const c = { role, canvas: el, ring: newRing(), audio: null, node: null, size: null, w: null, want: null, ready: false };
+    const c = { role, canvas: el, ring: newRing(), audio: null, node: null, size: null, w: null, want: null, ready: false, down: new Map(), buttons: 0 };
     const w = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
     c.w = w;
     w.onmessage = ({ data }) => fromCopy(c, data);
@@ -274,7 +277,12 @@ export function playGame(o) {
     cur = next;
     next.ready = false;
     show(next);
-    // the keys and controllers held now are the new copy's (it had none)
+    // The copy that played has its keys and mouse buttons released before it waits at a
+    // state (it would load the state with them held, and take over with them stuck);
+    // the keys and controllers held now are the new copy's.
+    for (const [code, numlock] of [...was.down]) sendKeyTo(was, code, false, numlock);
+    if (was.buttons) was.w.postMessage({ type: 'mouse', x: was.mouse[0], y: was.mouse[1], buttons: 0 });
+    was.buttons = 0;
     for (const [code, numlock] of held.values()) sendKeyTo(next, code, true, numlock);
     padLast.forEach((p, i) => p && next.w.postMessage({ type: 'pad', index: i, ...JSON.parse(p) }));
     await call(next.w, { type: 'state', op: 'activate' });
@@ -410,7 +418,11 @@ export function playGame(o) {
     const r = canvas.getBoundingClientRect();
     const buttons = (e.buttons & 1) | ((e.buttons & 2) ? 2 : 0) | ((e.buttons & 4) ? 4 : 0);
     const t = e.type === 'mousemove' ? undefined : performance.timeOrigin + e.timeStamp;
-    cur.w.postMessage({ type: 'mouse', x: (e.clientX - r.left) * (gameW / r.width), y: (e.clientY - r.top) * (gameH / r.height), buttons, t });
+    const x = (e.clientX - r.left) * (gameW / r.width);
+    const y = (e.clientY - r.top) * (gameH / r.height);
+    cur.buttons = buttons;
+    cur.mouse = [x, y];
+    cur.w.postMessage({ type: 'mouse', x, y, buttons, t });
   }
   for (const t of ['mousemove', 'mousedown', 'mouseup']) listen(canvas, t, mouse);
   listen(canvas, 'contextmenu', (e) => e.preventDefault());
