@@ -11,6 +11,14 @@ const jspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.
 // A save state's fresh buffer is mapped by helper threads in chunks of this size.
 const MAP_CHUNK = 1 << 20;
 
+/** Two translation profiles as one, in the order the functions were first needed. */
+function mergeProfiles(a, b) {
+  const all = [];
+  for (const p of [a, b]) for (let i = 0; i + 2 < p.length; i += 3) all.push([p[i], p[i + 1], p[i + 2]]);
+  all.sort((x, y) => x[2] - y[2]);
+  return Uint32Array.from(all.flat());
+}
+
 /**
  * @param {object} o
  * @param {BufferSource|WebAssembly.Module} o.runtimeBytes  web.wasm, or compiled
@@ -45,8 +53,8 @@ const MAP_CHUNK = 1 << 20;
  * @param {string} [o.relayUrl]  a WebSocket relay (tools/relay.mjs) for the guest's network
  *   connections; without one, sockets fail to connect
  * @param {(modules: {base: number, size: number, id: number}[]) => Promise<Uint32Array|null>} [o.sharedProfile]
- *   without `profile`: what other games with the same modules needed (a runner's code is the same
- *   in every game built with it)
+ *   what other games with the same modules needed (a runner's code is the same in every game built
+ *   with it), added to `profile`
  * @param {number} [o.stateThreads]  helper threads (state-map.mjs) that map save states' fresh
  *   buffers
  */
@@ -896,7 +904,9 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
   // [kind, frame, clock, a, b, c]: a recorded session's input
   for (const [kind, f, t, a, b, c] of replay ?? []) x.replay_push(kind, f, t, a, b, c);
   for (let i = 0, n = x.module_count(); i < n; i++) startModules.push({ base: x.module_at(i, 0), size: x.module_at(i, 1), id: x.module_at(i, 2) >>> 0 });
-  if (!profile && sharedProfile) profile = await sharedProfile(startModules);
+  // (a game's own profile holds what it needed besides what the shared one had)
+  const shared = sharedProfile ? await sharedProfile(startModules) : null;
+  if (shared) profile = profile ? mergeProfiles(profile, shared) : shared;
   if (profile) for (let i = profile.length - 3; i >= 0; i -= 3) x.profile_push(profile[i], profile[i + 1], profile[i + 2]);
   const status = canvas && jspi ? await WebAssembly.promising(x.run)() : x.run();
   flushProfile();
