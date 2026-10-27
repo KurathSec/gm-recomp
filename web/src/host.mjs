@@ -483,7 +483,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       let used = 0;
       // The pages go into the buffers of the state this one replaces where there is one:
       // writing into fresh memory cost three times as much (each of its pages is mapped as
-      // it is first written). Pages in a row are copied at once.
+      // it is first written). Pages in a row are copied at once. Fresh buffers are shared
+      // memory: the store's worker compresses them while the game's keeps them to load.
       const spare = stateWait?.state ?? [];
       let si = 0;
       let sOff = 0;
@@ -496,7 +497,7 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
             return c;
           }
         }
-        return new Uint8Array(STATE_CHUNK);
+        return new Uint8Array(new SharedArrayBuffer(STATE_CHUNK));
       };
       const copy = (from, to) => {
         while (from < to) {

@@ -312,8 +312,9 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     m.engine_ref().process().registry.check(&body.registry)?;
     let mut live = m.engine().p.take().ok_or("the process is lent out")?;
     let mut new = body.process;
+    let keep = kept_textures(&live, &new);
     // From here on the state replaces the process; a failure stops it.
-    drop_gpu_objects(&mut live);
+    drop_gpu_objects(&mut live, &keep);
     for &(a, n) in &body.ranges {
         if m.ensure_mapped(a, n).is_err() {
             m.engine().p = Some(live);
@@ -351,7 +352,7 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     new.dm_voices.clear();
     new.mixer = crate::hle::audio::Mixer::default();
     new.mixer.base = new.mixer.frame_at(new.clock_us);
-    make_gpu_objects(&mut new, m);
+    make_gpu_objects(&mut new, m, &keep);
     drop(live);
     m.engine().p = Some(Box::new(new));
     let _ = m.fill(recomp::abi::RESOLVE_CACHE, recomp::abi::RESOLVE_CACHE_SIZE, 0);
@@ -416,11 +417,41 @@ fn resync_engine<M: Machine>(m: &mut M) {
     engine::sync_modules(m);
 }
 
-/// Deletes the host's copies of the process's textures and shaders.
-fn drop_gpu_objects(p: &mut Process) {
+/// Whether texture object `o` is a render target (its contents exist only on the GPU).
+fn render_target(o: &crate::process::D3dObject) -> bool {
+    let f = |k: &str| o.data.get(k).copied().unwrap_or(0);
+    o.kind.contains("Surface") || if o.kind.starts_with("ID3D11") { f("bind") & 0x20 != 0 } else { f("usage") & 1 != 0 }
+}
+
+/// Textures whose GPU copy a loaded state keeps instead of uploading them again (a large
+/// game's texture pages took seconds of uneven frames after every load): the same texture
+/// in both processes (kind, size, format, levels), written last by the same write (the
+/// content stamp, `Process::stamp_content`), nothing of it waiting to be uploaded in
+/// either, and not a render target.
+fn kept_textures(live: &Process, new: &Process) -> HashSet<u32> {
+    let f = |o: &crate::process::D3dObject, k: &str| o.data.get(k).copied().unwrap_or(0);
+    new.d3d_objects
+        .iter()
+        .filter(|&(id, o)| {
+            let Some(l) = live.d3d_objects.get(id) else { return false };
+            f(o, "gpu") != 0
+                && f(l, "gpu") != 0
+                && o.kind == l.kind
+                && !render_target(o)
+                && f(o, "dirty") == 0
+                && f(l, "dirty") == 0
+                && (f(o, "rev_lo") | f(o, "rev_hi")) != 0
+                && ["w", "h", "fmt", "levels", "rev_lo", "rev_hi"].iter().all(|k| f(o, k) == f(l, k))
+        })
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// Deletes the host's copies of the process's textures (but those in `keep`) and shaders.
+fn drop_gpu_objects(p: &mut Process, keep: &HashSet<u32>) {
     let ids: Vec<(u32, bool, bool)> = p.d3d_objects.iter().map(|(&id, o)| (id, o.data.get("gpu").copied().unwrap_or(0) != 0, o.data.get("shader").copied().unwrap_or(0) != 0)).collect();
     for (id, tex, shader) in ids {
-        if tex {
+        if tex && !keep.contains(&id) {
             p.gpu.texture_delete(id);
         }
         if shader || p.d3d11.shaders.contains_key(&id) {
@@ -431,8 +462,8 @@ fn drop_gpu_objects(p: &mut Process) {
 
 /// Makes the host's textures and shaders of a loaded process: textures upload their
 /// contents from guest memory when next drawn (render targets' only exist on the GPU
-/// and start out empty).
-fn make_gpu_objects(p: &mut Process, mem: &dyn crate::mem::Guest) {
+/// and start out empty); those in `keep` are there already.
+fn make_gpu_objects(p: &mut Process, mem: &dyn crate::mem::Guest, keep: &HashSet<u32>) {
     let (bw, bh) = p.d3d.backbuffer;
     if bw != 0 && bh != 0 {
         p.gpu.resize(bw, bh);
@@ -442,10 +473,12 @@ fn make_gpu_objects(p: &mut Process, mem: &dyn crate::mem::Guest) {
     for id in ids {
         let o = &p.d3d_objects[&id];
         let f = |k: &str| o.data.get(k).copied().unwrap_or(0);
+        if f("gpu") != 0 && keep.contains(&id) {
+            continue;
+        }
         if f("gpu") != 0 {
             let levels = f("levels").clamp(1, 16);
-            let d3d11 = o.kind.starts_with("ID3D11");
-            let rt = o.kind.contains("Surface") || if d3d11 { f("bind") & 0x20 != 0 } else { f("usage") & 1 != 0 };
+            let rt = render_target(o);
             let version = if o.kind.ends_with('8') { 8 } else { 9 };
             p.gpu.texture_create(id, f("w"), f("h"), levels, f("fmt"), rt);
             let dirty = (1u32 << levels) - 1;

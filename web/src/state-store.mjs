@@ -9,8 +9,9 @@
 // {id, ok, result | error}. The game's worker (worker.mjs) hands states in and takes them
 // out through the port the page gives with {op: 'port', port}: {id, op: 'put', game, slot,
 // time, thumb, state} and {id, op: 'get', game, slot}, answered the same way, a put once
-// the state is stored. States are handed over, not copied: a put's state goes back at once
-// as {back: id, state}, once copied here to be compressed.
+// the state is stored. A put's pages are in shared memory, compressed from there a piece
+// at a time (the game's worker keeps them, and writes the next state into them only once
+// this put is answered); a state read back is handed over, not copied.
 
 export const SLOTS = 10;
 
@@ -43,6 +44,7 @@ const range = (game) => IDBKeyRange.bound(`${game}\0`, `${game}\0￿`);
 const latest = new Map();
 
 const MAGIC = 0x31534d47; // "GMS1"
+const PIECE = 4 << 20;
 
 /** A state gzipped (see the value's `data` above) and its size before. */
 async function compress(state) {
@@ -51,9 +53,16 @@ async function compress(state) {
   const w = gz.writable.getWriter();
   const parts = [new Uint8Array(new Uint32Array([MAGIC, state.meta.length, state.pages.length]).buffer), state.meta, new Uint8Array(state.pages.buffer, state.pages.byteOffset, state.pages.byteLength)];
   let bytes = 0;
-  for (const p of [...parts, ...state.chunks]) {
-    await w.write(p);
+  for (const p of parts) {
+    await w.write(p.slice());
     bytes += p.length;
+  }
+  // (streams take no shared memory: a copy of each piece goes in)
+  for (const c of state.chunks) {
+    for (let at = 0; at < c.length; at += PIECE) {
+      await w.write(c.slice(at, at + PIECE));
+    }
+    bytes += c.length;
   }
   await w.close();
   return { data: await out, bytes };
@@ -80,17 +89,9 @@ async function list(game) {
 /** A state's buffers, to hand it over. */
 const buffers = (state) => [...new Set([state.meta.buffer, state.pages.buffer, ...state.chunks.map((c) => c.buffer)])];
 
-async function put({ id, game, slot, time, thumb, state }, target) {
+async function put({ game, slot, time, thumb, state }) {
   latest.set(key(game, slot), time);
-  // A copy is compressed; the state goes back to the game's worker at once, which loads it
-  // again from there (also when the copy could not be made).
-  let copy;
-  try {
-    copy = { meta: state.meta.slice(), pages: state.pages.slice(), chunks: state.chunks.map((c) => c.slice()) };
-  } finally {
-    target.postMessage({ back: id, state }, buffers(state));
-  }
-  const { data, bytes } = await compress(copy);
+  const { data, bytes } = await compress(state);
   if (latest.get(key(game, slot)) !== time) return;
   const tx = (await db()).transaction('states', 'readwrite');
   tx.objectStore('states').put({ game, slot, time, bytes, stored: data.size, thumb, data }, key(game, slot));
@@ -121,7 +122,7 @@ function serve(target) {
     const f = ops[data.op];
     try {
       if (!f) throw new Error(`unknown op ${data.op}`);
-      const result = await f(data, target);
+      const result = await f(data);
       target.postMessage({ id: data.id, ok: true, result }, data.op === 'get' ? buffers(result) : []);
     } catch (e) {
       target.postMessage({ id: data.id, ok: false, error: String(e?.message ?? e) });

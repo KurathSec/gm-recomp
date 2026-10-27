@@ -502,6 +502,12 @@ pub struct Process {
     pub timers_due: Vec<(u32, u64, u64)>,
     #[serde(skip)]
     pub textures_created: u64,
+    /// Stamps of textures' contents (`rev_lo`/`rev_hi`, `stamp_content`): a counter that
+    /// never goes back in a session, loads included (kept from the live process), and
+    /// starts from the epoch so sessions differ. A loaded state keeps the GPU copy of a
+    /// texture whose stamp is the live one's (`state::make_gpu_objects`).
+    #[serde(skip)]
+    pub content_rev: u64,
     pub next_d3d_handle: u32,
     #[serde(skip)]
     pub trace: bool,
@@ -549,6 +555,7 @@ impl Process {
         self.soundfont = live.soundfont.take();
         self.soundfont_failed = live.soundfont_failed;
         self.textures_created = live.textures_created;
+        self.content_rev = live.content_rev;
         self.trace = live.trace;
         self.unimplemented = take(&mut live.unimplemented);
         self.log = take(&mut live.log);
@@ -692,6 +699,7 @@ impl Process {
             soundfont: None,
             soundfont_failed: false,
             textures_created: 0,
+            content_rev: 0,
             next_d3d_handle: 0x1000,
             trace: false,
             x64: false,
@@ -703,6 +711,19 @@ impl Process {
             mouse_buttons: 0,
             log: Vec::new(),
             injected_input: Vec::new(),
+        }
+    }
+
+    /// Marks the contents of D3D object `obj` (a texture the guest wrote) as new.
+    pub fn stamp_content(&mut self, obj: u32) {
+        if self.content_rev == 0 {
+            self.content_rev = self.epoch_unix << 32;
+        }
+        self.content_rev += 1;
+        let rev = self.content_rev;
+        if let Some(o) = self.d3d_objects.get_mut(&obj) {
+            o.data.insert("rev_lo", rev as u32);
+            o.data.insert("rev_hi", (rev >> 32) as u32);
         }
     }
 

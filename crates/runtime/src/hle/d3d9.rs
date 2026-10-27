@@ -1145,6 +1145,7 @@ fn level_bits(c: &mut Ctx, obj: u32, level: u32) -> (u32, u32) {
 fn mark_dirty(c: &mut Ctx, tex: u32, level: u32) {
     let d = field(c, tex, "dirty") | (1 << level.min(15));
     set_field(c, tex, "dirty", d);
+    c.p.stamp_content(tex);
     if !c.p.pending_uploads.contains(&(tex, 9)) {
         c.p.pending_uploads.push((tex, 9));
     }

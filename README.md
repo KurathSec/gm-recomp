@@ -123,11 +123,13 @@ engine allows.
   to it exactly. Up to 10 per game are kept in this browser (IndexedDB, compressed); the
   **States** button lists them. The runtime (`crates/runtime/src/state.rs`) takes and
   restores a state at the end of a frame: guest memory, the registers, and the emulated
-  Windows state (`Process`, serialized with serde), then rebuilds the GPU's textures and
-  shaders and reopens MCI music. A state loads into a later session too, and is refused
-  by a player whose state layout differs. The state last saved or loaded stays in the
-  game's worker, so going back to it again takes a fifth of a second even for a game
-  with a gigabyte of memory; the next save reuses its buffers.
+  Windows state (`Process`, serialized with serde), then rebuilds the GPU's textures (a
+  texture the game has not written since keeps its GPU copy) and shaders and reopens MCI
+  music. A state loads into a later session too, and is refused by a player whose state
+  layout differs. The state last saved or loaded stays in the game's worker (in shared
+  memory, which the store compresses as it is), so going back to it again takes a fifth
+  of a second even for a game with a gigabyte of memory; the next save reuses its
+  buffers.
 - **Play online** (GameMaker 8): [I wanna play online 1.2.3](https://github.com/Pardocaninacting/i-wanna-play-online-1.2.3)'s
   converter runs in the page and changes the game before it starts: the others playing the
   same game show up, with chat and their saves. Its `http_dll_2_3.dll` is replaced by a port
