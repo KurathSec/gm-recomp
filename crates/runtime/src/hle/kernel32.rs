@@ -1705,6 +1705,14 @@ fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u3
             if bytes == super::httpdll::MARKER {
                 return Ok(c.p.fake_module(&mut *c.host, "http_dll_2_3"));
             }
+            // A system DLL an import stored that is not one (the archive's site answered a
+            // name spelled in capitals, as an import table has it, with its home page):
+            // the player's own copy.
+            if !bytes.starts_with(b"MZ") && key.to_lowercase().starts_with(&SYSTEM_DIR.to_lowercase()) {
+                if let Some(bytes) = host_system_dll(c, &base_name) {
+                    return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true, deps_dir);
+                }
+            }
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
             return load_image(c, &base_name, &guest_path, bytes, true, deps_dir);
         }
@@ -1719,7 +1727,7 @@ fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u3
     // Then the system directory (runtime DLLs the importer supplied).
     let sys = format!("{SYSTEM_DIR}\\{base_name}");
     if !with_ext.contains(['\\', '/']) && c.p.fs.is_file(&sys) {
-        if let Some(bytes) = c.p.fs.read_all(&sys) {
+        if let Some(bytes) = c.p.fs.read_all(&sys).filter(|b| b.starts_with(b"MZ")) {
             return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true, deps_dir);
         }
     }

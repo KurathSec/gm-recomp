@@ -52,11 +52,15 @@ export async function importArchive(bytes, name, progress = () => {}) {
     if (!want.length) break;
     for (const dll of want) {
       tried.add(dll);
-      const r = await fetch(asset(`system32/${encodeURIComponent(dll)}`));
+      // (system32/ has lowercase names, and a site may answer a missing file with its
+      // page: an import table's MSACM32.dll stored a web page as the DLL)
+      const r = await fetch(asset(`system32/${encodeURIComponent(dll.toLowerCase())}`));
       if (!r.ok) continue;
+      const data = new Uint8Array(await r.arrayBuffer());
+      if (data[0] !== 0x4d || data[1] !== 0x5a) continue;
       progress(`adding ${dll}`);
       const [pp, pl] = put(new TextEncoder().encode(`C/Windows/system32/${dll}`));
-      const [dp, dl] = put(new Uint8Array(await r.arrayBuffer()));
+      const [dp, dl] = put(data);
       x.add_file(pp, pl, dp, dl);
       x.dealloc(pp, pl);
       x.dealloc(dp, dl);
