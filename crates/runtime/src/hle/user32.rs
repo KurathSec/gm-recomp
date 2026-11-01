@@ -18,6 +18,18 @@ pub const WM_PAINT: u32 = 0x000F;
 pub const WM_CLOSE: u32 = 0x0010;
 const WM_COMMAND: u32 = 0x0111;
 const WM_CHAR: u32 = 0x0102;
+
+/// A system color (GetSysColor's COLOR_ index) as a COLORREF.
+pub(crate) fn sys_color(i: u32) -> u32 {
+    match i {
+        5 => 0xFFFFFF,
+        15 => 0xF0F0F0,
+        8 => 0,
+        13 => 0xD77800,
+        18 => 0,
+        _ => 0xC0C0C0,
+    }
+}
 pub const WM_QUIT: u32 = 0x0012;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
@@ -548,10 +560,7 @@ pub fn register(r: &mut Registry) {
         ok(4, 1)
     });
     r.alias(u, "SystemParametersInfoW", u, "SystemParametersInfoA");
-    r.add(u, "GetSysColor", |c| {
-        let i = c.arg(0);
-        ok(1, match i { 5 => 0xFFFFFF, 15 => 0xF0F0F0, 8 => 0, 13 => 0xD77800, 18 => 0, _ => 0xC0C0C0 })
-    });
+    r.add(u, "GetSysColor", |c| ok(1, sys_color(c.arg(0))));
     r.add(u, "GetSysColorBrush", |c| {
         let i = c.arg(0);
         let color = match i { 5 => 0xFFFFFF, 15 => 0xF0F0F0, _ => 0xC0C0C0 };
@@ -806,7 +815,10 @@ pub fn register(r: &mut Registry) {
     r.add(u, "DrawEdge", |_c| ok(4, 1));
     r.add(u, "DrawFrameControl", |_c| ok(4, 1));
     r.add(u, "DrawFocusRect", |_c| ok(2, 1));
-    r.add(u, "FillRect", |_c| ok(3, 1));
+    r.add(u, "FillRect", |c| {
+        super::gdi32::fill_rect(c, c.arg(0), c.arg(1), c.arg(2));
+        ok(3, 1)
+    });
     r.add(u, "FrameRect", |_c| ok(3, 1));
     r.add(u, "InvertRect", |_c| ok(2, 1));
     r.add(u, "DrawStateA", |_c| ok(10, 1));

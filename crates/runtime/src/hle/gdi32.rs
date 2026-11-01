@@ -163,6 +163,134 @@ fn selected_bitmap(c: &Ctx, hdc: u32) -> Option<u32> {
     }
 }
 
+/// The pixels of the 24- or 32-bit bitmap selected into a DC: (width, height, bytes per
+/// pixel, bits, pitch, bottom-up (rows stored last first, as a DIB with a positive height)).
+fn dc_pixels(c: &Ctx, hdc: u32) -> Option<(i32, i32, u32, u32, u32, bool)> {
+    match gdi(c, selected_bitmap(c, hdc)?)? {
+        GdiObject::Bitmap { w, h, bpp: bpp @ (24 | 32), bits, pitch } if bits != 0 && w > 0 && h != 0 => Some((w, h.abs(), bpp / 8, bits, pitch, h > 0)),
+        _ => None,
+    }
+}
+
+/// A brush's color as a pixel (0x00RRGGBB); `hbr` 1..=31 is a system color + 1 (FillRect).
+fn brush_pixel(c: &Ctx, hbr: u32) -> u32 {
+    let color = match gdi(c, hbr) {
+        Some(GdiObject::Brush { color }) => color,
+        _ if (1..=31).contains(&hbr) => super::user32::sys_color(hbr - 1),
+        _ => 0,
+    };
+    ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF)
+}
+
+/// BitBlt, StretchBlt and PatBlt into a memory DC's bitmap: the destination rectangle
+/// `dr` ([x, y, width, height]; a negative size mirrors) from `sr` of `src`'s bitmap
+/// (nearest pixel), by raster operation `rop` (the common ones; the pattern is the
+/// destination DC's brush). Pixels are 0xAARRGGBB words, the alpha byte as stored.
+fn blit(c: &mut Ctx, dst: u32, dr: [i32; 4], src: u32, sr: [i32; 4], rop: u32) {
+    const SRCCOPY: u32 = 0x00CC_0020;
+    let Some((w, h, bytes, bits, pitch, up)) = dc_pixels(c, dst) else { return };
+    let uses_src = ((rop >> 16) ^ (rop >> 18)) & 0x33 != 0;
+    let pat = match gdi(c, dst) {
+        Some(GdiObject::Dc { brush, .. }) => brush_pixel(c, brush),
+        _ => 0,
+    };
+    // the source's pixels, whole
+    let source = if uses_src {
+        let Some((sw, sh, sbytes, sbits, spitch, sup)) = dc_pixels(c, src) else { return };
+        let mut buf = vec![0u8; (spitch * sh as u32) as usize];
+        if c.host.read(sbits, &mut buf).is_err() {
+            return;
+        }
+        Some((sw, sh, sbytes, spitch, sup, buf))
+    } else {
+        None
+    };
+    let mut out = vec![0u8; (pitch * h as u32) as usize];
+    if c.host.read(bits, &mut out).is_err() {
+        return;
+    }
+    let px = |b: &[u8], o: usize, n: u32| -> u32 {
+        let v = b[o] as u32 | (b[o + 1] as u32) << 8 | (b[o + 2] as u32) << 16;
+        if n == 4 { v | (b[o + 3] as u32) << 24 } else { v }
+    };
+    let (dw, dh) = (dr[2].unsigned_abs() as i64, dr[3].unsigned_abs() as i64);
+    for y in 0..dh {
+        let ty = dr[1] as i64 + y;
+        if ty < 0 || ty >= h as i64 {
+            continue;
+        }
+        let row = (if up { h as i64 - 1 - ty } else { ty }) as usize * pitch as usize;
+        for x in 0..dw {
+            let tx = dr[0] as i64 + x;
+            if tx < 0 || tx >= w as i64 {
+                continue;
+            }
+            let o = row + tx as usize * bytes as usize;
+            let d = px(&out, o, bytes);
+            let s = match &source {
+                Some((sw, sh, sbytes, spitch, sup, buf)) => {
+                    // (mirrored where the two rectangles' signs differ)
+                    let fx = if (dr[2] < 0) != (sr[2] < 0) { dw - 1 - x } else { x };
+                    let fy = if (dr[3] < 0) != (sr[3] < 0) { dh - 1 - y } else { y };
+                    let sx = sr[0] as i64 + fx * sr[2].unsigned_abs() as i64 / dw.max(1) - if sr[2] < 0 { sr[2].unsigned_abs() as i64 } else { 0 };
+                    let sy = sr[1] as i64 + fy * sr[3].unsigned_abs() as i64 / dh.max(1) - if sr[3] < 0 { sr[3].unsigned_abs() as i64 } else { 0 };
+                    if sx < 0 || sy < 0 || sx >= *sw as i64 || sy >= *sh as i64 {
+                        continue;
+                    }
+                    let srow = (if *sup { *sh as i64 - 1 - sy } else { sy }) as usize * *spitch as usize;
+                    px(buf, srow + sx as usize * *sbytes as usize, *sbytes)
+                }
+                None => 0,
+            };
+            let v = match rop {
+                SRCCOPY => s,
+                0x0033_0008 => !s,         // NOTSRCCOPY
+                0x00EE_0086 => s | d,      // SRCPAINT
+                0x0088_00C6 => s & d,      // SRCAND
+                0x0066_0046 => s ^ d,      // SRCINVERT
+                0x0044_0328 => s & !d,     // SRCERASE
+                0x0011_00A6 => !(s | d),   // NOTSRCERASE
+                0x00BB_0226 => !s | d,     // MERGEPAINT
+                0x00C0_00CA => s & pat,    // MERGECOPY
+                0x0055_0009 => !d,         // DSTINVERT
+                0x00F0_0021 => pat,        // PATCOPY
+                0x005A_0049 => pat ^ d,    // PATINVERT
+                0x0000_0042 => 0,          // BLACKNESS
+                0x00FF_0062 => 0x00FF_FFFF, // WHITENESS
+                _ => continue,
+            };
+            out[o] = v as u8;
+            out[o + 1] = (v >> 8) as u8;
+            out[o + 2] = (v >> 16) as u8;
+            if bytes == 4 {
+                out[o + 3] = (v >> 24) as u8;
+            }
+        }
+    }
+    let _ = c.host.write(bits, &out);
+}
+
+/// FillRect: `rect` (guest RECT) of a memory DC's bitmap in brush `hbr`'s color.
+pub(crate) fn fill_rect(c: &mut Ctx, hdc: u32, rect: u32, hbr: u32) {
+    let r: Vec<i32> = (0..4).map(|i| c.host.read_u32(rect + 4 * i).unwrap_or(0) as i32).collect();
+    let saved = match gdi(c, hdc) {
+        Some(GdiObject::Dc { brush, .. }) => brush,
+        _ => return,
+    };
+    // (as a pattern copy with the brush selected)
+    let brush = if (1..=31).contains(&hbr) { c.p.new_gdi(GdiObject::Brush { color: super::user32::sys_color(hbr - 1) }) } else { hbr };
+    if let Some(GdiObject::Dc { brush: b, .. }) = gdi_mut(c, hdc) {
+        *b = brush;
+    }
+    blit(c, hdc, [r[0], r[1], r[2] - r[0], r[3] - r[1]], 0, [0, 0, 0, 0], 0x00F0_0021);
+    if let Some(GdiObject::Dc { brush: b, .. }) = gdi_mut(c, hdc) {
+        *b = saved;
+    }
+    if brush != hbr {
+        c.p.handles.remove(&brush);
+    }
+}
+
 fn get_object(c: &mut Ctx, wide: bool) -> ApiResult {
     let h = c.arg(0);
     let h_obj = h;
@@ -936,10 +1064,23 @@ pub fn register(r: &mut Registry) {
         ok(4, set)
     });
 
-    // ---- drawing (no rasterisation in the harness) ---------------------------
-    r.add(g, "BitBlt", |_c| ok(9, 1));
-    r.add(g, "StretchBlt", |_c| ok(11, 1));
-    r.add(g, "PatBlt", |_c| ok(6, 1));
+    // ---- drawing ---------------------------------------------------------------
+    // (into memory DCs' bitmaps; a window's DC draws nothing: the game shows itself
+    // through Direct3D)
+    r.add(g, "BitBlt", |c| {
+        let (w, h) = (c.arg_i32(3), c.arg_i32(4));
+        blit(c, c.arg(0), [c.arg_i32(1), c.arg_i32(2), w, h], c.arg(5), [c.arg_i32(6), c.arg_i32(7), w, h], c.arg(8));
+        ok(9, 1)
+    });
+    r.add(g, "StretchBlt", |c| {
+        blit(c, c.arg(0), [c.arg_i32(1), c.arg_i32(2), c.arg_i32(3), c.arg_i32(4)], c.arg(5), [c.arg_i32(6), c.arg_i32(7), c.arg_i32(8), c.arg_i32(9)], c.arg(10));
+        ok(11, 1)
+    });
+    r.add(g, "PatBlt", |c| {
+        let (w, h) = (c.arg_i32(3), c.arg_i32(4));
+        blit(c, c.arg(0), [c.arg_i32(1), c.arg_i32(2), w, h], 0, [0, 0, w, h], c.arg(5));
+        ok(6, 1)
+    });
     r.add(g, "MaskBlt", |_c| ok(12, 1));
     r.add(g, "PlgBlt", |_c| ok(10, 1));
     r.add(g, "Rectangle", |_c| ok(5, 1));
