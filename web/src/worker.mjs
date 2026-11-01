@@ -1,7 +1,7 @@
 // The guest's main thread: fetches the runtime and the game files, then runs the game.
 // Messages to the page: {type: 'log', line} and {type: 'done', status}.
 import { asset } from './asset.mjs';
-import { GL_OPTIONS } from './gpu.mjs';
+import { glContext } from './gpu.mjs';
 import { runGame } from './host.mjs';
 import { applyMods, pageMod, selectedMods } from './mods.mjs';
 import { KEYS } from './keys.mjs';
@@ -224,7 +224,7 @@ self.onmessage = async ({ data }) => {
     runtime.catch(() => {}); // (awaited below)
     // Creating the WebGL context blocks this thread (seconds in a browser that has not
     // used WebGL yet): it is done while the downloads are under way.
-    const warmGl = () => canvas?.getContext('webgl2', GL_OPTIONS);
+    const warmGl = () => canvas && glContext(canvas);
     let manifest;
     let downloaded;
     const t0 = performance.now();
@@ -425,7 +425,7 @@ self.onmessage = async ({ data }) => {
     await profileSaving;
     self.postMessage({ type: 'done', status });
   } catch (e) {
-    post(`error: ${e && e.stack ? e.stack : e}`);
+    post(`error: ${e}${e?.stack && !e.stack.includes(String(e?.message)) ? `\n${e.stack}` : ''}`);
     self.postMessage({ type: 'done', status: -1 });
   }
 };

@@ -223,6 +223,20 @@ function toRGBA(fmt, src, w, h, pitch) {
  */
 export const GL_OPTIONS = { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false };
 
+const contexts = new WeakMap();
+/**
+ * The canvas's WebGL2 context, made once: Firefox 159 throws at a second getContext on a
+ * canvas a worker was handed ("Cannot update created context to different thread").
+ */
+export function glContext(canvas) {
+  let gl = contexts.get(canvas);
+  if (!gl) {
+    gl = canvas.getContext('webgl2', GL_OPTIONS);
+    if (gl) contexts.set(canvas, gl);
+  }
+  return gl;
+}
+
 export class D3DGL {
   /**
    * @param {OffscreenCanvas|HTMLCanvasElement} canvas
@@ -235,7 +249,7 @@ export class D3DGL {
     this.canvas = canvas;
     this.guestBuffer = guestBuffer;
     this.rtBuffer = rtBuffer;
-    const gl = canvas.getContext('webgl2', GL_OPTIONS);
+    const gl = glContext(canvas);
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
     // which GPU draws (a software renderer explains a slow game); Firefox names it
