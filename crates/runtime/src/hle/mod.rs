@@ -199,6 +199,11 @@ pub trait Host: Guest {
     fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
         Vec::new()
     }
+    /// Whether the page wants the files the game wrote at this frame's end, not at the
+    /// next of every 25 (it is about to stop the game); true once per request.
+    fn take_flush(&mut self) -> bool {
+        false
+    }
     /// Whether `monitor` lines are wanted (a session that can be replayed).
     fn monitoring(&self) -> bool {
         false

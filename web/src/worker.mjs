@@ -30,6 +30,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 'files'}). Both copies keep states the other made: a save then writes into fresh memory,
 // never into a state's buffers.
 let game = null;
+// The game's written files stored now ({type: 'flush', id} from the page, which stops the
+// game next): answered {type: 'flushed', id} once they are (or a frame has not come).
+let flushSaves = () => Promise.resolve();
 let store = null;
 let storeSeq = 0;
 const storeCalls = new Map();
@@ -199,6 +202,7 @@ function handleInput(data) {
 self.onmessage = async ({ data }) => {
   if (data.type === 'key' || data.type === 'mouse' || data.type === 'pad') return handleInput(data);
   if (data.type === 'state') return handleState(data);
+  if (data.type === 'flush') return flushSaves().then(() => self.postMessage({ type: 'flushed', id: data.id }));
   if (data.statePort) {
     store = data.statePort;
     store.onmessage = ({ data: r }) => {
@@ -365,6 +369,18 @@ self.onmessage = async ({ data }) => {
         .catch((e) => post(`storing the translation profile failed: ${e}`));
     };
     let saving = Promise.resolve();
+    // (the runtime hands them over at the end of the next frame)
+    const frameWaiters = [];
+    flushSaves = async () => {
+      if (input && active) {
+        input.flushSaves();
+        await new Promise((r) => {
+          frameWaiters.push(r);
+          setTimeout(r, 1000);
+        });
+      }
+      await saving;
+    };
     const onSave = (changes) => {
       // (a standby copy's own writes stay with it: the playing copy's are the game's)
       if (!active) return;
@@ -376,6 +392,7 @@ self.onmessage = async ({ data }) => {
     const want = new Set(capture);
     // Scripted input for tests: [frame, code, down] applied after that frame.
     const onFrame = async (frame, gpu) => {
+      for (const r of frameWaiters.splice(0)) r();
       for (const [f, code, a, b, c] of script) {
         if (f !== frame) continue;
         if (code === 'mouse') handleInput({ type: 'mouse', x: a, y: b, buttons: c });

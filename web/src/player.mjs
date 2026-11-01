@@ -33,7 +33,7 @@ const GAME_KEYS = /^(Arrow|Space|Tab|Backspace|F\d|Enter|Shift|Control|Alt|Key|D
  * '' for OK, Yes or Ignore, null to cancel, for No or Abort; the browser's
  * alert/prompt/confirm without it).
  * onStateStored(slot, error) (a save state is in the browser's storage, or could not be).
- * @returns {{worker: Worker, setKeymap(map): void, soundStats(): Promise<string | null>, stop(): void, states: object | null}}
+ * @returns {{worker: Worker, setKeymap(map): void, soundStats(): Promise<string | null>, flushSaves(): Promise<void>, stop(): void, states: object | null}}
  */
 export function playGame(o) {
   const { game, local = false, canvas, modChoices = {}, pageKeys = {} } = o;
@@ -84,6 +84,10 @@ export function playGame(o) {
     }
   };
   for (const t of ['pointerdown', 'keydown']) listen(window, t, startAudio);
+  // flushSaves's waiting calls, by id
+  const flushes = new Map();
+  let flushId = 0;
+
   const soundStats = () => {
     const audioNode = cur?.node;
     const audio = cur?.audio;
@@ -323,6 +327,10 @@ export function playGame(o) {
       case 'saved':
         if (playing) o.onSaved?.();
         break;
+      case 'flushed':
+        flushes.get(data.id)?.();
+        flushes.delete(data.id);
+        break;
       case 'prompt':
         answerPrompt(data);
         break;
@@ -463,6 +471,20 @@ export function playGame(o) {
     },
     soundStats,
     states,
+    /**
+     * Stores the files the game has written (they otherwise go every half second): before
+     * the page stops the game, so a save made just before is not lost. onSaved() comes
+     * first when there were any; resolves within about a second either way.
+     */
+    flushSaves() {
+      if (stopped || !cur) return Promise.resolve();
+      const id = ++flushId;
+      return new Promise((res) => {
+        flushes.set(id, res);
+        cur.w.postMessage({ type: 'flush', id });
+        setTimeout(() => flushes.delete(id) && res(), 2000);
+      });
+    },
     /** Stops the game and the page's listeners. */
     stop() {
       stopped = true;

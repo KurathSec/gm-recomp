@@ -355,6 +355,10 @@ pub trait Machine: Guest {
     fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
         Vec::new()
     }
+    /// See `Host::take_flush`.
+    fn take_flush(&mut self) -> bool {
+        false
+    }
     /// A General MIDI SoundFont, once available (the first call may start loading it).
     fn soundfont(&mut self) -> Option<Vec<u8>> {
         None
@@ -712,6 +716,10 @@ impl<M: Machine> Host for M {
 
     fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
         Machine::take_files(self)
+    }
+
+    fn take_flush(&mut self) -> bool {
+        Machine::take_flush(self)
     }
 
     fn monitoring(&self) -> bool {

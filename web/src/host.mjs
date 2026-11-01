@@ -864,6 +864,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
       pad: (i, connected, buttons, lt, rt, lx, ly, rx, ry) => x.input_pad(i, connected ? 1 : 0, buttons, lt | (rt << 8), lx, ly, rx, ry),
       // Files another copy of the game wrote ([{path (as stored), data: Uint8Array | null}]),
       // written at the guest's next input poll.
+      // The files the game wrote, to `onSave` at the end of the next frame.
+      flushSaves: () => x.saves_flush(),
       files: (changes) => {
         for (const { path, data } of changes) {
           const p = enc.encode(path);

@@ -445,7 +445,7 @@ fn dev_present(c: &mut Ctx) -> ApiResult {
 /// the frame limit.
 pub(crate) fn present_frame(c: &mut Ctx, src_rect: [i32; 4], dst_w: u32, dst_h: u32) -> Result<(), super::ApiError> {
     super::dsound::flush_audio(c);
-    if c.p.frames_presented % 25 == 0 {
+    if c.p.frames_presented % 25 == 0 || c.host.take_flush() {
         c.p.flush_saves();
     }
     let now = c.p.clock_us;

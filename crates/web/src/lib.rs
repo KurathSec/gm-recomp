@@ -245,6 +245,8 @@ struct State {
     input: Vec<runtime::InputEvent>,
     /// Files another copy of the game wrote (`fs_put`), for the next input poll.
     files: Vec<(String, Option<Vec<u8>>)>,
+    /// The page asked for the game's written files at the next frame (`saves_flush`).
+    flush: bool,
     glue: Option<Glue>,
     fs: Option<MemFs>,
     started: Option<engine::Started>,
@@ -263,7 +265,7 @@ struct State {
     nop64: u32,
 }
 
-static mut STATE: State = State { input: Vec::new(), files: Vec::new(), engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0, nop64: 0 };
+static mut STATE: State = State { input: Vec::new(), files: Vec::new(), flush: false, engine: None, glue: None, fs: None, started: None, guest_bytes: 0, soundfont_requested: false, soundfont: None, replay: std::collections::VecDeque::new(), drained: (u64::MAX, 0), waited: false, polls: 0, nop64: 0 };
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -427,6 +429,9 @@ impl Machine for Web {
     }
     fn take_files(&mut self) -> Vec<(String, Option<Vec<u8>>)> {
         std::mem::take(&mut state().files)
+    }
+    fn take_flush(&mut self) -> bool {
+        std::mem::take(&mut state().flush)
     }
     fn slack_ms(&mut self, clock_us: u64) -> f64 {
         unsafe { gpu_slack(clock_us as f64 / 1000.0) }
@@ -1061,6 +1066,12 @@ pub extern "C" fn state_request(op: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn input_key(vk: u32, scan: u32, down: u32) {
     state().input.push(runtime::InputEvent::Key { vk: vk as u8, scan: scan as u16, down: down != 0 });
+}
+
+/// Hands the files the game wrote to the page at the end of the next frame (`Host::take_flush`).
+#[unsafe(no_mangle)]
+pub extern "C" fn saves_flush() {
+    state().flush = true;
 }
 
 /// A file another copy of the game wrote (path as stored, from `alloc`; contents from
