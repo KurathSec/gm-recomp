@@ -84,9 +84,12 @@ export function playGame(o) {
     }
   };
   for (const t of ['pointerdown', 'keydown']) listen(window, t, startAudio);
-  // flushSaves's waiting calls, by id
+  // flushSaves's waiting calls, by id; save states made and not yet stored (a big one
+  // takes seconds to compress), and who waits for them
   const flushes = new Map();
   let flushId = 0;
+  let storing = 0;
+  const stored = [];
 
   const soundStats = () => {
     const audioNode = cur?.node;
@@ -338,6 +341,8 @@ export function playGame(o) {
         answer(data);
         break;
       case 'state-stored':
+        storing = Math.max(0, storing - 1);
+        if (!storing) for (const r of stored.splice(0)) r();
         o.onStateStored?.(data.slot, data.ok ? null : data.error);
         break;
       case 'files':
@@ -370,7 +375,11 @@ export function playGame(o) {
     /** The game's states: [{slot, time, bytes, stored, thumb (Blob | null)}]. */
     list: () => call(store, { op: 'list', game }),
     /** Saves the game as it is at the end of its next frame into `slot` (resolves once made). */
-    save: (slot) => call(cur.w, { type: 'state', op: 'save', slot }),
+    save: (slot) =>
+      call(cur.w, { type: 'state', op: 'save', slot }).then((r) => {
+        storing++;
+        return r;
+      }),
     /** Goes back to the state in `slot` (at once with instant loads, once the standby waits there). */
     load: async (slot) => {
       const version = versions.get(slot) ?? 0;
@@ -472,19 +481,23 @@ export function playGame(o) {
     soundStats,
     states,
     /**
-     * Stores the files the game has written (they otherwise go every half second): before
-     * the page stops the game, so a save made just before is not lost. onSaved() comes
-     * first when there were any; resolves within about a second either way.
+     * Stores the files the game has written (they otherwise go every half second) and the
+     * save states still being stored: before the page stops the game, so a save made just
+     * before is not lost. onSaved() comes first when there were files; resolves within
+     * about a second, or once the states are stored (at most half a minute).
      */
-    flushSaves() {
-      if (stopped || !cur) return Promise.resolve();
+    async flushSaves() {
+      if (stopped || !cur) return;
       const id = ++flushId;
-      return new Promise((res) => {
+      await new Promise((res) => {
         flushes.set(id, res);
         cur.w.postMessage({ type: 'flush', id });
         setTimeout(() => flushes.delete(id) && res(), 2000);
       });
+      if (storing) await new Promise((res) => (stored.push(res), setTimeout(res, 30000)));
     },
+    /** Whether save states are still being stored (flushSaves waits for them). */
+    storingStates: () => storing > 0,
     /** Stops the game and the page's listeners. */
     stop() {
       stopped = true;
