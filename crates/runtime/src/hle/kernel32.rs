@@ -1699,19 +1699,12 @@ fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u3
     let with_ext = if name.to_lowercase().ends_with(".dll") || name.contains('.') { name.to_string() } else { format!("{name}.dll") };
     let key = c.p.vpath(&with_ext);
     let base_name = with_ext.rsplit(['\\', '/']).next().unwrap_or(&with_ext).to_string();
-    if c.p.fs.is_file(&key) {
+    // (a stray system file, below, is not there)
+    if c.p.fs.is_file(&key) && !stray_system_file(c, &key) {
         if let Some(bytes) = c.p.fs.read_all(&key) {
             // a game I wanna play online converted: its http_dll_2_3.dll is the port
             if bytes == super::httpdll::MARKER {
                 return Ok(c.p.fake_module(&mut *c.host, "http_dll_2_3"));
-            }
-            // A system DLL an import stored that is not one (the archive's site answered a
-            // name spelled in capitals, as an import table has it, with its home page):
-            // the player's own copy.
-            if !bytes.starts_with(b"MZ") && key.to_lowercase().starts_with(&SYSTEM_DIR.to_lowercase()) {
-                if let Some(bytes) = host_system_dll(c, &base_name) {
-                    return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true, deps_dir);
-                }
             }
             let guest_path = if with_ext.contains(':') { with_ext.clone() } else { format!("{}\\{}", c.p.cwd.trim_end_matches('\\'), with_ext.trim_start_matches('\\')) };
             return load_image(c, &base_name, &guest_path, bytes, true, deps_dir);
@@ -1735,7 +1728,7 @@ fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u3
         return Ok(c.p.fake_module(&mut *c.host, &stem));
     }
     // Then the player's own system DLLs (the importer could not know this one was needed).
-    if !with_ext.contains(['\\', '/']) {
+    if !with_ext.contains(['\\', '/']) || stray_system_file(c, &key) {
         if let Some(bytes) = host_system_dll(c, &base_name) {
             return load_image(c, &base_name, &format!("C:\\Windows\\system32\\{base_name}"), bytes, true, deps_dir);
         }
@@ -1743,6 +1736,14 @@ fn load_library_in(c: &mut Ctx, name: &str, deps_dir: Option<&str>) -> Result<u3
     c.p.log(format!("LoadLibrary({name:?}): not found"));
     c.set_last_error(ERROR_MOD_NOT_FOUND);
     Ok(0)
+}
+
+/// A file in the system directory that is not a PE image: as if it were not there. An
+/// archive import stored a web site's page for each system DLL the player has no copy of
+/// (the site answers a missing path with its home page), and loading it failed the DLL
+/// that imports it (39dll.dll's iphlpapi.dll: "Error defining an external function").
+fn stray_system_file(c: &Ctx, vpath: &str) -> bool {
+    vpath.to_lowercase().starts_with(&SYSTEM_DIR.to_lowercase()) && !c.p.fs.read_all(vpath).is_some_and(|b| b.starts_with(b"MZ"))
 }
 
 /// A system DLL from the host (`Host::system_dll`), asked for once per name.
@@ -1794,7 +1795,10 @@ pub fn load_image(c: &mut Ctx, base_name: &str, guest_path: &str, bytes: Vec<u8>
                 continue;
             }
             let dirs = [deps_dir.map(str::to_string), exe_dir.clone(), Some(c.p.cwd.clone()), c.p.dll_dir.clone(), Some("C:\\Windows\\system32".to_string())];
-            let found = dirs.into_iter().flatten().map(|d| format!("{}\\{file}", d.trim_end_matches('\\'))).find(|p| c.p.fs.is_file(&c.p.vpath(p)));
+            let found = dirs.into_iter().flatten().map(|d| format!("{}\\{file}", d.trim_end_matches('\\'))).find(|p| {
+                let v = c.p.vpath(p);
+                c.p.fs.is_file(&v) && !stray_system_file(c, &v)
+            });
             let base = if let Some(path) = found {
                 load_library_in(c, &path, deps_dir)?
             } else if FALLBACK_DLLS.contains(&stem.as_str()) {
