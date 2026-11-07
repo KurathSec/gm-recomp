@@ -361,8 +361,8 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     resync_engine(m);
     m.engine().tsc = body.tsc;
     engine::restore_ctx(m, &body.ctx);
-    engine::request(m, Ctl::Resume);
-    if std::mem::take(&mut m.engine().state_eager) {
+    let waits = std::mem::take(&mut m.engine().state_eager);
+    if waits {
         let mut regs = engine::read_regs(m);
         let _ = engine::with_ctx(m, &mut regs, crate::hle::ApiId(0), |c| {
             for (tex, version) in std::mem::take(&mut c.p.pending_uploads) {
@@ -377,13 +377,20 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     let held = m.now_us();
     m.state_loaded();
     m.engine().state_held_us = m.now_us() - held;
+    // The keys held now, held in the game without a press (guest code runs for it: the
+    // registers go back after).
+    let mut regs = engine::read_regs(m);
+    let _ = engine::with_ctx(m, &mut regs, crate::hle::ApiId(0), |c| crate::hle::user32::carry_keys(c, waits));
+    engine::restore_ctx(m, &body.ctx);
+    engine::request(m, Ctl::Resume);
     let mem: u64 = body.ranges.iter().map(|r| r.1 as u64).sum();
     Ok(Outcome::Done(format!("loaded ({} MB of memory)", mem >> 20)))
 }
 
 /// Input as the player has it now, not as it was when the state was made: keys held then
-/// and not now are released and the other way round (as messages, which games that keep
-/// their own key state need), and the mouse and controllers are as they are.
+/// and not now are released and the other way round (`user32::carry_keys` takes them from
+/// here, without a press or release for the game to see), and the mouse and controllers
+/// are as they are.
 fn carry_input(new: &mut Process, live: &Process) {
     use crate::hle::InputEvent;
     for vk in 0..=255u8 {

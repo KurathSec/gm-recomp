@@ -522,6 +522,8 @@ impl Machine for Web {
         if unsafe { state_memory(flat.as_ptr(), clear.len()) } == 1 { Ok(()) } else { Err("the state's memory could not be written".into()) }
     }
     fn state_loaded(&mut self) {
+        // (the keys held when it takes over came in while it waited)
+        state().waited = true;
         let ms = self.engine_ref().process().clock_us as f64 / 1000.0;
         unsafe { state_loaded(ms) }
     }

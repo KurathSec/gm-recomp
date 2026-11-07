@@ -1376,11 +1376,8 @@ pub fn send_message(c: &mut Ctx, hwnd: u32, msg: u32, wp: u32, lp: u32) -> Resul
 
 /// Applies input from the host: key state, key messages to the focus window, mouse
 /// position and button messages.
-/// A key's state change and its message to the focus window.
-fn key_event(c: &mut Ctx, vk: u8, scan: u16, down: bool) {
-    if c.p.trace {
-        c.p.log(format!("key {vk:#04x} {}", if down { "down" } else { "up" }));
-    }
+/// A key's state change; returns whether it was down.
+fn set_key_state(c: &mut Ctx, vk: u8, down: bool) -> bool {
     let k = &mut c.p.key_state[vk as usize];
     let was_down = *k & 0x80 != 0;
     if down {
@@ -1398,10 +1395,11 @@ fn key_event(c: &mut Ctx, vk: u8, scan: u16, down: bool) {
             c.p.key_state[generic] = (c.p.key_state[generic] & 1) | any;
         }
     }
-    let target = if c.p.focus != 0 { c.p.focus } else { c.p.active };
-    if target == 0 {
-        return;
-    }
+    was_down
+}
+
+/// The virtual key a key's messages name, and the message's lParam.
+fn key_message(vk: u8, scan: u16, down: bool, was_down: bool) -> (u32, u32, u32) {
     let msg_vk = match vk {
         0xA0 | 0xA1 => 0x10,
         0xA2 | 0xA3 => 0x11,
@@ -1410,7 +1408,135 @@ fn key_event(c: &mut Ctx, vk: u8, scan: u16, down: bool) {
     } as u32;
     let ext = if scan & 0x100 != 0 { 1 << 24 } else { 0 };
     let lp = 1 | ((scan as u32 & 0xFF) << 16) | ext | if down { if was_down { 1 << 30 } else { 0 } } else { 0xC000_0000 };
-    post_message(c, target, if down { WM_KEYDOWN } else { 0x0101 }, msg_vk, lp);
+    (if down { WM_KEYDOWN } else { 0x0101 }, msg_vk, lp)
+}
+
+/// A key's state change and its message to the focus window.
+fn key_event(c: &mut Ctx, vk: u8, scan: u16, down: bool) {
+    if c.p.trace {
+        c.p.log(format!("key {vk:#04x} {}", if down { "down" } else { "up" }));
+    }
+    let was_down = set_key_state(c, vk, down);
+    let target = if c.p.focus != 0 { c.p.focus } else { c.p.active };
+    if target == 0 {
+        return;
+    }
+    let (msg, msg_vk, lp) = key_message(vk, scan, down, was_down);
+    post_message(c, target, msg, msg_vk, lp);
+}
+
+/// How many bytes of the game's own memory a key's held state can take at most (its entry
+/// in the key table, the last key): more, and they are something else.
+const MAX_HELD_BYTES: usize = 64;
+
+/// After a save state's load: the keys held now and not in the state, or the other way
+/// round, as the game's own state of them, with no press or release for it to see. The
+/// player holding Jump while loading on a vine must not jump, and a later press of a
+/// direction must find Jump held.
+///
+/// Runners keep a key's held state and its press and release flags apart in their own
+/// memory, at addresses of their own. So the window procedure gets the key's change and
+/// then the opposite one: the bytes of the exe's image the first sets and the second
+/// undoes are the held state, and all the others go back as they were. Keys whose messages
+/// do more (Esc, the F keys, the keypad) go as messages at the next poll, as does anything
+/// else. `waited`: the copy waited at the state, and the keys held now came in meanwhile.
+pub(crate) fn carry_keys(c: &mut Ctx, waited: bool) {
+    let mut events = std::mem::take(&mut c.p.injected_input);
+    if waited {
+        let (frame, clock) = (c.p.frames_presented, c.p.clock_us);
+        events.extend(c.host.poll_input(frame, clock));
+    }
+    let before = c.p.key_state;
+    let mut scans = [0u16; 256];
+    let mut rest = Vec::new();
+    for ev in events {
+        match ev {
+            super::InputEvent::Key { vk, scan, down } if quiet_key(c, vk, scan) => {
+                let numlock = scan & 0x200 != 0;
+                let scan = scan & 0x1FF;
+                if scan & 0xFF != 0 {
+                    let dik = (scan & 0x7F) as usize | if scan & 0x100 != 0 { 0x80 } else { 0 };
+                    c.p.dik[dik] = if down { 0x80 } else { 0 };
+                    c.p.key_state[0x90] = (c.p.key_state[0x90] & 0x80) | numlock as u8;
+                }
+                set_key_state(c, vk, down);
+                let (_, msg_vk, _) = key_message(vk, scan, down, false);
+                scans[msg_vk as usize] = scan;
+            }
+            other => rest.push(other),
+        }
+    }
+    c.p.injected_input = rest;
+    let want = c.p.key_state;
+    let target = if c.p.focus != 0 { c.p.focus } else { c.p.active };
+    let keys: Vec<u8> = (0..=255u8).filter(|&k| !matches!(k, 0xA0..=0xA5) && (want[k as usize] ^ before[k as usize]) & 0x80 != 0).collect();
+    if keys.is_empty() || target == 0 {
+        return;
+    }
+    let fpu = c.host.fpu_state();
+    for k in keys {
+        key_quietly(c, target, k, scans[k as usize], &before, &want);
+    }
+    c.host.set_fpu_state(&fpu);
+}
+
+/// Whether a key's change goes through `key_quietly`.
+fn quiet_key(c: &Ctx, vk: u8, scan: u16) -> bool {
+    let keypad = numpad_index(vk).is_some() && scan & 0x100 == 0;
+    let shifted = matches!(vk, 0xA0 | 0xA1) && c.p.numpad_shift != 0;
+    !keypad && !shifted && vk != 0x1B && !(0x70..=0x87).contains(&vk)
+}
+
+/// See `carry_keys`: key `k` (as its messages name it), `want` the key states it ends with.
+fn key_quietly(c: &mut Ctx, target: u32, k: u8, scan: u16, before: &[u8; 256], want: &[u8; 256]) {
+    let down = want[k as usize] & 0x80 != 0;
+    let (msg, wp, lp) = key_message(k, scan, down, !down);
+    let (back, _, back_lp) = key_message(k, scan, !down, down);
+    let image = c.p.exe_module().map(|m| (m.base, m.size));
+    let read = |c: &mut Ctx, base: u32, size: u32| {
+        let mut b = vec![0u8; size as usize];
+        c.host.read(base, &mut b).ok().map(|_| b)
+    };
+    let mut held = 0;
+    if let Some((base, size)) = image {
+        // (the key and, for a generic modifier, its left and right ones change together)
+        let same = |vk: usize| vk == k as usize || matches!((k, vk), (0x10, 0xA0 | 0xA1) | (0x11, 0xA2 | 0xA3) | (0x12, 0xA4 | 0xA5));
+        if let Some(s0) = read(c, base, size) {
+            let _ = send_message(c, target, msg, wp, lp);
+            let s1 = read(c, base, size).unwrap_or_else(|| s0.clone());
+            for (vk, b) in before.iter().enumerate().filter(|&(vk, _)| same(vk)) {
+                c.p.key_state[vk] = *b;
+            }
+            let _ = send_message(c, target, back, wp, back_lp);
+            let s2 = read(c, base, size).unwrap_or_else(|| s0.clone());
+            for (vk, b) in want.iter().enumerate().filter(|&(vk, _)| same(vk)) {
+                c.p.key_state[vk] = *b;
+            }
+            let is_held = |i: usize| s1[i] != s0[i] && s2[i] == s0[i];
+            const STEP: usize = 4096;
+            let changed: Vec<usize> = (0..s0.len().div_ceil(STEP))
+                .filter(|&p| {
+                    let r = p * STEP..((p + 1) * STEP).min(s0.len());
+                    s0[r.clone()] != s1[r.clone()] || s0[r.clone()] != s2[r]
+                })
+                .flat_map(|p| p * STEP..((p + 1) * STEP).min(s0.len()))
+                .filter(|&i| s0[i] != s1[i] || s0[i] != s2[i])
+                .collect();
+            held = changed.iter().filter(|&&i| is_held(i)).count();
+            let keep = (1..=MAX_HELD_BYTES).contains(&held);
+            for &i in &changed {
+                let v = if keep && is_held(i) { s1[i] } else { s0[i] };
+                if v != s2[i] {
+                    let _ = c.host.write(base + i as u32, &[v]);
+                }
+            }
+        }
+    }
+    c.p.log(format!("key {k:#04x} {} at a load: {held} bytes held", if down { "down" } else { "up" }));
+    // A runner that does not keep it this way gets the message.
+    if !(1..=MAX_HELD_BYTES).contains(&held) {
+        post_message(c, target, msg, wp, lp);
+    }
 }
 
 /// Keypad keys: VK_NUMPAD0..9, VK_DECIMAL.
