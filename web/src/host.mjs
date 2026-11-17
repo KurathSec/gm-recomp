@@ -231,6 +231,8 @@ export async function runGame({ runtimeBytes, files, exe, frames = 0, trace = fa
     gpu_shader_delete: (id) => gpu?.shaderDelete(id),
     gpu_blit: (src, sx, sy, sw, sh, dst, dx, dy, dw, dh, linear) => gpu?.blit(src, sx, sy, sw, sh, dst, dx, dy, dw, dh, !!linear),
     gpu_read_target: (id, w, h, dst, pitch) => gpu?.readTarget(id, w, h, dst >>> 0, pitch),
+    gpu_target_save: (id, w, h, ptr, len) => (gpu?.targetSave(id, w, h, mem().subarray(ptr >>> 0, (ptr >>> 0) + len)) ? 1 : 0),
+    gpu_target_restore: (id, w, h, ptr, len) => gpu?.targetRestore(id, w, h, mem().subarray(ptr >>> 0, (ptr >>> 0) + len)),
     gpu_pace: () => {},
     gpu_slack: () => 0,
     gpu_present: (clockMs, x, y, w, h, dw, dh) => {

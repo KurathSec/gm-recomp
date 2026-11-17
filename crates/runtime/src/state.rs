@@ -279,10 +279,80 @@ fn temp_files(fs: &dyn crate::vfs::Vfs) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+/// After the body, a state holds what its render targets showed (their contents exist
+/// only on the host's GPU; a surface a game drew once, a background, came back empty, R
+/// drew it again): `TARGETS`, a count, then per target its id (0: the back buffer),
+/// width and height (u32 LE) and 4 bytes a pixel as the host holds them. Written by hand,
+/// not by serde, so `SCHEMA` stays: states without it load as before (empty targets).
+const TARGETS: &[u8; 8] = b"GMRTARGS";
+
+/// The render targets the host has (ids, sizes), the back buffer last.
+fn target_list(p: &Process) -> Vec<(u32, u32, u32)> {
+    let f = |o: &crate::process::D3dObject, k: &str| o.data.get(k).copied().unwrap_or(0);
+    let mut list: Vec<(u32, u32, u32)> = p
+        .d3d_objects
+        .iter()
+        .filter(|(_, o)| f(o, "gpu") != 0 && render_target(o))
+        .map(|(&id, o)| (id, f(o, "w"), f(o, "h")))
+        .collect();
+    list.sort_unstable();
+    let (bw, bh) = p.d3d.backbuffer;
+    list.push((0, bw, bh));
+    list.retain(|&(_, w, h)| w > 0 && h > 0 && w <= 16384 && h <= 16384);
+    list
+}
+
+/// The render targets' pixels, as `TARGETS` lays them out (nothing when the host has none).
+fn save_targets(p: &mut Process, out: &mut Vec<u8>) {
+    let mut n = 0u32;
+    let mut items = Vec::new();
+    for (id, w, h) in target_list(p) {
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        if p.gpu.target_save(id, w, h, &mut px) {
+            for v in [id, w, h] {
+                items.extend_from_slice(&v.to_le_bytes());
+            }
+            items.extend_from_slice(&px);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        out.extend_from_slice(TARGETS);
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&items);
+    }
+}
+
+/// Puts the saved render targets' pixels into the loaded process's targets (made again,
+/// empty), those of the same id and size; they are then not uploaded from guest memory
+/// (a target's backing there, when it has one, is older than what it shows).
+fn restore_targets(p: &mut Process, tail: &[u8]) {
+    let Some(rest) = tail.strip_prefix(TARGETS.as_slice()) else { return };
+    let u = |b: &[u8], at: usize| b.get(at..at + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    let Some(n) = u(rest, 0) else { return };
+    let have = target_list(p);
+    let mut at = 4;
+    for _ in 0..n {
+        let (Some(id), Some(w), Some(h)) = (u(rest, at), u(rest, at + 4), u(rest, at + 8)) else { return };
+        at += 12;
+        let len = w as usize * h as usize * 4;
+        let Some(px) = rest.get(at..at + len) else { return };
+        at += len;
+        if have.contains(&(id, w, h)) {
+            p.gpu.target_restore(id, w, h, px);
+            // (what it held is there now: no upload of guest memory goes over it)
+            if let Some(o) = p.d3d_objects.get_mut(&id) {
+                o.data.insert("dirty", 0);
+            }
+            p.pending_uploads.retain(|&(t, _)| t != id);
+        }
+    }
+}
+
 fn save<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     let ctx = engine::save_ctx(m);
     let shape = shape(m);
-    let (meta, ranges) = {
+    let (mut meta, ranges) = {
         let p = m.engine_ref().process();
         let ranges = memory_ranges(p);
         let header = Header { format: FORMAT, schema: SCHEMA.to_string(), exe: p.exe_path.clone(), shape };
@@ -291,6 +361,7 @@ fn save<M: Machine>(m: &mut M) -> Result<Outcome, String> {
         meta.extend(postcard::to_stdvec(&body).map_err(|e| format!("cannot write the process: {e}"))?);
         (meta, ranges)
     };
+    save_targets(m.engine().p.as_mut().ok_or("the process is lent out")?, &mut meta);
     let mem: u64 = ranges.iter().map(|r| r.1 as u64).sum();
     m.state_saved(&meta, &ranges);
     Ok(Outcome::Done(format!("saved ({} KB of state, {} MB of memory in {} ranges)", meta.len() / 1024, mem >> 20, ranges.len())))
@@ -310,7 +381,7 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     if h.shape != here {
         return Ok(Outcome::Later(format!("the host frames are {here:?}, the state's {:?}", h.shape)));
     }
-    let body: BodyIn = postcard::from_bytes(rest).map_err(|e| format!("the state cannot be read: {e}"))?;
+    let (body, tail) = postcard::take_from_bytes::<BodyIn>(rest).map_err(|e| format!("the state cannot be read: {e}"))?;
     m.engine_ref().process().registry.check(&body.registry)?;
     let mut live = m.engine().p.take().ok_or("the process is lent out")?;
     let mut new = body.process;
@@ -355,6 +426,7 @@ fn load<M: Machine>(m: &mut M) -> Result<Outcome, String> {
     new.mixer = crate::hle::audio::Mixer::default();
     new.mixer.base = new.mixer.frame_at(new.clock_us);
     make_gpu_objects(&mut new, m, &keep);
+    restore_targets(&mut new, tail);
     drop(live);
     m.engine().p = Some(Box::new(new));
     let _ = m.fill(recomp::abi::RESOLVE_CACHE, recomp::abi::RESOLVE_CACHE_SIZE, 0);

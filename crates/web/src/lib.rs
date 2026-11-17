@@ -47,6 +47,8 @@ unsafe extern "C" {
     fn gpu_shader_delete(id: u32);
     fn gpu_blit(src: u32, sx: i32, sy: i32, sw: i32, sh: i32, dst: u32, dx: i32, dy: i32, dw: i32, dh: i32, linear: u32);
     fn gpu_read_target(id: u32, w: u32, h: u32, dst: u32, pitch: u32);
+    fn gpu_target_save(id: u32, w: u32, h: u32, out: *mut u8, len: usize) -> u32;
+    fn gpu_target_restore(id: u32, w: u32, h: u32, data: *const u8, len: usize);
     /// Shows the frame; may suspend the guest until it is time for the next one.
     fn gpu_present(clock_ms: f64, x: i32, y: i32, w: i32, h: i32, dst_w: u32, dst_h: u32);
     /// Holds the guest until real time reaches its clock (may suspend it).
@@ -170,6 +172,12 @@ impl runtime::hle::gpu::Gpu for WebGpu {
     }
     fn read_target(&mut self, id: u32, w: u32, h: u32, dst: u32, pitch: u32) {
         unsafe { gpu_read_target(id, w, h, dst, pitch) }
+    }
+    fn target_save(&mut self, id: u32, w: u32, h: u32, out: &mut [u8]) -> bool {
+        unsafe { gpu_target_save(id, w, h, out.as_mut_ptr(), out.len()) != 0 }
+    }
+    fn target_restore(&mut self, id: u32, w: u32, h: u32, data: &[u8]) {
+        unsafe { gpu_target_restore(id, w, h, data.as_ptr(), data.len()) }
     }
     fn texture_delete(&mut self, id: u32) {
         unsafe { gpu_texture_delete(id) }

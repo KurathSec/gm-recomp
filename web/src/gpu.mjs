@@ -762,6 +762,38 @@ export class D3DGL {
     }
   }
 
+  /**
+   * Save states: target `id` (0: the back buffer), `w` x `h`, as held (R, G, B, A, rows
+   * as stored) into `out`; false without such a target. Its contents exist only here.
+   */
+  targetSave(id, w, h, out) {
+    const t = id ? this.textures.get(id) : this.back;
+    if (!t || t.w !== w || t.h !== h || out.length < w * h * 4) return false;
+    this.flush();
+    const f = this.targetFbo(id);
+    if (!f) return false;
+    const gl = this.gl;
+    const px = new Uint8Array(w * h * 4);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, f);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.bindTarget(this.target, this.targetW, this.targetH);
+    out.set(px);
+    return true;
+  }
+
+  /** Save states: what targetSave gave, back into the target (made again, empty). */
+  targetRestore(id, w, h, data) {
+    const t = id ? this.textures.get(id) : this.back;
+    if (!t || t.w !== w || t.h !== h || data.length < w * h * 4) return;
+    this.flush();
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    // (a copy: the runtime's memory may be shared, which WebGL does not take)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data.slice(0, w * h * 4));
+    this.keyValid = false;
+  }
+
   shaderCreate(id, vertex, glsl) {
     // (a loaded save state's shader that is here already: it and its programs stay)
     const had = this.shaders?.get(id);

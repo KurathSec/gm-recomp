@@ -169,6 +169,13 @@ pub trait Gpu {
     fn blit(&mut self, _src: u32, _src_rect: [i32; 4], _dst: u32, _dst_rect: [i32; 4], _linear: bool) {}
     /// Reads target/texture `id` (w x h, 32-bit pixels) into guest memory at `dst`.
     fn read_target(&mut self, _id: u32, _w: u32, _h: u32, _dst: u32, _pitch: u32) {}
+    /// Save states: render target `id` (0: the back buffer), `w` x `h`, as the host holds
+    /// it (4 bytes a pixel) into `out`; false when the host has no such target.
+    fn target_save(&mut self, _id: u32, _w: u32, _h: u32, _out: &mut [u8]) -> bool {
+        false
+    }
+    /// Save states: what `target_save` gave, back into the target made again.
+    fn target_restore(&mut self, _id: u32, _w: u32, _h: u32, _data: &[u8]) {}
     /// End of a frame: rectangle `src` (x, y, w, h) of the back buffer is shown at
     /// `dst_w` x `dst_h`. `clock_us` is the guest's virtual time, which the host uses to
     /// pace frames against real time.
