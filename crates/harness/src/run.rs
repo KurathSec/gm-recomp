@@ -724,7 +724,9 @@ pub fn run(opts: RunOpts) -> Result<()> {
         if let Some(h) = &e.api_hist {
             let mut v: Vec<(u64, usize)> = h.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| (*n, i)).collect();
             v.sort_unstable_by(|a, b| b.cmp(a));
-            let top: Vec<String> = v.iter().take(25).map(|(n, i)| format!("{} {n}", p.registry.entries[*i].clone_name())).collect();
+            // (GMR_API_COUNT=<n>: the n most called; any other value: 25)
+            let n = std::env::var("GMR_API_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+            let top: Vec<String> = v.iter().take(n).map(|(n, i)| format!("{} {n}", p.registry.entries[*i].clone_name())).collect();
             eprintln!("most called APIs: {}", top.join(", "));
         }
         if let Some(h) = &e.fpu_profile {
