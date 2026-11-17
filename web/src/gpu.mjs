@@ -15,6 +15,36 @@ const D9 = {
   vsF: 621, psF: 1645, vsI: 2541, psI: 2605, vsB: 2669, psB: 2685, words: 2701,
 };
 const USAGE = ['POSITION', 'BLENDWEIGHT', 'BLENDINDICES', 'NORMAL', 'PSIZE', 'TEXCOORD', 'TANGENT', 'BINORMAL', 'TESSFACTOR', 'POSITIONT', 'COLOR', 'FOG', 'DEPTH', 'SAMPLE'];
+
+/**
+ * The vertex stage of a pixel shader drawn over fixed-function vertex processing (no
+ * vertex shader set), as GLSL in d3d9_shader.rs's conventions, for the vertex inputs
+ * `names` (e.g. ['POSITION0', 'COLOR0', 'TEXCOORD0']): a position transformed by world x
+ * view x projection (rows in c0..c3, from the runtime) or one already in screen pixels
+ * (POSITIONT), and the colours and texture coordinates passed on. Without a diffuse colour
+ * a vertex is white. Lighting, fog and texture transforms are not done.
+ */
+function ffVertex9(names) {
+  const has = (n) => names.includes(n);
+  const lines = ['#version 300 es', 'precision highp float;', 'precision highp int;', 'uniform vec4 vc[256];', 'uniform ivec4 vi[16];', 'uniform bool vb[16];', 'uniform vec2 u_fixup;', 'uniform int u_bgra;', 'uniform vec4 u_vp;'];
+  names.forEach((n, v) => lines.push(`in vec4 a_${n}; // v${v}`));
+  const outs = ['COLOR0', 'COLOR1', ...names.filter((n) => n.startsWith('TEXCOORD'))];
+  for (const o of outs) lines.push(`out vec4 v_${o};`);
+  lines.push('// @varyings', 'void main() {', '  // @init');
+  names.forEach((n, v) => lines.push(`  vec4 in_${n} = ((u_bgra >> ${v}) & 1) != 0 ? a_${n}.zyxw : a_${n};`));
+  lines.push('  vec4 o_pos = vec4(0.0, 0.0, 0.0, 1.0);');
+  if (has('POSITIONT0')) {
+    // screen pixels (x, y, z, 1/w) -> clip space, before the shared fix-up
+    lines.push('  vec4 p = in_POSITIONT0;', '  float w = p.w != 0.0 ? 1.0 / p.w : 1.0;');
+    lines.push('  o_pos = vec4((p.x - u_vp.x) / u_vp.z * 2.0 - 1.0, 1.0 - (p.y - u_vp.y) / u_vp.w * 2.0, p.z, 1.0) * w;');
+  } else if (has('POSITION0')) {
+    lines.push('  vec4 p = vec4(in_POSITION0.xyz, 1.0);', '  o_pos = p.x * vc[0] + p.y * vc[1] + p.z * vc[2] + p.w * vc[3];');
+  }
+  lines.push(`  v_COLOR0 = ${has('COLOR0') ? 'in_COLOR0' : 'vec4(1.0)'};`, `  v_COLOR1 = ${has('COLOR1') ? 'in_COLOR1' : 'vec4(0.0)'};`);
+  for (const o of outs.slice(2)) lines.push(`  v_${o} = in_${o};`);
+  lines.push('  gl_Position = vec4(o_pos.x + o_pos.w * u_fixup.x, -o_pos.y + o_pos.w * u_fixup.y, 2.0 * o_pos.z - o_pos.w, o_pos.w);', '  gl_PointSize = 1.0;', '}');
+  return lines.join('\n') + '\n';
+}
 // D3DDECLTYPE -> [components, GL type, normalized]
 const DECL = {
   0: [1, 'FLOAT', false], 1: [2, 'FLOAT', false], 2: [3, 'FLOAT', false], 3: [4, 'FLOAT', false], 4: [4, 'UNSIGNED_BYTE', true],
@@ -757,14 +787,17 @@ export class D3DGL {
     }
   }
 
-  /** The program for a vertex/pixel shader pair (translated by crates/runtime/src/hle/d3d9_shader.rs). */
-  program9(vsId, psId) {
-    const key = `${vsId}|${psId}`;
+  /**
+   * The program for a vertex/pixel shader pair (translated by crates/runtime/src/hle/d3d9_shader.rs);
+   * vertex shader 0: the fixed-function stand-in (`ffVertex9`) for the vertex inputs `ff`.
+   */
+  program9(vsId, psId, ff) {
+    const key = vsId ? `${vsId}|${psId}` : `ff:${ff.join(',')}|${psId}`;
     this.programs ??= new Map();
     let p = this.programs.get(key);
     if (p !== undefined) return p;
     const gl = this.gl;
-    const vs = this.shaders?.get(vsId), ps = this.shaders?.get(psId);
+    const vs = vsId ? this.shaders?.get(vsId) : { glsl: ffVertex9(ff) }, ps = this.shaders?.get(psId);
     p = null;
     if (vs && ps) {
       // Pixel shader inputs the vertex shader does not write read as zero.
@@ -786,7 +819,7 @@ export class D3DGL {
         const samplers = [...ps.glsl.matchAll(/uniform highp \w+ s(\d+);/g)].map((m) => Number(m[1]));
         gl.useProgram(prog);
         for (const s of samplers) gl.uniform1i(u(`s${s}`), s);
-        p = { prog, attrs, samplers, vc: u('vc'), vi: u('vi'), vb: u('vb'), pc: u('pc'), pi: u('pi'), pb: u('pb'), fixup: u('u_fixup'), bgra: u('u_bgra'), atest: u('u_atest'), aref: u('u_aref') };
+        p = { prog, attrs, samplers, vc: u('vc'), vi: u('vi'), vb: u('vb'), pc: u('pc'), pi: u('pi'), pb: u('pb'), fixup: u('u_fixup'), bgra: u('u_bgra'), atest: u('u_atest'), aref: u('u_aref'), vp: u('u_vp') };
       } catch (e) {
         this.print(`shaders ${vsId.toString(16)}/${psId.toString(16)}: ${e.message}`);
       }
@@ -800,7 +833,9 @@ export class D3DGL {
     const w = new Uint32Array(this.rtBuffer(), ptr, D9.words);
     const f = new Float32Array(this.rtBuffer(), ptr, D9.words);
     const i32 = new Int32Array(this.rtBuffer(), ptr, D9.words);
-    const p = this.program9(w[D9.vs], w[D9.ps]);
+    // (no vertex shader: the fixed-function stand-in for this vertex layout)
+    const ff = w[D9.vs] ? null : [...new Set(Array.from({ length: w[D9.elementCount] }, (_, e) => w[D9.elements + 4 * e + 3]).map((use) => `${USAGE[use & 0xff] ?? 'UNKNOWN'}${use >> 8}`))];
+    const p = this.program9(w[D9.vs], w[D9.ps], ff);
     if (!p) return;
     this.flush();
     this.draws++;
@@ -852,6 +887,7 @@ export class D3DGL {
     gl.viewport(vp[0], vp[1], vp[2], vp[3]);
     gl.depthRange(vp[4], vp[5]);
     gl.uniform2f(p.fixup, 1 / Math.max(1, vp[2]), 1 / Math.max(1, vp[3]));
+    if (p.vp) gl.uniform4f(p.vp, vp[0], vp[1], Math.max(1, vp[2]), Math.max(1, vp[3]));
     gl.uniform1i(p.bgra, bgra);
     const rs = (i) => w[D9.rs + i];
     gl.uniform1i(p.atest, rs(RS.ALPHATESTENABLE) ? rs(RS.ALPHAFUNC) : 8);

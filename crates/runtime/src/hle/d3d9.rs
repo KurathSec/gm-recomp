@@ -27,6 +27,13 @@ const DLL: &str = "d3d9.dll";
 
 type Method = (&'static str, u32, ApiFn);
 
+/// The Direct3D 9Ex interfaces: an object answers for them only when it was made by
+/// Direct3DCreate9Ex or CreateDeviceEx, or comes from an object that was (data "ex"). A
+/// plain device that says it is a 9Ex one makes Microsoft's D3DX refuse the managed pool,
+/// which 9Ex does not have: D3DXCheckTextureRequirements fails for every texture a
+/// GameMaker 8.1 runner makes (gm82dx9 with the game's own D3DX9_43.dll).
+const EX_IIDS: &[&str] = &["{02177241-69FC-400C-8FF1-93A44DF6861D}", "{B18B10CE-2649-405A-870F-95F777D4313A}", "{91886CAF-1C3D-4D2E-A0AB-3E4C7D8D3303}"];
+
 /// Every interface the objects answer QueryInterface for, by vtable name.
 const IIDS: &[(&str, &[&str])] = &[
     ("IDirect3D9Ex", &["{81BDCBCA-64D4-426D-AE8D-AD0147F4275C}", "{02177241-69FC-400C-8FF1-93A44DF6861D}"]),
@@ -269,7 +276,9 @@ fn query_interface(c: &mut Ctx) -> ApiResult {
     let _ = c.host.read(iid, &mut g);
     let want = super::com::format_iid(&g);
     let k = kind(c, t);
-    let ok = want == "{00000000-0000-0000-C000-000000000046}" || IIDS.iter().any(|(name, iids)| *name == k && iids.iter().any(|i| i.eq_ignore_ascii_case(&want)));
+    let ex = field(c, t, "ex") != 0;
+    let ok = want == "{00000000-0000-0000-C000-000000000046}"
+        || IIDS.iter().any(|(name, iids)| *name == k && iids.iter().any(|i| i.eq_ignore_ascii_case(&want) && (ex || !EX_IIDS.iter().any(|e| e.eq_ignore_ascii_case(i)))));
     if ok {
         add_ref_obj(c, t);
         out(c, pp, t);
@@ -482,7 +491,9 @@ fn d3d_create_device(c: &mut Ctx) -> ApiResult {
     }
     c.trace(format!("({w}x{h} fmt {fmt} windowed {windowed} flags {flags:#x} hwnd {target_win:#x} depth {auto_depth}/{depth_fmt})"));
     add_ref_obj(c, this(c));
-    let data = HashMap::from_iter([("w", w), ("h", h), ("fmt", fmt), ("hwnd", target_win), ("flags", flags), ("d3d", this(c)), ("depth_fmt", depth_fmt)]);
+    // (a device of a Direct3DCreate9Ex object is a 9Ex one, whichever CreateDevice made it)
+    let dev_ex = (ex || field(c, this(c), "ex") != 0) as u32;
+    let data = HashMap::from_iter([("w", w), ("h", h), ("fmt", fmt), ("hwnd", target_win), ("flags", flags), ("d3d", this(c)), ("depth_fmt", depth_fmt), ("ex", dev_ex)]);
     let dev = new_object(c, "IDirect3DDevice9Ex", IDIRECT3DDEVICE9, data);
     reset_state(c, dev, w, h, auto_depth != 0);
     c.p.d3d.window = target_win;
@@ -604,6 +615,14 @@ fn dev_reset(c: &mut Ctx) -> ApiResult {
     set_field(c, t, "w", w);
     set_field(c, t, "h", h);
     reset_state(c, t, w, h, auto_depth);
+    // The back buffer is one object for the device's life (back_buffer): it takes the new
+    // size, or a game that set it as the target again would draw into the old one (an
+    // older gm82dx9 makes its device 1x1, then resets it to the window at game start).
+    let bb = field(c, t, "backbuffer");
+    if bb != 0 && c.p.d3d_objects.contains_key(&bb) {
+        set_field(c, bb, "w", w);
+        set_field(c, bb, "h", h);
+    }
     c.trace(format!("({w}x{h})"));
     ret(c, D3D_OK)
 }
@@ -1274,7 +1293,7 @@ fn submit(c: &mut Ctx, prim: u32, prim_count: u32, base: i32, min_index: u32, ve
         viewport: st.viewport,
         scissor: st.scissor,
         rs: st.rs,
-        vs_f: *st.vs_f,
+        vs_f: if st.vs == 0 { ff_constants(st) } else { *st.vs_f },
         ps_f: *st.ps_f,
         vs_i: st.vs_i,
         ps_i: st.ps_i,
@@ -1285,6 +1304,18 @@ fn submit(c: &mut Ctx, prim: u32, prim_count: u32, base: i32, min_index: u32, ve
         c.p.log(format!("    draw9 prim {prim} x{prim_count} vs {:#x} ps {:#x} tex {:#x} elements {}", d.vs, d.ps, textures[0][0], d.element_count));
     }
     c.p.gpu.draw9(&d);
+}
+
+/// A pixel shader over fixed-function vertex processing (no vertex shader): the host's
+/// stand-in vertex stage (gpu.mjs `ffVertex9`) takes world x view x projection, by rows,
+/// in c0..c3.
+fn ff_constants(st: &State9) -> [[f32; 4]; 256] {
+    let mut c = *st.vs_f;
+    let m = mat_mul(&mat_mul(&st.world, &st.view), &st.proj);
+    for (r, row) in c.iter_mut().take(4).enumerate() {
+        row.copy_from_slice(&m[4 * r..4 * r + 4]);
+    }
+    c
 }
 
 /// A D3D9 texture stage with its sampler's states in the Direct3D 8 slots.
@@ -1450,7 +1481,8 @@ fn dev_get_swap_chain(c: &mut Ctx) -> ApiResult {
     let dev = this(c);
     let mut sc = field(c, dev, "swapchain");
     if sc == 0 || !c.p.d3d_objects.contains_key(&sc) {
-        sc = new_object(c, "IDirect3DSwapChain9", IDIRECT3DSWAPCHAIN9, HashMap::from_iter([("device", dev)]));
+        let ex = field(c, dev, "ex");
+        sc = new_object(c, "IDirect3DSwapChain9", IDIRECT3DSWAPCHAIN9, HashMap::from_iter([("device", dev), ("ex", ex)]));
         set_field(c, dev, "swapchain", sc);
     } else {
         add_ref_obj(c, sc);
@@ -2146,7 +2178,7 @@ fn register_iface(r: &mut Registry, iface: &str, methods: &[Method]) {
 
 fn create(c: &mut Ctx) -> ApiResult {
     let ex = c.name().ends_with("Ex");
-    let obj = new_object(c, "IDirect3D9Ex", IDIRECT3D9, HashMap::default());
+    let obj = new_object(c, "IDirect3D9Ex", IDIRECT3D9, HashMap::from_iter([("ex", ex as u32)]));
     c.trace(format!("(sdk {}) = {obj:#x}", c.arg(0)));
     if ex {
         // Direct3DCreate9Ex(sdk, &d3d) -> HRESULT
